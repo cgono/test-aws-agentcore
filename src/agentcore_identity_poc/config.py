@@ -1,5 +1,6 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 
 class SettingsError(ValueError):
@@ -48,13 +49,24 @@ class Settings:
             if not isinstance(value, str) or not value:
                 raise SettingsError(f"{environment_name} must be set")
 
-            value = value.rstrip("/")
+            value = value.strip().rstrip("/")
             if not value:
                 raise SettingsError(f"{environment_name} must be set")
             configured_values[field_name] = value
 
         public_base_url = configured_values["public_base_url"]
-        if not public_base_url.startswith("https://"):
+        try:
+            parsed_public_base_url = urlparse(public_base_url)
+        except ValueError as error:
+            raise SettingsError("PUBLIC_BASE_URL must use https") from error
+
+        if (
+            parsed_public_base_url.scheme != "https"
+            or not parsed_public_base_url.netloc
+            or parsed_public_base_url.params
+            or parsed_public_base_url.query
+            or parsed_public_base_url.fragment
+        ):
             raise SettingsError("PUBLIC_BASE_URL must use https")
 
         return cls(**configured_values)

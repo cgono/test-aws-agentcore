@@ -43,9 +43,43 @@ def test_settings_require_nonempty_values() -> None:
         Settings.from_mapping(values)
 
 
+def test_settings_reject_whitespace_only_values() -> None:
+    values = BASE | {"ENTRA_TENANT_ID": "   "}
+
+    with pytest.raises(SettingsError, match="ENTRA_TENANT_ID"):
+        Settings.from_mapping(values)
+
+
 def test_settings_strip_trailing_slashes() -> None:
     values = {name: f"{value}/" for name, value in BASE.items()}
     settings = Settings.from_mapping(values)
 
     assert settings.aws_region == "us-west-2"
     assert settings.public_base_url == "https://poc-callback.example.test"
+
+
+def test_settings_normalize_surrounding_whitespace_before_trailing_slashes() -> None:
+    values = BASE | {
+        "AWS_REGION": " us-west-2 ",
+        "PUBLIC_BASE_URL": " https://poc-callback.example.test/ ",
+    }
+
+    settings = Settings.from_mapping(values)
+
+    assert settings.aws_region == "us-west-2"
+    assert settings.public_base_url == "https://poc-callback.example.test"
+
+
+@pytest.mark.parametrize(
+    "public_base_url",
+    [
+        "https:///relative",
+        "https://poc-callback.example.test/metadata?unexpected=true",
+        "https://poc-callback.example.test/metadata#fragment",
+    ],
+)
+def test_settings_reject_unusable_https_public_urls(public_base_url: str) -> None:
+    values = BASE | {"PUBLIC_BASE_URL": public_base_url}
+
+    with pytest.raises(SettingsError, match="PUBLIC_BASE_URL must use https"):
+        Settings.from_mapping(values)
