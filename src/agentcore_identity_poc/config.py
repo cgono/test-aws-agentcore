@@ -27,7 +27,7 @@ _FIELD_NAMES = (
 
 def _is_alternate_ipv4_literal(hostname: str) -> bool:
     labels = hostname.split(".")
-    return len(labels) == 4 and all(
+    return 1 <= len(labels) <= 4 and all(
         label.isdecimal()
         or (
             label.lower().startswith("0x")
