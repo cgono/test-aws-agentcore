@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentcore-identity-poc"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "bedrock-agentcore==1.18.1",
+  "boto3==1.43.31",
+  "fastapi==0.139.2",
+  "httpx==0.28.1",
+  "msal==1.37.0",
+  "PyJWT[crypto]==2.13.0",
+  "typer==0.27.0",
+  "uvicorn==0.51.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy==1.18.2",
+  "pytest==8.4.2",
+  "pytest-asyncio==1.1.0",
+  "pytest-cov==6.2.1",
+  "respx==0.22.0",
+  "ruff==0.12.10",
+]
+
+[project.scripts]
+agentcore-identity-poc = "agentcore_identity_poc.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+agentcore_identity_poc = ["static/*.html"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+markers = ["integration: requires live cloud/provider credentials"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "S105", "S106"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["agentcore_identity_poc"]
