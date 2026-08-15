@@ -1,5 +1,6 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
+from ipaddress import ip_address
 from urllib.parse import urlparse
 
 
@@ -22,6 +23,16 @@ _FIELD_NAMES = (
     "resource_api_url",
     "public_base_url",
 )
+
+
+def _is_public_callback_hostname(hostname: str) -> bool:
+    if hostname.lower() == "localhost":
+        return False
+
+    try:
+        return ip_address(hostname).is_global
+    except ValueError:
+        return True
 
 
 @dataclass(frozen=True)
@@ -66,6 +77,9 @@ class Settings:
             parsed_public_base_url.scheme != "https"
             or not hostname
             or not (port is None or 1 <= port <= 65535)
+            or parsed_public_base_url.username is not None
+            or parsed_public_base_url.password is not None
+            or not _is_public_callback_hostname(hostname)
             or parsed_public_base_url.params
             or parsed_public_base_url.query
             or parsed_public_base_url.fragment
