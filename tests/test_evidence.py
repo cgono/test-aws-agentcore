@@ -39,6 +39,15 @@ def test_writer_persists_only_sanitized_fields(tmp_path: Path) -> None:
     }
 
 
+def test_writer_persists_nonsecret_correlation_identifier(tmp_path: Path) -> None:
+    path = tmp_path / "evidence.jsonl"
+    EvidenceWriter(path).append(
+        Observation("H1", "workload", "pass", {"correlation_id": "per-run-alias"})
+    )
+
+    assert json.loads(path.read_text())["details"] == {"correlation_id": "per-run-alias"}
+
+
 @pytest.mark.parametrize(
     "details",
     [

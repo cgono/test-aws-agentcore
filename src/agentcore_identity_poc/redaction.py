@@ -57,7 +57,6 @@ _SENSITIVE_FIELD_COMPONENTS = frozenset(
         "client",
         "code",
         "cookie",
-        "id",
         "key",
         "password",
         "refresh",
