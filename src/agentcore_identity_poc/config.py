@@ -53,6 +53,9 @@ def _is_public_callback_hostname(hostname: str) -> bool:
         except UnicodeError:
             return False
 
+    if len(idna_hostname) > 253:
+        return False
+
     labels = idna_hostname.split(".")
     return len(labels) >= 2 and all(
         label

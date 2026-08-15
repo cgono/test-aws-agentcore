@@ -70,6 +70,14 @@ def test_settings_normalize_surrounding_whitespace_before_trailing_slashes() -> 
     assert settings.public_base_url == "https://poc-callback.example.test"
 
 
+def test_settings_reject_overlong_idna_hostname() -> None:
+    hostname = ".".join(["a" * 63] * 4)
+    values = BASE | {"PUBLIC_BASE_URL": f"https://{hostname}"}
+
+    with pytest.raises(SettingsError, match="PUBLIC_BASE_URL must use https"):
+        Settings.from_mapping(values)
+
+
 @pytest.mark.parametrize(
     "public_base_url",
     [
