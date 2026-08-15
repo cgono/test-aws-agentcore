@@ -30,6 +30,7 @@ _SECRET_FIELD_NAMES = frozenset(
         "client_secret",
         "code",
         "cookie",
+        "cookies",
         "family_name",
         "given_name",
         "id_token",
