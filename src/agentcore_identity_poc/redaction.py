@@ -20,6 +20,7 @@ _EMAIL_PATTERN = re.compile(
 _URL_PATTERN = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 _CAMEL_CASE_BOUNDARY = re.compile(r"([a-z0-9])([A-Z])")
 _ACRONYM_BOUNDARY = re.compile(r"([A-Z]+)([A-Z][a-z])")
+_FIELD_SEPARATOR = re.compile(r"[^A-Za-z0-9]+")
 _SECRET_FIELD_NAMES = frozenset(
     {
         "access_token",
@@ -47,6 +48,7 @@ _DRIVE_FILENAME_FIELD_NAMES = frozenset(
         "filename",
     }
 )
+_SENSITIVE_FIELD_COMPONENTS = frozenset({"authorization", "cookie", "token"})
 _AUTHORIZATION_QUERY_KEYS = frozenset({"code", "session_id", "state"})
 
 
@@ -56,7 +58,7 @@ def assert_safe_evidence(value: object) -> None:
     _validate_value(value)
 
 
-def _validate_value(value: object, *, inside_drive_mapping: bool = False) -> None:
+def _validate_value(value: object) -> None:
     if value is None or isinstance(value, bool | int):
         return
     if isinstance(value, float):
@@ -70,26 +72,23 @@ def _validate_value(value: object, *, inside_drive_mapping: bool = False) -> Non
         for key, nested_value in value.items():
             if not isinstance(key, str):
                 _reject()
-            _validate_key(key, inside_drive_mapping=inside_drive_mapping)
-            _validate_value(
-                nested_value,
-                inside_drive_mapping=inside_drive_mapping or _is_drive_related_key(key),
-            )
+            _validate_key(key)
+            _validate_value(nested_value)
         return
     if isinstance(value, Sequence) and not isinstance(value, bytes | bytearray):
         for nested_value in value:
-            _validate_value(nested_value, inside_drive_mapping=inside_drive_mapping)
+            _validate_value(nested_value)
         return
     _reject()
 
 
-def _validate_key(key: str, *, inside_drive_mapping: bool) -> None:
+def _validate_key(key: str) -> None:
     normalized = _normalize_field_name(key)
     if (
         normalized in _SECRET_FIELD_NAMES
         or normalized in _DRIVE_FILENAME_FIELD_NAMES
-        or normalized.startswith(("authorization_", "cookie_", "set_cookie_"))
-        or (inside_drive_mapping and normalized == "name")
+        or normalized == "name"
+        or bool(_SENSITIVE_FIELD_COMPONENTS.intersection(normalized.split("_")))
     ):
         _reject()
 
@@ -97,12 +96,7 @@ def _validate_key(key: str, *, inside_drive_mapping: bool) -> None:
 def _normalize_field_name(key: str) -> str:
     snake_case = _ACRONYM_BOUNDARY.sub(r"\1_\2", key)
     snake_case = _CAMEL_CASE_BOUNDARY.sub(r"\1_\2", snake_case)
-    return snake_case.casefold().replace("-", "_")
-
-
-def _is_drive_related_key(key: str) -> bool:
-    normalized = _normalize_field_name(key)
-    return normalized == "drive" or normalized.startswith("drive_")
+    return _FIELD_SEPARATOR.sub("_", snake_case).strip("_").casefold()
 
 
 def _validate_string(value: str) -> None:

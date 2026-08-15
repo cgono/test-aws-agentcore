@@ -58,6 +58,10 @@ def test_writer_persists_only_sanitized_fields(tmp_path: Path) -> None:
         {"user": "member" + "@" + "example.invalid"},
         {"drive": {"filename": "redacted-document.txt"}},
         {"drive": {"name": "Confidential-Finance.xlsx"}},
+        {"files": [{"name": "Quarterly Plan.xlsx"}]},
+        {"workload_access_token": "opaque"},
+        {"headers": {"X-Authorization": "Basic redacted-value"}},
+        {"response_cookie": "opaque"},
     ],
 )
 def test_writer_rejects_unsafe_values_recursively(
