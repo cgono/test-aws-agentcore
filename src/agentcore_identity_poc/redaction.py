@@ -18,6 +18,8 @@ _EMAIL_PATTERN = re.compile(
     r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![A-Za-z0-9._%+-])"
 )
 _URL_PATTERN = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+_CAMEL_CASE_BOUNDARY = re.compile(r"([a-z0-9])([A-Z])")
+_ACRONYM_BOUNDARY = re.compile(r"([A-Z]+)([A-Z][a-z])")
 _SECRET_FIELD_NAMES = frozenset(
     {
         "access_token",
@@ -79,9 +81,15 @@ def _validate_value(value: object) -> None:
 
 
 def _validate_key(key: str) -> None:
-    normalized = key.casefold().replace("-", "_")
+    normalized = _normalize_field_name(key)
     if normalized in _SECRET_FIELD_NAMES or normalized in _DRIVE_FILENAME_FIELD_NAMES:
         _reject()
+
+
+def _normalize_field_name(key: str) -> str:
+    snake_case = _ACRONYM_BOUNDARY.sub(r"\1_\2", key)
+    snake_case = _CAMEL_CASE_BOUNDARY.sub(r"\1_\2", snake_case)
+    return snake_case.casefold().replace("-", "_")
 
 
 def _validate_string(value: str) -> None:
