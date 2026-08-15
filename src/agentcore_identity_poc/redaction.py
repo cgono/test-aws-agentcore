@@ -48,7 +48,26 @@ _DRIVE_FILENAME_FIELD_NAMES = frozenset(
         "filename",
     }
 )
-_SENSITIVE_FIELD_COMPONENTS = frozenset({"authorization", "cookie", "token"})
+_SENSITIVE_FIELD_COMPONENTS = frozenset(
+    {
+        "access",
+        "api",
+        "authorization",
+        "bearer",
+        "client",
+        "code",
+        "cookie",
+        "id",
+        "key",
+        "password",
+        "refresh",
+        "secret",
+        "session",
+        "set",
+        "state",
+        "token",
+    }
+)
 _AUTHORIZATION_QUERY_KEYS = frozenset({"code", "session_id", "state"})
 
 

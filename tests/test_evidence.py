@@ -62,6 +62,12 @@ def test_writer_persists_only_sanitized_fields(tmp_path: Path) -> None:
         {"workload_access_token": "opaque"},
         {"headers": {"X-Authorization": "Basic redacted-value"}},
         {"response_cookie": "opaque"},
+        {"clientSecretValue": "opaque"},
+        {"apiKeyValue": "opaque"},
+        {"passwordValue": "opaque"},
+        {"sessionIdValue": "opaque"},
+        {"stateValue": "opaque"},
+        {"codeValue": "opaque"},
     ],
 )
 def test_writer_rejects_unsafe_values_recursively(
@@ -89,3 +95,17 @@ def test_writer_does_not_create_or_partially_append_on_rejection(tmp_path: Path)
         writer.append(observation({"access_token": "redacted-value"}))
 
     assert path.read_text() == original_contents
+
+
+def test_observation_details_are_immutable_and_defensively_copied(tmp_path: Path) -> None:
+    details = {"nested": [{"status": "initial"}]}
+    item = Observation("H1", "workload", "pass", details)
+    details["nested"][0]["status"] = "changed"
+
+    with pytest.raises(TypeError):
+        item.details["result"] = "changed"  # type: ignore[index]
+
+    path = tmp_path / "evidence.jsonl"
+    EvidenceWriter(path).append(item)
+
+    assert json.loads(path.read_text())["details"] == {"nested": [{"status": "initial"}]}
