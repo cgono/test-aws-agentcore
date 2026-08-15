@@ -78,6 +78,8 @@ def test_settings_normalize_surrounding_whitespace_before_trailing_slashes() -> 
         "https://:443",
         "https://localhost:8443",
         "https://127.0.0.1:8443",
+        "https://0177.0.0.1",
+        "https://0x7f.0.0.1",
         "https://user:pass@poc-callback.example.test",
         "https://exa mple.test",
         "https://-example.test",

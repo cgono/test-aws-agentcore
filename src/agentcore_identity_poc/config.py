@@ -25,8 +25,24 @@ _FIELD_NAMES = (
 )
 
 
+def _is_alternate_ipv4_literal(hostname: str) -> bool:
+    labels = hostname.split(".")
+    return len(labels) == 4 and all(
+        label.isdecimal()
+        or (
+            label.lower().startswith("0x")
+            and len(label) > 2
+            and all(character in "0123456789abcdef" for character in label[2:].lower())
+        )
+        for label in labels
+    )
+
+
 def _is_public_callback_hostname(hostname: str) -> bool:
     if hostname.lower() == "localhost":
+        return False
+
+    if _is_alternate_ipv4_literal(hostname):
         return False
 
     try:
