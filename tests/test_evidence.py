@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 
@@ -138,3 +139,16 @@ def test_observation_details_are_immutable_and_defensively_copied(tmp_path: Path
     EvidenceWriter(path).append(item)
 
     assert json.loads(path.read_text())["details"] == {"nested": [{"status": "initial"}]}
+
+
+def test_observation_freezes_mapping_proxy_backed_details() -> None:
+    backing_details = {"status": "initial"}
+    item = Observation(
+        "H1",
+        "workload",
+        "pass",
+        {"nested": MappingProxyType(backing_details)},
+    )
+    backing_details["status"] = "changed"
+
+    assert item.as_dict()["details"] == {"nested": {"status": "initial"}}

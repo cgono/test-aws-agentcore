@@ -43,7 +43,7 @@ def _freeze_mapping(details: Mapping[str, JsonValue]) -> Mapping[str, FrozenJson
 
 
 def _freeze(value: JsonValue) -> FrozenJsonValue:
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return _freeze_mapping(value)
     if isinstance(value, list):
         return tuple(_freeze(item) for item in value)
