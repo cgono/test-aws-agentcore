@@ -37,7 +37,11 @@ _SECRET_FIELD_NAMES = frozenset(
         "session_id",
         "set_cookie",
         "state",
+        "sub",
+        "subject",
         "token",
+        "oid",
+        "user_principal_name",
     }
 )
 _DRIVE_FILENAME_FIELD_NAMES = frozenset(

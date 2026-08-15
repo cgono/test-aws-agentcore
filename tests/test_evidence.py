@@ -83,6 +83,10 @@ def test_writer_persists_nonsecret_correlation_identifier(tmp_path: Path) -> Non
         {"codeValue": "opaque"},
         {"user_id": "opaque"},
         {"subject_id": "opaque"},
+        {"sub": "opaque"},
+        {"subject": "opaque"},
+        {"oid": "opaque"},
+        {"nested": {"userPrincipalName": "opaque"}},
     ],
 )
 def test_writer_rejects_unsafe_values_recursively(
