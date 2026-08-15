@@ -53,8 +53,11 @@ def test_writer_persists_only_sanitized_fields(tmp_path: Path) -> None:
         {"clientSecret": "redacted-value"},
         {"refreshToken": "redacted-value"},
         {"nested": [{"sessionId": "redacted-value"}]},
+        {"authorizationHeader": "Basic redacted-value"},
+        {"cookieValue": "sid=redacted-value"},
         {"user": "member" + "@" + "example.invalid"},
         {"drive": {"filename": "redacted-document.txt"}},
+        {"drive": {"name": "Confidential-Finance.xlsx"}},
     ],
 )
 def test_writer_rejects_unsafe_values_recursively(

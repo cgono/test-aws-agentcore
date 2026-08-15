@@ -56,7 +56,7 @@ def assert_safe_evidence(value: object) -> None:
     _validate_value(value)
 
 
-def _validate_value(value: object) -> None:
+def _validate_value(value: object, *, inside_drive_mapping: bool = False) -> None:
     if value is None or isinstance(value, bool | int):
         return
     if isinstance(value, float):
@@ -70,19 +70,27 @@ def _validate_value(value: object) -> None:
         for key, nested_value in value.items():
             if not isinstance(key, str):
                 _reject()
-            _validate_key(key)
-            _validate_value(nested_value)
+            _validate_key(key, inside_drive_mapping=inside_drive_mapping)
+            _validate_value(
+                nested_value,
+                inside_drive_mapping=inside_drive_mapping or _is_drive_related_key(key),
+            )
         return
     if isinstance(value, Sequence) and not isinstance(value, bytes | bytearray):
         for nested_value in value:
-            _validate_value(nested_value)
+            _validate_value(nested_value, inside_drive_mapping=inside_drive_mapping)
         return
     _reject()
 
 
-def _validate_key(key: str) -> None:
+def _validate_key(key: str, *, inside_drive_mapping: bool) -> None:
     normalized = _normalize_field_name(key)
-    if normalized in _SECRET_FIELD_NAMES or normalized in _DRIVE_FILENAME_FIELD_NAMES:
+    if (
+        normalized in _SECRET_FIELD_NAMES
+        or normalized in _DRIVE_FILENAME_FIELD_NAMES
+        or normalized.startswith(("authorization_", "cookie_", "set_cookie_"))
+        or (inside_drive_mapping and normalized == "name")
+    ):
         _reject()
 
 
@@ -90,6 +98,11 @@ def _normalize_field_name(key: str) -> str:
     snake_case = _ACRONYM_BOUNDARY.sub(r"\1_\2", key)
     snake_case = _CAMEL_CASE_BOUNDARY.sub(r"\1_\2", snake_case)
     return snake_case.casefold().replace("-", "_")
+
+
+def _is_drive_related_key(key: str) -> bool:
+    normalized = _normalize_field_name(key)
+    return normalized == "drive" or normalized.startswith("drive_")
 
 
 def _validate_string(value: str) -> None:
