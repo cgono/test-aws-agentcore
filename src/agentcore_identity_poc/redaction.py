@@ -57,6 +57,7 @@ _SENSITIVE_FIELD_COMPONENTS = frozenset(
         "client",
         "code",
         "cookie",
+        "id",
         "key",
         "password",
         "refresh",
@@ -112,6 +113,8 @@ def _validate_value(value: object) -> None:
 
 def _validate_key(key: str) -> None:
     normalized = _normalize_field_name(key)
+    if normalized == "correlation_id":
+        return
     if (
         normalized in _SECRET_FIELD_NAMES
         or normalized in _DRIVE_FILENAME_FIELD_NAMES
