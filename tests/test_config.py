@@ -74,6 +74,8 @@ def test_settings_normalize_surrounding_whitespace_before_trailing_slashes() -> 
     "public_base_url",
     [
         "https:///relative",
+        "https://user@",
+        "https://:443",
         "https://poc-callback.example.test/metadata?unexpected=true",
         "https://poc-callback.example.test/metadata#fragment",
     ],

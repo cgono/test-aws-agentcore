@@ -57,12 +57,15 @@ class Settings:
         public_base_url = configured_values["public_base_url"]
         try:
             parsed_public_base_url = urlparse(public_base_url)
+            hostname = parsed_public_base_url.hostname
+            port = parsed_public_base_url.port
         except ValueError as error:
             raise SettingsError("PUBLIC_BASE_URL must use https") from error
 
         if (
             parsed_public_base_url.scheme != "https"
-            or not parsed_public_base_url.netloc
+            or not hostname
+            or not (port is None or 1 <= port <= 65535)
             or parsed_public_base_url.params
             or parsed_public_base_url.query
             or parsed_public_base_url.fragment
