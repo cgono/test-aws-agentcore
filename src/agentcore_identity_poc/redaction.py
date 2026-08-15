@@ -68,7 +68,17 @@ _SENSITIVE_FIELD_COMPONENTS = frozenset(
         "token",
     }
 )
-_AUTHORIZATION_QUERY_KEYS = frozenset({"code", "session_id", "state"})
+_AUTHORIZATION_QUERY_KEYS = frozenset(
+    {
+        "access_token",
+        "code",
+        "id_token",
+        "refresh_token",
+        "session_id",
+        "state",
+        "token",
+    }
+)
 
 
 def assert_safe_evidence(value: object) -> None:
