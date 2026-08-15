@@ -42,12 +42,12 @@ def _is_public_callback_hostname(hostname: str) -> bool:
     if hostname.lower() == "localhost":
         return False
 
-    if _is_alternate_ipv4_literal(hostname):
-        return False
-
     try:
         return ip_address(hostname).is_global
     except ValueError:
+        if _is_alternate_ipv4_literal(hostname):
+            return False
+
         try:
             idna_hostname = hostname.encode("idna").decode("ascii")
         except UnicodeError:

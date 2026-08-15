@@ -36,6 +36,12 @@ def test_settings_derive_pinned_issuer_and_callback() -> None:
     assert settings.google_return_url == "https://poc-callback.example.test/oauth/google/return"
 
 
+def test_settings_allow_global_ipv4_callback() -> None:
+    settings = Settings.from_mapping(BASE | {"PUBLIC_BASE_URL": "https://8.8.8.8"})
+
+    assert settings.google_return_url == "https://8.8.8.8/oauth/google/return"
+
+
 def test_settings_require_nonempty_values() -> None:
     values = BASE | {"ENTRA_TENANT_ID": ""}
 
