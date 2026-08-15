@@ -35,6 +35,7 @@ _SECRET_FIELD_NAMES = frozenset(
         "id_token",
         "password",
         "preferred_username",
+        "puid",
         "refresh_token",
         "secret",
         "session_id",
@@ -48,6 +49,7 @@ _SECRET_FIELD_NAMES = frozenset(
         "upn",
         "oid",
         "user_principal_name",
+        "username",
     }
 )
 _DRIVE_FILENAME_FIELD_NAMES = frozenset(
@@ -154,7 +156,10 @@ def _validate_string(value: str) -> None:
 def _contains_authorization_url(value: str) -> bool:
     for candidate in _URL_PATTERN.findall(value):
         query = urlsplit(candidate.rstrip(".,;)")).query
-        if any(key.casefold() in _AUTHORIZATION_QUERY_KEYS for key, _ in parse_qsl(query)):
+        if any(
+            key.casefold() in _AUTHORIZATION_QUERY_KEYS
+            for key, _ in parse_qsl(query, keep_blank_values=True)
+        ):
             return True
     return False
 

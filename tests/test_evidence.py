@@ -59,6 +59,7 @@ def test_writer_persists_nonsecret_correlation_identifier(tmp_path: Path) -> Non
         {"href": "https://auth.example.test/authorize?refresh_token=redacted"},
         {"href": "https://auth.example.test/authorize?id_token=redacted"},
         {"href": "https://auth.example.test/authorize?token=redacted"},
+        {"href": "https://auth.example.test/return?code="},
         {"cookie": "redacted-value"},
         {"client_secret": "redacted-value"},
         {"nested": [{"refresh_token": "redacted-value"}]},
@@ -92,6 +93,8 @@ def test_writer_persists_nonsecret_correlation_identifier(tmp_path: Path) -> Non
         {"sid": "opaque"},
         {"given_name": "opaque"},
         {"family_name": "opaque"},
+        {"username": "opaque"},
+        {"puid": "opaque"},
     ],
 )
 def test_writer_rejects_unsafe_values_recursively(
