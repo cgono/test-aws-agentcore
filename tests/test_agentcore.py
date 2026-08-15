@@ -130,6 +130,7 @@ def test_complete_google_binds_the_signed_user_jwt_to_the_session() -> None:
     ("code", "exception_type"),
     [
         ("AccessDeniedException", AgentCoreAccessDenied),
+        ("UnauthorizedException", AgentCoreAccessDenied),
         ("ThrottlingException", AgentCoreThrottled),
         ("ValidationException", AgentCoreValidationError),
         ("InternalServerException", AgentCoreInternalError),

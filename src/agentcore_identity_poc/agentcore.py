@@ -84,7 +84,9 @@ class AgentCoreInternalError(AgentCoreError):
     message = "AgentCore Identity request could not be completed"
 
 
-_ACCESS_DENIED_CODES = frozenset({"AccessDenied", "AccessDeniedException", "Unauthorized"})
+_ACCESS_DENIED_CODES = frozenset(
+    {"AccessDenied", "AccessDeniedException", "Unauthorized", "UnauthorizedException"}
+)
 _THROTTLING_CODES = frozenset(
     {"LimitExceededException", "Throttling", "ThrottlingException", "TooManyRequestsException"}
 )
