@@ -32,7 +32,23 @@ def _is_public_callback_hostname(hostname: str) -> bool:
     try:
         return ip_address(hostname).is_global
     except ValueError:
-        return True
+        try:
+            idna_hostname = hostname.encode("idna").decode("ascii")
+        except UnicodeError:
+            return False
+
+    labels = idna_hostname.split(".")
+    return len(labels) >= 2 and all(
+        label
+        and len(label) <= 63
+        and not label.startswith("-")
+        and not label.endswith("-")
+        and all(
+            character.isascii() and (character.isalnum() or character == "-")
+            for character in label
+        )
+        for label in labels
+    )
 
 
 @dataclass(frozen=True)
