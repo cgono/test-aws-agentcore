@@ -5,11 +5,12 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import httpx
 import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from agentcore_identity_poc.jwt_validation import JwtPolicy, TokenRejected
+from agentcore_identity_poc.jwt_validation import JwtPolicy, TokenRejected, make_http_jwks_loader
 
 ISSUER = "https://login.microsoftonline.com/example-tenant/v2.0"
 AUDIENCE = "api://agentcore-resource"
@@ -151,3 +152,56 @@ def test_uses_cached_jwks_for_five_minutes(
     policy.validate(token_factory())
 
     assert calls == 2
+
+
+@pytest.mark.parametrize("jwks_url", ["http://keys.example/jwks", "https://", "not a URL"])
+def test_http_jwks_loader_rejects_non_absolute_https_urls(jwks_url: str) -> None:
+    with pytest.raises(ValueError, match="absolute HTTPS"):
+        make_http_jwks_loader(jwks_url)
+
+
+def test_http_jwks_loader_filters_non_public_rsa_keys(jwk: dict[str, Any]) -> None:
+    received_timeout: object | None = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal received_timeout
+        received_timeout = request.extensions["timeout"]
+        return httpx.Response(
+            200,
+            json={
+                "keys": [
+                    jwk,
+                    {**jwk, "kid": "private", "d": "not-public"},
+                    {"kty": "EC", "kid": "elliptic"},
+                ]
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        keys = make_http_jwks_loader("https://keys.example/jwks", client)()["keys"]
+
+    assert keys == [jwk]
+    assert received_timeout == {"connect": 5.0, "read": 5.0, "write": 5.0, "pool": 5.0}
+
+
+@pytest.mark.parametrize("body", [[], {}, {"keys": "not-a-list"}])
+def test_http_jwks_loader_rejects_malformed_responses(body: object) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=body)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        loader = make_http_jwks_loader("https://keys.example/jwks", client)
+
+        with pytest.raises(ValueError):
+            loader()
+
+
+def test_http_jwks_loader_propagates_http_errors() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        loader = make_http_jwks_loader("https://keys.example/jwks", client)
+
+        with pytest.raises(httpx.HTTPStatusError):
+            loader()

@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 import jwt
@@ -23,6 +24,7 @@ class TokenRejected(ValueError):
 
 def make_http_jwks_loader(jwks_url: str, client: httpx.Client | None = None) -> JwksLoader:
     """Return a loader that obtains only public RSA signing JWKs over HTTPS."""
+    _require_absolute_https_url(jwks_url)
 
     def load() -> Jwks:
         if client is None:
@@ -31,6 +33,16 @@ def make_http_jwks_loader(jwks_url: str, client: httpx.Client | None = None) -> 
         return _fetch_public_jwks(client, jwks_url)
 
     return load
+
+
+def _require_absolute_https_url(jwks_url: str) -> None:
+    try:
+        parsed_url = urlparse(jwks_url)
+        has_host = parsed_url.hostname is not None
+    except ValueError as error:
+        raise ValueError("JWKS URL must be an absolute HTTPS URL") from error
+    if parsed_url.scheme != "https" or not has_host:
+        raise ValueError("JWKS URL must be an absolute HTTPS URL")
 
 
 def _fetch_public_jwks(client: httpx.Client, jwks_url: str) -> Jwks:
