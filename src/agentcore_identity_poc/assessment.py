@@ -130,6 +130,7 @@ def finalize_terminal_evidence(
     output_path: Path,
     *,
     h5_compatibility_reviewed: bool,
+    allow_deferred_failures: bool,
 ) -> None:
     """Write minimal terminal evidence selected against actual sanitized observations."""
 
@@ -137,21 +138,36 @@ def finalize_terminal_evidence(
     observations = load_sanitized_observations(evidence_path)
     if any(_is_terminal(row) for row in observations):
         raise AssessmentError("terminal evidence must be finalized from nonterminal observations")
-    observed_operations = {
-        (hypothesis, operation)
+    observed_evidence = {
+        (hypothesis, operation, outcome)
         for row in observations
-        for hypothesis, operation in [(row["hypothesis"], row["operation"])]
-        if isinstance(hypothesis, str) and isinstance(operation, str)
+        for hypothesis, operation, outcome in [
+            (row["hypothesis"], row["operation"], row["outcome"])
+        ]
+        if isinstance(hypothesis, str) and isinstance(operation, str) and isinstance(outcome, str)
     }
     for hypothesis in REQUIRED_HYPOTHESES:
         if hypothesis == "H5":
             if not h5_compatibility_reviewed:
                 raise AssessmentError("H5 requires explicit compatibility review")
-        elif not any(
-            (hypothesis, operation) in observed_operations
-            for operation in _SOURCE_OPERATIONS[hypothesis]
+            continue
+        source_outcomes = {
+            outcome
+            for observed_hypothesis, operation, outcome in observed_evidence
+            if observed_hypothesis == hypothesis and operation in _SOURCE_OPERATIONS[hypothesis]
+        }
+        if selected_results[hypothesis] == "pass" and "pass" not in source_outcomes:
+            raise AssessmentError(
+                f"passing terminal result lacks passing source evidence for {hypothesis}"
+            )
+        if (
+            selected_results[hypothesis] == "fail"
+            and not any(outcome != "pass" for outcome in source_outcomes)
+            and not allow_deferred_failures
         ):
-            raise AssessmentError(f"missing source evidence for {hypothesis}")
+            raise AssessmentError(
+                f"failing terminal result requires non-pass evidence for {hypothesis}"
+            )
 
     rows = [
         {

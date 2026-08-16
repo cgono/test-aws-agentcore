@@ -9,6 +9,12 @@ the explicit H5 compatibility-review acknowledgement because H5 is a documented 
 It writes exactly one `assessment_terminal` row with `details.terminal=true` for each hypothesis;
 it does not copy observation details or provider responses.
 
+A selected `pass` requires at least one matching POC observation with outcome `pass`. A selected
+`fail` requires matching non-pass evidence, unless an operator deliberately records a defer with
+`--allow-deferred-failures`. A later `pass` still requires new matching passing source evidence;
+a defer cannot be relabeled as a pass. H5 uses the explicit compatibility-review acknowledgement
+instead of a machine-generated observation, and H5 `pass` requires that acknowledgement.
+
 ```sh
 .venv/bin/agentcore-identity-poc assessment-finalize \
   --evidence evidence/sanitized.jsonl \
@@ -39,6 +45,8 @@ a substitute for live evidence. `assessment.md` is deliberately not committed be
 The command emits status-only Markdown and excludes provider responses, credentials, tokens,
 authorization URLs, and evidence details. The four acceptance switches are explicit
 platform/security decisions after reviewing sanitized IAM, audit, latency, and quota observations.
+Use `--allow-deferred-failures` only when the terminal failure is an explicit operator defer rather
+than an observed non-pass result.
 
 ## Hypothesis Results
 

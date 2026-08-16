@@ -206,14 +206,18 @@ def assessment_finalize(
     h5_compatibility_reviewed: Annotated[
         bool, typer.Option("--h5-compatibility-reviewed")
     ] = False,
+    allow_deferred_failures: Annotated[
+        bool, typer.Option("--allow-deferred-failures")
+    ] = False,
 ) -> None:
-    """Create minimal terminal evidence from sanitized POC observations."""
+    """Create terminal evidence; a deferred failure requires explicit operator acknowledgement."""
     try:
         finalize_terminal_evidence(
             evidence,
             result or [],
             output,
             h5_compatibility_reviewed=h5_compatibility_reviewed,
+            allow_deferred_failures=allow_deferred_failures,
         )
     except AssessmentError:
         typer.echo(_json_line({"status": "blocked", "category": "assessment_incomplete"}))

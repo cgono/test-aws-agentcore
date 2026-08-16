@@ -313,15 +313,69 @@ def _nonterminal_rows() -> list[dict[str, object]]:
     ]
 
 
-def _result_arguments() -> list[str]:
+def _result_arguments(h3_outcome: str = "pass", h8_outcome: str = "pass") -> list[str]:
     arguments: list[str] = []
     for hypothesis in passing_results():
-        arguments.extend(["--result", f"{hypothesis}=pass"])
+        outcome = h3_outcome if hypothesis == "H3" else h8_outcome if hypothesis == "H8" else "pass"
+        arguments.extend(["--result", f"{hypothesis}={outcome}"])
     return arguments
 
 
-def test_terminalization_creates_minimal_evidence_that_report_can_consume(tmp_path) -> None:
+def _all_supported_nonterminal_rows() -> list[dict[str, object]]:
+    rows = _nonterminal_rows()
+    rows[2] = {
+        "hypothesis": "H3",
+        "operation": "google_vault_token",
+        "outcome": "pass",
+        "details": {},
+    }
+    return rows
+
+
+def test_terminalization_preserves_h3_failure_and_report_rejects(tmp_path) -> None:
     evidence = write_evidence(tmp_path, _nonterminal_rows())
+    terminal = tmp_path / "terminal.jsonl"
+    assessment = tmp_path / "assessment.md"
+
+    finalize = CliRunner().invoke(
+        app,
+        [
+            "assessment-finalize",
+            "--evidence",
+            str(evidence),
+            "--output",
+            str(terminal),
+            "--h5-compatibility-reviewed",
+            *_result_arguments(h3_outcome="fail"),
+        ],
+    )
+    report = CliRunner().invoke(
+        app,
+        [
+            "report",
+            "--evidence",
+            str(terminal),
+            "--output",
+            str(assessment),
+            "--iam-acceptable",
+            "--audit-acceptable",
+            "--latency-acceptable",
+            "--quota-acceptable",
+        ],
+    )
+
+    assert finalize.exit_code == 0
+    assert report.exit_code == 0
+    terminal_rows = [json.loads(line) for line in terminal.read_text(encoding="utf-8").splitlines()]
+    assert [row["hypothesis"] for row in terminal_rows] == list(passing_results())
+    assert all(row["operation"] == "assessment_terminal" for row in terminal_rows)
+    assert all(row["details"] == {"terminal": True} for row in terminal_rows)
+    assert terminal_rows[2]["outcome"] == "fail"
+    assert "**reject_or_defer**" in assessment.read_text(encoding="utf-8")
+
+
+def test_terminalization_creates_adoptable_report_with_passing_source_evidence(tmp_path) -> None:
+    evidence = write_evidence(tmp_path, _all_supported_nonterminal_rows())
     terminal = tmp_path / "terminal.jsonl"
     assessment = tmp_path / "assessment.md"
 
@@ -354,10 +408,50 @@ def test_terminalization_creates_minimal_evidence_that_report_can_consume(tmp_pa
 
     assert finalize.exit_code == 0
     assert report.exit_code == 0
-    terminal_rows = [json.loads(line) for line in terminal.read_text(encoding="utf-8").splitlines()]
-    assert [row["hypothesis"] for row in terminal_rows] == list(passing_results())
-    assert all(row["operation"] == "assessment_terminal" for row in terminal_rows)
-    assert all(row["details"] == {"terminal": True} for row in terminal_rows)
+    assert "**adopt_with_caveats**" in assessment.read_text(encoding="utf-8")
+
+
+def test_terminalization_rejects_h3_failure_selected_as_pass(tmp_path) -> None:
+    evidence = write_evidence(tmp_path, _nonterminal_rows())
+    terminal = tmp_path / "terminal.jsonl"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "assessment-finalize",
+            "--evidence",
+            str(evidence),
+            "--output",
+            str(terminal),
+            "--h5-compatibility-reviewed",
+            *_result_arguments(),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert not terminal.exists()
+
+
+def test_terminalization_requires_explicit_acknowledgement_for_deferred_failure(tmp_path) -> None:
+    evidence = write_evidence(tmp_path, _all_supported_nonterminal_rows())
+    terminal = tmp_path / "terminal.jsonl"
+    command = [
+        "assessment-finalize",
+        "--evidence",
+        str(evidence),
+        "--output",
+        str(terminal),
+        "--h5-compatibility-reviewed",
+        *_result_arguments(h8_outcome="fail"),
+    ]
+
+    blocked = CliRunner().invoke(app, command)
+    deferred = CliRunner().invoke(app, [*command, "--allow-deferred-failures"])
+
+    assert blocked.exit_code == 2
+    assert deferred.exit_code == 0
+    rows = [json.loads(line) for line in terminal.read_text(encoding="utf-8").splitlines()]
+    assert rows[-1]["outcome"] == "fail"
 
 
 @pytest.mark.parametrize(
