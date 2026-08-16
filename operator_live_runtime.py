@@ -85,7 +85,9 @@ class OperatorLiveRuntime:
         # Not programmatically detectable: MSAL's device-flow response carries no consent
         # signal. Default the ambiguous/blank answer to True, the conservative failing case.
         consent_prompt_seen = _confirm(
-            f"Did a consent/permission screen appear for '{user_alias}'? [y/N]: "
+            f"Did a consent/permission screen appear for '{user_alias}'? "
+            "Type 'n' or 'no' if it did NOT appear -- any other answer, including blank, "
+            "is treated as consent seen and fails H2: "
         )
 
         runtime.validate_token(settings, inbound_token)
@@ -246,6 +248,7 @@ class OperatorLiveRuntime:
 
         settings = Settings.from_mapping(os.environ)
         identity = cli._agentcore_identity(settings)
+        writer = cli._default_runtime().evidence_writer(cli._DEFAULT_GOOGLE_EVIDENCE_PATH)
         try:
             identity.obo_token(
                 state["workload_token"],
@@ -253,8 +256,25 @@ class OperatorLiveRuntime:
                 [settings.entra_downstream_scope],
             )
         except AgentCoreError:
+            # Without this row, H7 can never be finalized as passing:
+            # assessment.finalize_terminal_evidence cross-checks an operator-selected
+            # H7=pass/fail against an actual "obo_after_inbound_expiry" evidence row.
+            cli._append(
+                writer,
+                "H7",
+                "obo_after_inbound_expiry",
+                "fail",
+                {"source_expired": True, "obo_succeeded": False},
+            )
             _RAW_H7_STATE_PATH.unlink(missing_ok=True)
             return "failed"
+        cli._append(
+            writer,
+            "H7",
+            "obo_after_inbound_expiry",
+            "pass",
+            {"source_expired": True, "obo_succeeded": True},
+        )
         _RAW_H7_STATE_PATH.unlink(missing_ok=True)
         return True
 
@@ -267,7 +287,9 @@ def create_runtime() -> OperatorLiveRuntime:
 def _confirm(prompt: str) -> bool:
     try:
         answer = input(prompt)
-    except EOFError:
+    except (EOFError, OSError):
+        # OSError: pytest captures stdin unless run with -s, exactly as the runbook
+        # specifies for every live gate; treat that the same as no answer at all.
         return True
     return answer.strip().lower() not in {"n", "no"}
 

@@ -101,6 +101,11 @@ AGENTCORE_POC_LIVE_RUNTIME=operator_live_runtime:create_runtime \
 requested live run without this runtime fails clearly. It must run both aliases and record H1,
 H2, and H6. Stop before Google work when this gate fails.
 
+Always run every live gate as `.venv/bin/python -m pytest`, never a bare `pytest`. The `-m` form
+puts the current directory on `sys.path`, which is the only reason the root-level
+`operator_live_runtime` module (and its `scripts.provision_agentcore` import) resolves; a bare
+`pytest` invocation fails with an opaque `could not load AGENTCORE_POC_LIVE_RUNTIME` error.
+
 ## Google Browser Callback
 
 Run the callback service with its production factory. The factory reads the existing POC
@@ -323,7 +328,15 @@ point. Wait for a default Entra access token to actually expire (typically 60-90
 configurable by this POC), then rerun the identical command. The operator runtime checks real
 elapsed time itself; it never sleeps inside the process. A completed second run reports `True`
 only if the existing workload access token still obtained a fresh downstream token after its
-source JWT expired.
+source JWT expired. That second run also writes the durable H7 `obo_after_inbound_expiry`
+evidence row; `assessment-finalize` requires that row to accept an `H7=pass` selection, so a
+missing second run is not just an unfinished measurement, it makes `H7=pass` unreachable.
+
+`scripts/provision_agentcore.py cleanup` does not remove `evidence/raw/`. If the H7 flow is
+abandoned between the two runs (for example, the operator does not return after the wait), a
+real workload access token is left sitting in
+`evidence/raw/h7-source-expiry-state.json` until the second run completes and deletes it, or
+until it is removed by hand. Delete that file manually if the H7 flow is abandoned.
 
 ### Assessment
 
