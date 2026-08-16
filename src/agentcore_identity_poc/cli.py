@@ -360,7 +360,6 @@ def measure_concurrency_command(
     stage_latency_ms = _stage_latency_details(measurements)
     readiness_details = _concurrency_readiness(
         workers=workers,
-        requests=requests,
         documented_quota=documented_quota,
         temporal_target=temporal_target,
     )
@@ -578,11 +577,11 @@ def measure_cloudtrail_command(
     _append(
         writer,
         "H7",
-        "measure_cloudtrail",
+        "audit_attribution",
         attribution.outcome,
         {
             "lookback_minutes": lookback_minutes,
-            "event_count": attribution.event_count,
+            "eligible_event_count": attribution.eligible_event_count,
             "aws_principal_present": attribution.aws_principal_present,
             "workload_identity_present": attribution.workload_identity_present,
             "user_correlation_present": attribution.user_correlation_present,
@@ -594,7 +593,7 @@ def measure_cloudtrail_command(
                 "status": attribution.outcome,
                 "operation": "measure_cloudtrail",
                 "lookback_minutes": lookback_minutes,
-                "event_count": attribution.event_count,
+                "eligible_event_count": attribution.eligible_event_count,
                 "aws_principal_present": attribution.aws_principal_present,
                 "workload_identity_present": attribution.workload_identity_present,
                 "user_correlation_present": attribution.user_correlation_present,
@@ -1534,38 +1533,50 @@ def _stage_latency_details(
 def _concurrency_readiness(
     *,
     workers: int,
-    requests: int,
     documented_quota: int | None,
     temporal_target: int | None,
 ) -> dict[str, JsonValue]:
     """Compare operator-declared limits without inferring unverified AWS service quotas."""
-    quota_status = (
+    probe_quota_status = (
         "unknown"
         if documented_quota is None
-        else "within_documented_quota"
+        else "probe_within_quota"
         if workers <= documented_quota
-        else "exceeds_documented_quota"
+        else "probe_exceeds_quota"
     )
-    temporal_status = (
+    target_quota_status = (
+        "unknown"
+        if temporal_target is None or documented_quota is None
+        else "target_within_quota"
+        if temporal_target <= documented_quota
+        else "target_exceeds_quota"
+    )
+    probe_target_status = (
         "unknown"
         if temporal_target is None
-        else "within_temporal_target"
-        if requests <= temporal_target
-        else "exceeds_temporal_target"
+        else "probe_exercises_target"
+        if workers >= temporal_target
+        else "probe_below_target"
     )
     readiness = (
         "unknown"
-        if "unknown" in {quota_status, temporal_status}
+        if "unknown" in {probe_quota_status, target_quota_status, probe_target_status}
         else "ready"
-        if quota_status == "within_documented_quota"
-        and temporal_status == "within_temporal_target"
+        if probe_quota_status == "probe_within_quota"
+        and target_quota_status == "target_within_quota"
+        and probe_target_status == "probe_exercises_target"
+        else "unknown"
+        if probe_quota_status == "probe_within_quota"
+        and target_quota_status == "target_within_quota"
+        and probe_target_status == "probe_below_target"
         else "not_ready"
     )
     return {
         "documented_quota": documented_quota,
         "temporal_target": temporal_target,
-        "quota_status": quota_status,
-        "temporal_status": temporal_status,
+        "probe_quota_status": probe_quota_status,
+        "target_quota_status": target_quota_status,
+        "probe_target_status": probe_target_status,
         "readiness": readiness,
     }
 
@@ -1687,26 +1698,27 @@ def _cloudtrail_attribution_from_events(
 ) -> CloudTrailAttribution:
     """Derive only required field-presence booleans from raw event payloads in memory."""
     parsed_events = [_decode_cloudtrail_event(event) for event in events]
-    return CloudTrailAttribution(
-        event_count=len(events),
-        aws_principal_present=any(
-            _mapping_has_any_key(event, {"arn", "principalid", "accountid"}, under="useridentity")
-            for event in parsed_events
-        ),
-        workload_identity_present=any(
+    eligible_events = [event for event in parsed_events if _is_provider_token_event(event)]
+    category_presence = [
+        (
+            _mapping_has_any_key(event, {"arn", "principalid", "accountid"}, under="useridentity"),
             _mapping_has_any_key(
                 event,
                 {"workloadname", "workloadidentity", "workloadidentitytoken"},
-            )
-            for event in parsed_events
-        ),
-        user_correlation_present=any(
+            ),
             _mapping_has_any_key(
                 event,
                 {"useridentifier", "userid", "usertoken", "customstate"},
-            )
-            for event in parsed_events
-        ),
+            ),
+        )
+        for event in eligible_events
+    ]
+    return CloudTrailAttribution(
+        eligible_event_count=len(eligible_events),
+        aws_principal_present=any(principal for principal, _, _ in category_presence),
+        workload_identity_present=any(workload for _, workload, _ in category_presence),
+        user_correlation_present=any(user for _, _, user in category_presence),
+        attribution_complete=any(all(categories) for categories in category_presence),
     )
 
 
@@ -1719,6 +1731,15 @@ def _decode_cloudtrail_event(event: Mapping[str, object]) -> Mapping[str, object
     except json.JSONDecodeError:
         return {}
     return decoded if isinstance(decoded, Mapping) else {}
+
+
+def _is_provider_token_event(event: Mapping[str, object]) -> bool:
+    """Keep only the documented AgentCore provider-token retrieval operation."""
+    event_name = next(
+        (value for key, value in event.items() if key.casefold() == "eventname"),
+        None,
+    )
+    return isinstance(event_name, str) and event_name.casefold() == "getresourceoauth2token"
 
 
 def _mapping_has_any_key(

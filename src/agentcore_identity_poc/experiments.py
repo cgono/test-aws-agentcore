@@ -142,22 +142,16 @@ class SourceExpiryExperiment:
 class CloudTrailAttribution:
     """Presence-only attribution summary derived in memory from CloudTrail events."""
 
-    event_count: int
+    eligible_event_count: int
     aws_principal_present: bool
     workload_identity_present: bool
     user_correlation_present: bool
+    attribution_complete: bool = False
 
     @property
     def outcome(self) -> str:
         """An attribution claim requires all privacy-preserving categories to be present."""
-        if (
-            self.event_count > 0
-            and self.aws_principal_present
-            and self.workload_identity_present
-            and self.user_correlation_present
-        ):
-            return "pass"
-        return "unknown"
+        return "pass" if self.attribution_complete else "unknown"
 
 
 @dataclass(frozen=True)

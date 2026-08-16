@@ -730,6 +730,7 @@ def test_cloudtrail_attribution_parses_only_field_presence() -> None:
             {
                 "CloudTrailEvent": json.dumps(
                     {
+                        "eventName": "GetResourceOauth2Token",
                         "userIdentity": {"principalId": "sensitive-principal"},
                         "requestParameters": {
                             "workloadName": "approved-workload",
@@ -742,10 +743,11 @@ def test_cloudtrail_attribution_parses_only_field_presence() -> None:
     )
 
     assert attribution == CloudTrailAttribution(
-        event_count=1,
+        eligible_event_count=1,
         aws_principal_present=True,
         workload_identity_present=True,
         user_correlation_present=True,
+        attribution_complete=True,
     )
 
 
@@ -756,7 +758,7 @@ def test_measure_cloudtrail_reports_unknown_when_attribution_fields_are_missing(
     runtime = replace(
         _measurement_runtime(MeasurementIdentity(), evidence),
         cloudtrail_events=lambda _, __: CloudTrailAttribution(
-            event_count=2,
+            eligible_event_count=2,
             aws_principal_present=True,
             workload_identity_present=False,
             user_correlation_present=False,
@@ -771,17 +773,24 @@ def test_measure_cloudtrail_reports_unknown_when_attribution_fields_are_missing(
         "status": "unknown",
         "operation": "measure_cloudtrail",
         "lookback_minutes": 30,
-        "event_count": 2,
+        "eligible_event_count": 2,
         "aws_principal_present": True,
         "workload_identity_present": False,
         "user_correlation_present": False,
     }
+    assert evidence.observations[-1].as_dict()["operation"] == "audit_attribution"
     assert "sensitive" not in repr(evidence.observations)
 
 
 @pytest.mark.parametrize(
     ("quota", "target", "readiness"),
-    [(5, 20, "ready"), (1, 20, "not_ready"), (None, None, "unknown")],
+    [
+        (5, 20, "not_ready"),
+        (1, 20, "not_ready"),
+        (5, 5, "unknown"),
+        (5, 2, "ready"),
+        (None, None, "unknown"),
+    ],
 )
 def test_measure_concurrency_reports_documented_quota_and_temporal_readiness(
     monkeypatch: pytest.MonkeyPatch,
@@ -808,6 +817,83 @@ def test_measure_concurrency_reports_documented_quota_and_temporal_readiness(
     assert rendered["readiness"] == readiness
     assert rendered["documented_quota"] == quota
     assert rendered["temporal_target"] == target
+
+
+def test_cloudtrail_attribution_does_not_combine_categories_across_events() -> None:
+    attribution = _cloudtrail_attribution_from_events(
+        [
+            {
+                "CloudTrailEvent": json.dumps(
+                    {
+                        "eventName": "GetResourceOauth2Token",
+                        "userIdentity": {"principalId": "sensitive-principal"},
+                    }
+                )
+            },
+            {
+                "CloudTrailEvent": json.dumps(
+                    {
+                        "eventName": "GetResourceOauth2Token",
+                        "requestParameters": {"workloadName": "approved-workload"},
+                    }
+                )
+            },
+            {
+                "CloudTrailEvent": json.dumps(
+                    {
+                        "eventName": "GetResourceOauth2Token",
+                        "requestParameters": {"userIdentifier": "sensitive-user"},
+                    }
+                )
+            },
+        ]
+    )
+
+    assert attribution.eligible_event_count == 3
+    assert attribution.aws_principal_present is True
+    assert attribution.workload_identity_present is True
+    assert attribution.user_correlation_present is True
+    assert attribution.outcome == "unknown"
+
+
+def test_cloudtrail_attribution_ignores_unrelated_events_and_requires_one_complete_event() -> None:
+    attribution = _cloudtrail_attribution_from_events(
+        [
+            {
+                "CloudTrailEvent": json.dumps(
+                    {
+                        "eventName": "GetWorkloadAccessTokenForJWT",
+                        "userIdentity": {"principalId": "sensitive-principal"},
+                        "requestParameters": {
+                            "workloadName": "approved-workload",
+                            "userIdentifier": "sensitive-user",
+                        },
+                    }
+                )
+            },
+            {
+                "CloudTrailEvent": json.dumps(
+                    {
+                        "eventName": "getresourceoauth2token",
+                        "userIdentity": {"principalId": "sensitive-principal"},
+                        "requestParameters": {
+                            "workloadName": "approved-workload",
+                            "userIdentifier": "sensitive-user",
+                        },
+                    }
+                )
+            },
+        ]
+    )
+
+    assert attribution == CloudTrailAttribution(
+        eligible_event_count=1,
+        aws_principal_present=True,
+        workload_identity_present=True,
+        user_correlation_present=True,
+        attribution_complete=True,
+    )
+    assert attribution.outcome == "pass"
 
 
 def test_offboard_google_detects_drive_revocation_before_forcing_authentication(
