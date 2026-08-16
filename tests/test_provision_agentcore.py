@@ -325,15 +325,26 @@ def test_apply_rejects_missing_policy_prerequisites_before_budget_api(tmp_path: 
         )
 
 
-def test_apply_cli_rejects_invalid_policy_environment_before_aws_session(
+@pytest.mark.parametrize(
+    ("environment_name", "environment_value"),
+    [
+        ("AGENTCORE_DIRECTORY_ARN", " \t "),
+        ("AGENTCORE_TOKEN_VAULT_ARN", "\n"),
+        ("AGENTCORE_POC_IAM_ROLE_NAME", "  "),
+    ],
+)
+def test_apply_cli_rejects_whitespace_policy_environment_before_aws_session(
     monkeypatch: pytest.MonkeyPatch,
+    environment_name: str,
+    environment_value: str,
 ) -> None:
     monkeypatch.setattr(
         "scripts.provision_agentcore.Settings.from_mapping", lambda _: SETTINGS
     )
-    monkeypatch.delenv("AGENTCORE_DIRECTORY_ARN", raising=False)
+    monkeypatch.setenv("AGENTCORE_DIRECTORY_ARN", "arn:directory:returned")
     monkeypatch.setenv("AGENTCORE_TOKEN_VAULT_ARN", "arn:vault:returned")
     monkeypatch.setenv("AGENTCORE_POC_IAM_ROLE_NAME", "agentcore-poc-role")
+    monkeypatch.setenv(environment_name, environment_value)
     monkeypatch.setattr(
         "scripts.provision_agentcore.boto3.session.Session",
         lambda **_kwargs: (_ for _ in ()).throw(
@@ -350,9 +361,12 @@ def test_apply_cli_rejects_invalid_policy_environment_before_aws_session(
         ("", "arn:vault:returned", "agentcore-poc-role"),
         ("arn:directory:returned", "", "agentcore-poc-role"),
         ("arn:directory:returned", "arn:vault:returned", ""),
+        (" \t ", "arn:vault:returned", "agentcore-poc-role"),
+        ("arn:directory:returned", "\n", "agentcore-poc-role"),
+        ("arn:directory:returned", "arn:vault:returned", "  "),
     ],
 )
-def test_apply_rejects_blank_policy_prerequisites_before_aws_calls(
+def test_apply_rejects_blank_or_whitespace_policy_prerequisites_before_aws_calls(
     tmp_path: Path,
     directory_arn: str,
     vault_arn: str,
