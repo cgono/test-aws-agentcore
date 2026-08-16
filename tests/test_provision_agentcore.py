@@ -139,6 +139,41 @@ class RecordingControlClient:
         return {}
 
 
+class FailingOnceCleanupControlClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, object]]] = []
+        self.provider_exists = True
+        self.workloads = {"approved-workload", "unapproved-workload"}
+        self.fail_first_workload_delete = True
+
+    def delete_oauth2_credential_provider(self, *, name: str) -> dict[str, object]:
+        self.calls.append(("delete_oauth2_credential_provider", {"name": name}))
+        if not self.provider_exists:
+            raise ClientError(
+                {"Error": {"Code": "ResourceNotFoundException"}},
+                "DeleteOauth2CredentialProvider",
+            )
+        self.provider_exists = False
+        return {}
+
+    def delete_workload_identity(self, *, name: str) -> dict[str, object]:
+        self.calls.append(("delete_workload_identity", {"name": name}))
+        if self.fail_first_workload_delete:
+            self.fail_first_workload_delete = False
+            raise RuntimeError("temporary deletion failure")
+        if name not in self.workloads:
+            raise ClientError(
+                {"Error": {"Code": "ResourceNotFoundException"}}, "DeleteWorkloadIdentity"
+            )
+        self.workloads.remove(name)
+        return {}
+
+
+class NoControlCallsClient:
+    def __getattr__(self, name: str) -> object:
+        raise AssertionError(f"control-plane method must not be accessed: {name}")
+
+
 class RecordingIamClient:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
@@ -270,6 +305,39 @@ def test_apply_rejects_missing_scoped_policy_prerequisites_before_creation(tmp_p
     assert control.calls == []
 
 
+@pytest.mark.parametrize(
+    ("directory_arn", "vault_arn", "iam_role_name"),
+    [
+        ("", "arn:vault:returned", "agentcore-poc-role"),
+        ("arn:directory:returned", "", "agentcore-poc-role"),
+        ("arn:directory:returned", "arn:vault:returned", ""),
+    ],
+)
+def test_apply_rejects_blank_policy_prerequisites_before_control_plane_calls(
+    tmp_path: Path,
+    directory_arn: str,
+    vault_arn: str,
+    iam_role_name: str,
+) -> None:
+    state_path = tmp_path / ".poc-state.json"
+
+    with pytest.raises(ProvisioningError, match="all required for policy install"):
+        apply_resources(
+            SETTINGS,
+            "123456789012",
+            budgets_client=PresentBudgetClient(),
+            control_client=NoControlCallsClient(),
+            state_path=state_path,
+            entra_client_secret="not-logged",
+            directory_arn=directory_arn,
+            vault_arn=vault_arn,
+            iam_client=RecordingIamClient(),
+            iam_role_name=iam_role_name,
+        )
+
+    assert not state_path.exists()
+
+
 def test_cleanup_deletes_only_recorded_resources_after_exact_confirmation(tmp_path: Path) -> None:
     control = RecordingControlClient()
     iam = RecordingIamClient()
@@ -306,6 +374,53 @@ def test_cleanup_deletes_only_recorded_resources_after_exact_confirmation(tmp_pa
         "delete_oauth2_credential_provider",
         "delete_workload_identity",
         "delete_workload_identity",
+    ]
+    assert not state_path.exists()
+
+
+def test_cleanup_retries_after_partial_failure_when_prior_delete_is_not_found(
+    tmp_path: Path,
+) -> None:
+    control = FailingOnceCleanupControlClient()
+    state_path = tmp_path / ".poc-state.json"
+    write_state(
+        state_path,
+        {
+            "version": 1,
+            "workloads": [
+                {"name": "approved-workload", "arn": "arn:workload:approved"},
+                {"name": "unapproved-workload", "arn": "arn:workload:unapproved"},
+            ],
+            "provider": {
+                "name": "microsoft-provider",
+                "arn": "arn:provider:microsoft",
+                "callback_url": "https://callback.example.test/provider",
+            },
+        },
+    )
+
+    with pytest.raises(ProvisioningError, match="could not delete recorded workload identity"):
+        cleanup_resources(
+            control,
+            state_path=state_path,
+            apply=True,
+            confirm="agentcore-identity-poc",
+        )
+
+    assert state_path.exists()
+    cleanup_resources(
+        control,
+        state_path=state_path,
+        apply=True,
+        confirm="agentcore-identity-poc",
+    )
+
+    assert control.calls == [
+        ("delete_oauth2_credential_provider", {"name": "microsoft-provider"}),
+        ("delete_workload_identity", {"name": "approved-workload"}),
+        ("delete_oauth2_credential_provider", {"name": "microsoft-provider"}),
+        ("delete_workload_identity", {"name": "approved-workload"}),
+        ("delete_workload_identity", {"name": "unapproved-workload"}),
     ]
     assert not state_path.exists()
 

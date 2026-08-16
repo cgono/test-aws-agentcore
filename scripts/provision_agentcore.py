@@ -128,8 +128,12 @@ def apply_resources(
     """Create absent POC resources and persist only their returned identifiers."""
     verify_budget(budgets_client, account_id, settings.aws_budget_name)
 
-    policy_inputs = (directory_arn, vault_arn, iam_client, iam_role_name)
-    if not all(item is not None for item in policy_inputs):
+    if (
+        not _is_nonempty_string(directory_arn)
+        or not _is_nonempty_string(vault_arn)
+        or iam_client is None
+        or not _is_nonempty_string(iam_role_name)
+    ):
         raise ProvisioningError(
             "directory ARN, vault ARN, IAM client, and IAM role name are all required "
             "for policy install"
@@ -160,7 +164,7 @@ def apply_resources(
         "directory_arn": cast(str, directory_arn),
         "vault_arn": cast(str, vault_arn),
     }
-    install_scoped_policy(cast(IamPolicyClient, iam_client), cast(str, iam_role_name), state)
+    install_scoped_policy(iam_client, cast(str, iam_role_name), state)
     write_state(state_path, state)
     return state
 
@@ -199,6 +203,10 @@ def _state_string(state: Mapping[str, object], field: str) -> str:
     if not isinstance(value, str) or not value:
         raise ProvisioningError(f"state omitted required ARN: {field}")
     return value
+
+
+def _is_nonempty_string(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
 
 
 def _ensure_workload(client: ControlPlaneClient, name: str) -> dict[str, object]:
@@ -325,11 +333,7 @@ def cleanup_resources(
         raise ProvisioningError("cleanup requires an AgentCore control-plane client")
     control_client = cast(ControlPlaneClient, client)
 
-    provider = cast(dict[str, str], state["provider"])
-    control_client.delete_oauth2_credential_provider(name=provider["name"])
-    for workload in cast(list[dict[str, str]], state["workloads"]):
-        control_client.delete_workload_identity(name=workload["name"])
-    state_path.unlink()
+    _delete_recorded_resources(control_client, state, state_path)
 
 
 def preview_cleanup(path: Path, output: Callable[[str], None] = print) -> dict[str, object]:
@@ -450,10 +454,30 @@ def _delete_recorded_resources(
     client: ControlPlaneClient, state: Mapping[str, object], state_path: Path
 ) -> None:
     provider = cast(Mapping[str, str], state["provider"])
-    client.delete_oauth2_credential_provider(name=provider["name"])
+    _delete_provider_if_present(client, provider["name"])
     for workload in cast(list[Mapping[str, str]], state["workloads"]):
-        client.delete_workload_identity(name=workload["name"])
+        _delete_workload_if_present(client, workload["name"])
     state_path.unlink()
+
+
+def _delete_provider_if_present(client: ControlPlaneClient, name: str) -> None:
+    try:
+        client.delete_oauth2_credential_provider(name=name)
+    except Exception as error:
+        if _is_not_found(error):
+            return
+        raise ProvisioningError(
+            f"could not delete recorded credential provider '{name}'"
+        ) from error
+
+
+def _delete_workload_if_present(client: ControlPlaneClient, name: str) -> None:
+    try:
+        client.delete_workload_identity(name=name)
+    except Exception as error:
+        if _is_not_found(error):
+            return
+        raise ProvisioningError(f"could not delete recorded workload identity '{name}'") from error
 
 
 if __name__ == "__main__":
