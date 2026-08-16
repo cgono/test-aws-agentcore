@@ -200,6 +200,62 @@ def test_google_list_outputs_only_aggregate_metadata_and_redacts_tokens(
     assert "google-access-token" not in repr(rendered_evidence)
 
 
+def test_user_isolation_uses_two_validated_stdin_tokens_and_records_sanitized_h4a_evidence(
+    monkeypatch: object,
+) -> None:
+    identity = FakeIdentity([OAuthToken("google-access-a"), OAuthToken("google-access-b")])
+    drive = FakeDrive(
+        [
+            DriveMetadata(1, {"application/pdf": 1}),
+            DriveMetadata(2, {"text/plain": 2}),
+        ]
+    )
+    runtime, evidence = _runtime(identity=identity, drive=drive)
+    validated_tokens: list[str] = []
+    runtime = replace(runtime, validate_token=lambda _, token: validated_tokens.append(token))
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)  # type: ignore[attr-defined]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "user-isolation",
+            "--user-a-alias",
+            "user-a",
+            "--user-b-alias",
+            "user-b",
+            "--tokens-stdin",
+        ],
+        input="inbound-a\ninbound-b\n",
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout == '{"status":"pass","operation":"user-isolation","user_count":2}\n'
+    assert validated_tokens == ["inbound-a", "inbound-b"]
+    assert identity.workload_tokens == ["inbound-a", "inbound-b"]
+    assert drive.access_tokens == ["google-access-a", "google-access-b"]
+    assert [(item.hypothesis, item.operation, item.outcome) for item in evidence.observations] == [
+        ("H6", "google_drive_metadata", "pass"),
+        ("H6", "google_drive_metadata", "pass"),
+        ("H4a", "user_isolation", "pass"),
+        ("H4a", "user_isolation", "pass"),
+    ]
+    rendered_evidence = [observation.as_dict() for observation in evidence.observations]
+    h4a_aliases = {
+        observation.details["user_alias"]
+        for observation in evidence.observations
+        if observation.hypothesis == "H4a"
+    }
+    assert h4a_aliases == {"user-a", "user-b"}
+    assert "inbound-a" not in result.output
+    assert "inbound-b" not in result.output
+    assert "google-access-a" not in result.output
+    assert "google-access-b" not in result.output
+    assert "inbound-a" not in repr(rendered_evidence)
+    assert "inbound-b" not in repr(rendered_evidence)
+    assert "google-access-a" not in repr(rendered_evidence)
+    assert "google-access-b" not in repr(rendered_evidence)
+
+
 def test_google_revoke_check_forces_one_new_authorization_after_drive_401(
     monkeypatch: object,
 ) -> None:

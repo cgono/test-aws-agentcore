@@ -92,6 +92,44 @@ Expose port 8001 through an authenticated public HTTPS tunnel, set `PUBLIC_BASE_
 tunnel origin, then add `https://<tunnel-origin>/auth/entra/callback` as the public client
 redirect URI in Entra before beginning the browser callback test.
 
+## Phase 2 Isolation
+
+Authorize the Google provider once for each of two test users through the callback service. Use
+opaque aliases, not email addresses or Entra object IDs; the aliases are the only user values
+written to evidence. The concrete H4a command acquires and validates two separate Entra JWTs,
+then requests an approved-workload token and aggregate-only Drive metadata for each user. By
+default it starts two device-code sign-ins. For noninteractive automation, pass exactly two JWTs
+on standard input in the same order as the aliases:
+
+```bash
+printf '%s\n%s\n' "$USER_A_JWT" "$USER_B_JWT" | \
+  .venv/bin/agentcore-identity-poc user-isolation \
+  --user-a-alias user-a \
+  --user-b-alias user-b \
+  --tokens-stdin
+```
+
+The command appends H4a rows and per-user aggregate Drive metadata to
+`evidence/phase-2.jsonl`; it never records tokens, authorization URLs, or user identifiers.
+Both users must have an available Google connection and successful Drive metadata observation for
+the command to pass.
+
+The H4a live test invokes this concrete path, using device-code sign-in for each user. Set the
+same opaque aliases before running the Phase 2 gate. H4b retains a separate operator runtime
+because it deliberately replaces an IAM inline policy.
+
+```bash
+AGENTCORE_POC_LIVE=1 \
+AGENTCORE_POC_USER_A_ALIAS=user-a \
+AGENTCORE_POC_USER_B_ALIAS=user-b \
+AGENTCORE_POC_LIVE_RUNTIME=operator_live_runtime:create_runtime \
+.venv/bin/python -m pytest tests/integration/test_isolation_live.py -m integration -v -s
+```
+
+`operator_live_runtime:create_runtime` needs only `run_workload_isolation()` for H4b. The
+temporary broad-policy run requires the explicit acknowledgement documented by
+`agentcore-identity-poc workload-isolation --help` and restores the scoped policy in all cases.
+
 ## Cleanup
 
 Print the exact recorded resources first:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import sys
 import time
@@ -43,6 +44,7 @@ from agentcore_identity_poc.experiments import (
     PolicyRestorationError,
     WorkloadAttempt,
     WorkloadPolicyManager,
+    run_user_isolation,
     run_workload_isolation,
 )
 from agentcore_identity_poc.jwt_validation import JwtPolicy, TokenRejected, make_http_jwks_loader
@@ -57,6 +59,7 @@ _DEFAULT_GOOGLE_EVIDENCE_PATH = Path("evidence/phase-2.jsonl")
 _GOOGLE_DRIVE_METADATA_SCOPE = "https://www.googleapis.com/auth/drive.metadata.readonly"
 _POLICY_NAME = "agentcore-identity-poc-scoped"
 _STATE_PATH = Path(".poc-state.json")
+_SAFE_ALIAS_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 
 
 class IdentityClient(Protocol):
@@ -345,6 +348,57 @@ def google_revoke_check(
     typer.echo(_json_line({"status": "pass", "operation": "google-revoke-check"}))
 
 
+@app.command("user-isolation")
+def user_isolation(
+    user_a_alias: Annotated[str, typer.Option("--user-a-alias")],
+    user_b_alias: Annotated[str, typer.Option("--user-b-alias")],
+    tokens_stdin: Annotated[bool, typer.Option("--tokens-stdin")] = False,
+    evidence_path: Annotated[Path, typer.Option()] = _DEFAULT_GOOGLE_EVIDENCE_PATH,
+) -> None:
+    """Prove distinct users have independent vaulted Google connections."""
+    runtime = runtime_factory()
+    try:
+        settings = runtime.load_settings()
+        users = _get_isolation_users(
+            runtime,
+            settings,
+            user_a_alias=user_a_alias,
+            user_b_alias=user_b_alias,
+            tokens_stdin=tokens_stdin,
+        )
+    except SettingsError as error:
+        _emit_configuration_failure(error, json_output=True)
+    except _InteractiveStdinError:
+        _emit_blocked(
+            "configuration",
+            _CONFIGURATION_EXIT,
+            "tokens_stdin_requires_noninteractive_input",
+        )
+    except (EntraAuthError, TokenRejected):
+        _emit_blocked("authentication", _AUTHENTICATION_EXIT, "inbound_token_unavailable")
+    except ExperimentConfigurationError as error:
+        _emit_blocked("configuration", _CONFIGURATION_EXIT, str(error))
+
+    writer = runtime.evidence_writer(evidence_path)
+    try:
+        rows = _run_user_isolation(runtime, settings, users, writer)
+    except (EntraAuthError, TokenRejected):
+        _emit_blocked("authentication", _AUTHENTICATION_EXIT, "inbound_token_rejected")
+    except AgentCoreError:
+        _emit_blocked("identity_broker", _AGENTCORE_EXIT, "google_token_unavailable")
+
+    for row in rows:
+        _append(writer, "H4a", "user_isolation", row.outcome, row.as_details())
+
+    if any(row.outcome == "authorization_required" for row in rows):
+        _emit_authorization_required()
+    if any(row.outcome != "pass" for row in rows):
+        _emit_blocked("downstream_denied", _DOWNSTREAM_EXIT, "google_connection_unavailable")
+    typer.echo(
+        _json_line({"status": "pass", "operation": "user-isolation", "user_count": len(rows)})
+    )
+
+
 @app.command("workload-isolation")
 def workload_isolation(
     acknowledge_broad_policy: Annotated[
@@ -473,6 +527,124 @@ def _run_workload_isolation(
         clock=runtime.clock,
         record_row=record_row,
     )
+
+
+def _get_isolation_users(
+    runtime: Runtime,
+    settings: Settings,
+    *,
+    user_a_alias: str,
+    user_b_alias: str,
+    tokens_stdin: bool,
+) -> tuple[tuple[str, str], tuple[str, str]]:
+    aliases = (user_a_alias, user_b_alias)
+    if len(set(aliases)) != 2 or not all(_SAFE_ALIAS_PATTERN.fullmatch(alias) for alias in aliases):
+        raise ExperimentConfigurationError(
+            "user aliases must be two distinct opaque values using letters, digits, "
+            "hyphens, or underscores"
+        )
+    if tokens_stdin:
+        return (
+            (user_a_alias, _get_inbound_token(runtime, settings, token_stdin=True)),
+            (user_b_alias, _get_inbound_token(runtime, settings, token_stdin=True)),
+        )
+    return (
+        (user_a_alias, runtime.acquire_token(settings, typer.echo)),
+        (user_b_alias, runtime.acquire_token(settings, typer.echo)),
+    )
+
+
+def _run_user_isolation(
+    runtime: Runtime,
+    settings: Settings,
+    users: tuple[tuple[str, str], tuple[str, str]],
+    writer: ObservationSink,
+) -> tuple[MatrixRow, ...]:
+    identity = runtime.agentcore(settings)
+
+    def observe_connection(user_alias: str, workload_token: str) -> WorkloadAttempt:
+        try:
+            authorization = identity.google_token(
+                workload_token,
+                settings.agentcore_google_provider,
+                [_GOOGLE_DRIVE_METADATA_SCOPE],
+                settings.google_return_url,
+                runtime.random_urlsafe(),
+            )
+        except AgentCoreError as error:
+            return WorkloadAttempt(
+                "denied" if _is_access_denied(error) else "fail",
+                _aws_error_category(error),
+            )
+        if isinstance(authorization, AuthorizationRequired):
+            return WorkloadAttempt("authorization_required")
+
+        drive = runtime.google_drive(settings)
+        try:
+            metadata = drive.list(authorization.access_token)
+        except DownstreamUnauthorized:
+            _append(
+                writer,
+                "H6",
+                "google_drive_metadata",
+                "fail",
+                {"user_alias": user_alias, "category": "unauthorized"},
+            )
+            return WorkloadAttempt("denied", "unauthorized")
+        except DownstreamError:
+            _append(
+                writer,
+                "H6",
+                "google_drive_metadata",
+                "fail",
+                {"user_alias": user_alias, "category": "denied"},
+            )
+            return WorkloadAttempt("denied", "access_denied")
+        finally:
+            _close_resource_client(drive)
+
+        _append(
+            writer,
+            "H6",
+            "google_drive_metadata",
+            "pass",
+            {
+                "user_alias": user_alias,
+                "item_count": metadata.item_count,
+                "type_counts": dict(metadata.type_counts),
+            },
+        )
+        return WorkloadAttempt("pass")
+
+    return run_user_isolation(
+        principal_alias="local-poc-worker",
+        workload_name=settings.agentcore_workload_name,
+        provider=settings.agentcore_google_provider,
+        users=users,
+        validate_user=lambda _, token: runtime.validate_token(settings, token),
+        get_workload_token=lambda _, token: identity.workload_token(
+            settings.agentcore_workload_name, token
+        ),
+        observe_connection=observe_connection,
+    )
+
+
+def run_live_user_isolation() -> tuple[MatrixRow, ...]:
+    """Run the opt-in H4a live path with two device-code authenticated users."""
+    runtime = _default_runtime()
+    settings = runtime.load_settings()
+    users = _get_isolation_users(
+        runtime,
+        settings,
+        user_a_alias=os.environ.get("AGENTCORE_POC_USER_A_ALIAS", "").strip(),
+        user_b_alias=os.environ.get("AGENTCORE_POC_USER_B_ALIAS", "").strip(),
+        tokens_stdin=False,
+    )
+    writer = runtime.evidence_writer(_DEFAULT_GOOGLE_EVIDENCE_PATH)
+    rows = _run_user_isolation(runtime, settings, users, writer)
+    for row in rows:
+        _append(writer, "H4a", "user_isolation", row.outcome, row.as_details())
+    return rows
 
 
 def _load_json_policy(filename: str) -> Mapping[str, object]:

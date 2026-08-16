@@ -7,13 +7,12 @@ from typing import Protocol
 
 import pytest
 
-from agentcore_identity_poc.experiments import MatrixRow
+from agentcore_identity_poc.cli import run_live_user_isolation
+from agentcore_identity_poc.experiments import ExperimentConfigurationError, MatrixRow
 
 
 class LiveIsolationRuntime(Protocol):
-    """Operator-owned live actions; test code never embeds cloud credentials or tokens."""
-
-    def run_user_isolation(self) -> Sequence[MatrixRow]: ...
+    """Operator-owned H4b actions; test code never embeds cloud credentials or tokens."""
 
     def run_workload_isolation(self) -> Sequence[MatrixRow]: ...
 
@@ -23,9 +22,13 @@ def live_runtime() -> LiveIsolationRuntime:
     return _load_live_runtime()
 
 
-def _load_live_runtime() -> LiveIsolationRuntime:
+def _require_live() -> None:
     if "AGENTCORE_POC_LIVE" not in os.environ:
         pytest.skip("set AGENTCORE_POC_LIVE=1 and configure live Entra/AWS/Google credentials")
+
+
+def _load_live_runtime() -> LiveIsolationRuntime:
+    _require_live()
     target = os.environ.get("AGENTCORE_POC_LIVE_RUNTIME")
     if not target or ":" not in target:
         pytest.fail(
@@ -38,9 +41,7 @@ def _load_live_runtime() -> LiveIsolationRuntime:
         runtime = factory()
     except (AttributeError, ImportError, TypeError) as error:
         pytest.fail(f"could not load AGENTCORE_POC_LIVE_RUNTIME: {error}")
-    if not callable(getattr(runtime, "run_user_isolation", None)) or not callable(
-        getattr(runtime, "run_workload_isolation", None)
-    ):
+    if not callable(getattr(runtime, "run_workload_isolation", None)):
         pytest.fail("AGENTCORE_POC_LIVE_RUNTIME factory did not return a LiveIsolationRuntime")
     return runtime
 
@@ -54,10 +55,12 @@ def test_live_flag_presence_requires_runtime(monkeypatch: pytest.MonkeyPatch) ->
 
 
 @pytest.mark.integration
-def test_live_user_isolation_records_two_distinct_validated_users(
-    live_runtime: LiveIsolationRuntime,
-) -> None:
-    rows = live_runtime.run_user_isolation()
+def test_live_user_isolation_records_two_distinct_validated_users() -> None:
+    _require_live()
+    try:
+        rows = run_live_user_isolation()
+    except ExperimentConfigurationError as error:
+        pytest.fail(f"could not configure concrete H4a runner: {error}")
 
     assert len(rows) == 2
     assert len({row.user_alias for row in rows}) == 2
