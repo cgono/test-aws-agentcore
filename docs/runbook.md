@@ -208,6 +208,10 @@ check, and first consent have succeeded:
 
 ```bash
 AGENTCORE_POC_LIVE=1 \
+AGENTCORE_POC_USER_A_ALIAS=user-a \
+AGENTCORE_POC_USER_B_ALIAS=user-b \
+AGENTCORE_POC_USER_A_DRIVE_MARKER="$USER_A_DRIVE_MARKER" \
+AGENTCORE_POC_USER_B_DRIVE_MARKER="$USER_B_DRIVE_MARKER" \
 AGENTCORE_POC_LIVE_RUNTIME=operator_live_runtime:create_runtime \
 .venv/bin/python -m pytest \
   tests/integration/test_google_live.py tests/integration/test_isolation_live.py \
@@ -218,6 +222,10 @@ The operator runtime supplies `run_google_provider_gate()` for callback binding,
 consent, and durable-vault connection evidence, and `run_workload_isolation()` for H4b. Stop the
 POC if callback binding or durable vaulting fails. H3 remains pending until Task 13 records a
 post-expiry retrieval; H7 and H8 remain pending as well.
+
+`user-a` and `user-b` are opaque operator aliases, not email addresses or Entra identifiers. Each
+marker is the distinct SHA-256 fingerprint emitted by `google-list` for that alias's aggregate
+Drive item count and MIME-type histogram; it is not a Drive item identifier or name.
 
 ## Cleanup
 
