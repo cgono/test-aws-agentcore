@@ -78,6 +78,7 @@ def _runtime(
     resource: FakeResource | None = None,
     evidence: RecordingEvidence | None = None,
     stdin_isatty: Callable[[], bool] = lambda: False,
+    check_reachability: Callable[[Settings], None] | None = None,
 ) -> tuple[Runtime, list[str], RecordingEvidence]:
     events: list[str] = []
     evidence_writer = evidence or RecordingEvidence()
@@ -91,6 +92,9 @@ def _runtime(
     def default_validate(_: Settings, token: str) -> None:
         events.append(f"validate:{token}")
 
+    def default_check_reachability(settings: Settings) -> None:
+        events.append(f"reachability:{settings.agentcore_workload_name}")
+
     return (
         Runtime(
             load_settings=settings,
@@ -101,6 +105,7 @@ def _runtime(
             clock=lambda: 1.0,
             evidence_writer=lambda _: evidence_writer,
             stdin_isatty=stdin_isatty,
+            check_reachability=check_reachability or default_check_reachability,
         ),
         events,
         evidence_writer,
@@ -120,6 +125,65 @@ def test_preflight_reports_machine_readable_configuration_failure(
     assert result.exit_code == 2
     assert result.stdout == (
         '{"status":"blocked","category":"configuration","detail":"AWS_REGION must be set"}\n'
+    )
+
+
+def test_preflight_checks_agentcore_after_valid_configuration(monkeypatch: object) -> None:
+    events: list[str] = []
+
+    def load_settings() -> Settings:
+        events.append("configuration")
+        return SETTINGS
+
+    def check_reachability(_: Settings) -> None:
+        events.append("reachability")
+
+    runtime, _, _ = _runtime(
+        settings=load_settings,
+        check_reachability=check_reachability,
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)  # type: ignore[attr-defined]
+
+    result = CliRunner().invoke(app, ["preflight", "--json"])
+
+    assert result.exit_code == 0
+    assert result.stdout == '{"status":"ready","category":"configuration"}\n'
+    assert events == ["configuration", "reachability"]
+
+
+def test_preflight_does_not_check_reachability_when_configuration_fails(
+    monkeypatch: object,
+) -> None:
+    checked = False
+
+    def check_reachability(_: Settings) -> None:
+        nonlocal checked
+        checked = True
+
+    runtime, _, _ = _runtime(
+        settings=lambda: (_ for _ in ()).throw(SettingsError("AWS_REGION must be set")),
+        check_reachability=check_reachability,
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)  # type: ignore[attr-defined]
+
+    result = CliRunner().invoke(app, ["preflight", "--json"])
+
+    assert result.exit_code == 2
+    assert checked is False
+
+
+def test_preflight_maps_agentcore_reachability_failure(monkeypatch: object) -> None:
+    def fail_reachability(_: Settings) -> None:
+        raise AgentCoreAccessDenied()
+
+    runtime, _, _ = _runtime(check_reachability=fail_reachability)
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)  # type: ignore[attr-defined]
+
+    result = CliRunner().invoke(app, ["preflight", "--json"])
+
+    assert result.exit_code == 4
+    assert result.stdout == (
+        '{"status":"blocked","category":"identity_broker","detail":"agentcore_unreachable"}\n'
     )
 
 

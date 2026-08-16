@@ -14,7 +14,12 @@ from typing import Annotated, Protocol, cast
 import boto3  # type: ignore[import-untyped]
 import typer
 
-from agentcore_identity_poc.agentcore import AgentCoreDataPlane, AgentCoreError, AgentCoreIdentity
+from agentcore_identity_poc.agentcore import (
+    AgentCoreDataPlane,
+    AgentCoreError,
+    AgentCoreIdentity,
+    AgentCoreInternalError,
+)
 from agentcore_identity_poc.config import Settings, SettingsError
 from agentcore_identity_poc.downstream import (
     DownstreamError,
@@ -58,6 +63,7 @@ class Runtime:
     """Replaceable collaborators for command tests and local execution."""
 
     load_settings: Callable[[], Settings]
+    check_reachability: Callable[[Settings], None]
     acquire_token: Callable[[Settings, Callable[[str], None]], str]
     validate_token: Callable[[Settings, str], None]
     agentcore: Callable[[Settings], IdentityClient]
@@ -81,9 +87,14 @@ def preflight(json_output: Annotated[bool, typer.Option("--json")] = False) -> N
     """Check local configuration before any provider reachability work."""
     runtime = runtime_factory()
     try:
-        runtime.load_settings()
+        settings = runtime.load_settings()
     except SettingsError as error:
         _emit_configuration_failure(error, json_output=json_output)
+
+    try:
+        runtime.check_reachability(settings)
+    except AgentCoreError:
+        _emit_blocked("identity_broker", _AGENTCORE_EXIT, "agentcore_unreachable")
 
     if json_output:
         typer.echo(_json_line({"status": "ready", "category": "configuration"}))
@@ -244,6 +255,7 @@ def _json_line(value: dict[str, bool | int | str]) -> str:
 def _default_runtime() -> Runtime:
     return Runtime(
         load_settings=lambda: Settings.from_mapping(os.environ),
+        check_reachability=_check_agentcore_reachability,
         acquire_token=_acquire_device_code_token,
         validate_token=_validate_inbound_token,
         agentcore=_agentcore_identity,
@@ -275,6 +287,15 @@ def _validate_inbound_token(settings: Settings, token: str) -> None:
 def _agentcore_identity(settings: Settings) -> AgentCoreIdentity:
     client = boto3.client("bedrock-agentcore", region_name=settings.aws_region)
     return AgentCoreIdentity(cast(AgentCoreDataPlane, client))
+
+
+def _check_agentcore_reachability(settings: Settings) -> None:
+    """Verify access to the configured workload using one read-only control-plane call."""
+    try:
+        client = boto3.client("bedrock-agentcore-control", region_name=settings.aws_region)
+        client.get_workload_identity(name=settings.agentcore_workload_name)
+    except Exception as error:
+        raise AgentCoreInternalError() from error
 
 
 runtime_factory: Callable[[], Runtime] = _default_runtime
