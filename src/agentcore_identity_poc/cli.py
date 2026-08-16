@@ -29,6 +29,12 @@ from agentcore_identity_poc.agentcore import (
     AuthorizationRequired,
     OAuthToken,
 )
+from agentcore_identity_poc.assessment import (
+    AssessmentError,
+    decide,
+    load_terminal_results,
+    render_markdown,
+)
 from agentcore_identity_poc.config import Settings, SettingsError
 from agentcore_identity_poc.downstream import (
     DownstreamError,
@@ -188,6 +194,51 @@ app.add_typer(offboard_app, name="offboard")
 @app.callback()
 def main() -> None:
     """Run AgentCore Identity POC commands."""
+
+
+@app.command("report")
+def report(
+    evidence: Annotated[Path, typer.Option("--evidence")],
+    output: Annotated[Path, typer.Option("--output")],
+    iam_acceptable: Annotated[bool, typer.Option("--iam-acceptable/--iam-unacceptable")] = False,
+    audit_acceptable: Annotated[
+        bool, typer.Option("--audit-acceptable/--audit-unacceptable")
+    ] = False,
+    latency_acceptable: Annotated[
+        bool, typer.Option("--latency-acceptable/--latency-unacceptable")
+    ] = False,
+    quota_acceptable: Annotated[
+        bool, typer.Option("--quota-acceptable/--quota-unacceptable")
+    ] = False,
+    custom_provider_plausible: Annotated[
+        bool, typer.Option("--custom-provider-plausible/--custom-provider-incompatible")
+    ] = True,
+) -> None:
+    """Create a status-only suitability assessment from explicit terminal evidence."""
+    try:
+        results = load_terminal_results(evidence)
+        custom_provider_path_plausible = custom_provider_plausible and results["H5"] == "pass"
+        decision = decide(
+            results,
+            iam_acceptable=iam_acceptable,
+            custom_provider_plausible=custom_provider_path_plausible,
+            audit_acceptable=audit_acceptable,
+            latency_acceptable=latency_acceptable,
+            quota_acceptable=quota_acceptable,
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(
+            render_markdown(
+                results,
+                decision,
+                custom_provider_plausible=custom_provider_path_plausible,
+            ),
+            encoding="utf-8",
+        )
+    except AssessmentError:
+        typer.echo(_json_line({"status": "blocked", "category": "assessment_incomplete"}))
+        raise typer.Exit(code=_CONFIGURATION_EXIT) from None
+    typer.echo(_json_line({"status": "pass", "operation": "report", "decision": decision}))
 
 
 @app.command("preflight")

@@ -1,0 +1,193 @@
+import json
+
+import pytest
+from typer.testing import CliRunner
+
+from agentcore_identity_poc.assessment import (
+    AssessmentError,
+    decide,
+    load_terminal_results,
+    render_markdown,
+)
+from agentcore_identity_poc.cli import app
+
+
+def passing_results() -> dict[str, str]:
+    return {
+        "H1": "pass",
+        "H2": "pass",
+        "H3": "pass",
+        "H4a": "pass",
+        "H4b": "pass",
+        "H5": "pass",
+        "H6": "pass",
+        "H7": "pass",
+        "H8": "pass",
+    }
+
+
+def terminal_row(hypothesis: str, outcome: str = "pass", **details: object) -> dict[str, object]:
+    return {
+        "hypothesis": hypothesis,
+        "operation": "assessment_terminal",
+        "outcome": outcome,
+        "details": {"terminal": True, **details},
+    }
+
+
+def write_evidence(tmp_path, rows: list[dict[str, object]]):
+    path = tmp_path / "sanitized.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    return path
+
+
+def test_rejects_when_mandatory_hypothesis_fails() -> None:
+    results = passing_results() | {"H7": "fail"}
+    assert decide(results, iam_acceptable=True, custom_provider_plausible=True) == "reject_or_defer"
+
+
+def test_adopts_with_caveats_for_accepted_iam_dependency() -> None:
+    assert decide(passing_results(), iam_acceptable=True, custom_provider_plausible=True) == (
+        "adopt_with_caveats"
+    )
+
+
+def test_rejects_when_a_required_terminal_result_is_missing(tmp_path) -> None:
+    evidence = write_evidence(
+        tmp_path,
+        [terminal_row(hypothesis) for hypothesis in passing_results() if hypothesis != "H8"],
+    )
+
+    with pytest.raises(AssessmentError, match="terminal evidence"):
+        load_terminal_results(evidence)
+
+
+def test_rejects_ambiguous_terminal_results(tmp_path) -> None:
+    evidence = write_evidence(
+        tmp_path,
+        [terminal_row(hypothesis) for hypothesis in passing_results()] + [terminal_row("H1")],
+    )
+
+    with pytest.raises(AssessmentError, match="exactly one"):
+        load_terminal_results(evidence)
+
+
+def test_rejects_unsafe_raw_evidence_before_assessing(tmp_path) -> None:
+    rows = [terminal_row(hypothesis) for hypothesis in passing_results()]
+    rows[0]["details"] = {"terminal": True, "token": "secret-value"}
+    evidence = write_evidence(tmp_path, rows)
+
+    with pytest.raises(AssessmentError, match="sanitized"):
+        load_terminal_results(evidence)
+
+
+def test_rejects_raw_secret_looking_text_nested_in_a_provider_response(tmp_path) -> None:
+    rows = [terminal_row(hypothesis) for hypothesis in passing_results()]
+    rows[0]["details"] = {
+        "terminal": True,
+        "provider_response": '{"access_token":"not-a-jwt"}',
+    }
+    evidence = write_evidence(tmp_path, rows)
+
+    with pytest.raises(AssessmentError, match="sanitized"):
+        load_terminal_results(evidence)
+
+
+def test_rejects_invalid_measurement_units(tmp_path) -> None:
+    rows = [terminal_row(hypothesis) for hypothesis in passing_results()]
+    rows[0]["details"] = {"terminal": True, "p95_ms": "100ms"}
+    evidence = write_evidence(tmp_path, rows)
+
+    with pytest.raises(AssessmentError, match="measurement"):
+        load_terminal_results(evidence)
+
+
+def test_rejects_unacceptable_iam_dependency() -> None:
+    assert decide(passing_results(), iam_acceptable=False, custom_provider_plausible=True) == (
+        "reject_or_defer"
+    )
+
+
+def test_custom_provider_incompatibility_only_rejects_that_path() -> None:
+    assert decide(passing_results(), iam_acceptable=True, custom_provider_plausible=False) == (
+        "adopt_with_caveats"
+    )
+
+
+@pytest.mark.parametrize("condition", ["audit", "latency", "quota"])
+def test_rejects_unacceptable_operational_measurements(condition: str) -> None:
+    acceptable = {"audit_acceptable": True, "latency_acceptable": True, "quota_acceptable": True}
+    acceptable[f"{condition}_acceptable"] = False
+
+    assert decide(
+        passing_results(), iam_acceptable=True, custom_provider_plausible=True, **acceptable
+    ) == ("reject_or_defer")
+
+
+def test_report_command_writes_sanitized_summary_without_provider_response(tmp_path) -> None:
+    evidence = write_evidence(
+        tmp_path,
+        [
+            terminal_row(hypothesis, provider_response="this-must-not-be-rendered")
+            for hypothesis in passing_results()
+        ],
+    )
+    output = tmp_path / "assessment.md"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "report",
+            "--evidence",
+            str(evidence),
+            "--output",
+            str(output),
+            "--iam-acceptable",
+            "--audit-acceptable",
+            "--latency-acceptable",
+            "--quota-acceptable",
+        ],
+    )
+
+    assert result.exit_code == 0
+    rendered = output.read_text(encoding="utf-8")
+    assert "this-must-not-be-rendered" not in rendered
+    assert "adopt_with_caveats" in rendered
+
+
+def test_rendered_report_marks_h3_api_limitation_when_it_fails() -> None:
+    report = render_markdown(passing_results() | {"H3": "fail"}, "reject_or_defer")
+
+    assert "H3" in report
+    assert "Current API limitation" in report
+
+
+def test_report_rejects_only_the_custom_provider_path_when_h5_fails(tmp_path) -> None:
+    evidence = write_evidence(
+        tmp_path,
+        [
+            terminal_row(hypothesis, "fail" if hypothesis == "H5" else "pass")
+            for hypothesis in passing_results()
+        ],
+    )
+    output = tmp_path / "assessment.md"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "report",
+            "--evidence",
+            str(evidence),
+            "--output",
+            str(output),
+            "--iam-acceptable",
+            "--audit-acceptable",
+            "--latency-acceptable",
+            "--quota-acceptable",
+        ],
+    )
+
+    assert result.exit_code == 0
+    rendered = output.read_text(encoding="utf-8")
+    assert "**adopt_with_caveats**" in rendered
+    assert "Custom-provider production path: **rejected**" in rendered
