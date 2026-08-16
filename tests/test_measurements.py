@@ -301,6 +301,12 @@ def test_resume_state_rejects_jwt_shaped_values_anywhere_in_decoded_json(tmp_pat
     with pytest.raises(MeasurementConfigurationError, match="JWT-shaped"):
         load_expiry_resume_state(path, project_id="project-a")
 
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state = {"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1In0.signature": state}
+    path.write_text(json.dumps(state), encoding="utf-8")
+    with pytest.raises(MeasurementConfigurationError, match="JWT-shaped"):
+        load_expiry_resume_state(path, project_id="project-a")
+
 
 def test_measure_latency_reports_cold_warm_percentiles_and_no_tokens(
     monkeypatch: pytest.MonkeyPatch,
@@ -318,7 +324,8 @@ def test_measure_latency_reports_cold_warm_percentiles_and_no_tokens(
     assert result.stdout == (
         '{"status":"pass","operation":"measure_latency","samples":3,'
         '"cold_samples":1,"warm_samples":2,"p50_ms":30,"p95_ms":100,'
-        '"cache_equivalent":true}\n'
+        '"workload_cache_equivalent":true,"google_cache_equivalent":true,'
+        '"drive_result_equivalent":true}\n'
     )
     assert identity.workload_calls == 3
     assert drive.access_tokens == ["google-secret"] * 3
@@ -402,7 +409,7 @@ def test_measure_expiry_compares_old_and_new_fingerprints_after_known_expiry(
     result = CliRunner().invoke(app, ["measure", "expiry", "--resume-state", str(state_path)])
 
     assert result.exit_code == 0
-    assert json.loads(result.stdout)["status"] == "pass"
+    assert json.loads(result.stdout)["status"] == "unknown"
     observations = [item.as_dict() for item in resumed_evidence.observations]
     inbound = next(item for item in observations if item["details"]["token_kind"] == "inbound_jwt")
     google = next(item for item in observations if item["details"]["token_kind"] == "google_token")
@@ -411,6 +418,80 @@ def test_measure_expiry_compares_old_and_new_fingerprints_after_known_expiry(
     assert (google["operation"], google["outcome"]) == ("refresh_unproven", "unknown")
     assert google["details"]["prior_expiry_known"] is False
     assert "inbound-new" not in repr(observations)
+
+
+def test_measure_expiry_uses_persisted_issue_timestamp_for_resume_salt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state_path = tmp_path / "expiry-state.json"
+    first_runtime = _measurement_runtime(
+        MeasurementIdentity(), RecordingEvidence(), clock=iter((10.0, 11.0)).__next__
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: first_runtime)
+    assert (
+        CliRunner().invoke(app, ["measure", "expiry", "--resume-state", str(state_path)]).exit_code
+        == 0
+    )
+
+    resumed_evidence = RecordingEvidence()
+    resumed_runtime = _measurement_runtime(
+        MeasurementIdentity(), resumed_evidence, clock=lambda: 101.0, inbound_expiry=200.0
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: resumed_runtime)
+    result = CliRunner().invoke(app, ["measure", "expiry", "--resume-state", str(state_path)])
+
+    assert result.exit_code == 0
+    inbound = next(
+        item.as_dict()
+        for item in resumed_evidence.observations
+        if item.as_dict()["details"]["token_kind"] == "inbound_jwt"
+    )
+    assert inbound["details"]["fingerprint_changed"] is False
+
+
+def test_measure_expiry_requires_known_google_boundary_and_drive_success_for_h3(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state_path = tmp_path / "expiry-state.json"
+    first_runtime = _measurement_runtime(
+        MeasurementIdentity(), RecordingEvidence(), clock=lambda: 10.0
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: first_runtime)
+    assert (
+        CliRunner().invoke(
+            app,
+            [
+                "measure",
+                "expiry",
+                "--resume-state",
+                str(state_path),
+                "--google-resume-at",
+                "100",
+            ],
+        ).exit_code
+        == 0
+    )
+
+    evidence = RecordingEvidence()
+    runtime = _measurement_runtime(
+        MeasurementIdentity(inbound_token="inbound-new", token_suffix="-new"),
+        evidence,
+        clock=lambda: 101.0,
+        inbound_expiry=200.0,
+        drive=MeasurementDrive([DriveMetadata(1, {"text/plain": 1})]),
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+    result = CliRunner().invoke(app, ["measure", "expiry", "--resume-state", str(state_path)])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["status"] == "pass"
+    google = next(
+        item.as_dict()
+        for item in evidence.observations
+        if item.as_dict()["hypothesis"] == "H3"
+    )
+    assert (google["operation"], google["outcome"]) == ("post_expiry_refresh", "pass")
+    assert google["details"]["drive_metadata_observed"] is True
 
 
 def test_offboard_google_detects_drive_revocation_before_forcing_authentication(
@@ -462,9 +543,39 @@ def test_offboard_google_does_not_force_authentication_without_drive_revocation(
     assert result.exit_code == 0
     assert identity.force_authentication == [False]
     assert json.loads(result.stdout)["detail"] == "drive_revocation_not_observed"
-    assert [item.as_dict()["operation"] for item in evidence.observations] == [
-        "google_revocation_probe"
+    observations = [item.as_dict() for item in evidence.observations]
+    assert [item["operation"] for item in observations] == [
+        "google_revocation_probe",
+        "offboard_google",
     ]
+    assert observations[-1]["outcome"] == "fail"
+
+
+def test_offboard_google_attempts_narrow_purge_after_nonrevoked_probe_but_keeps_h8_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PurgableIdentity(MeasurementIdentity):
+        def __init__(self) -> None:
+            super().__init__()
+            self.purged_aliases: list[str] = []
+
+        def purge_google_user_connection(self, user_alias: str) -> None:
+            self.purged_aliases.append(user_alias)
+
+    identity = PurgableIdentity()
+    runtime = _measurement_runtime(identity, RecordingEvidence())
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(app, ["offboard", "google", "--user-alias", "user-a", "--apply"])
+
+    assert result.exit_code == 0
+    assert identity.purged_aliases == ["user-a"]
+    assert json.loads(result.stdout) == {
+        "status": "failed",
+        "operation": "offboard_google",
+        "hypothesis": "H8",
+        "detail": "drive_revocation_not_observed",
+    }
 
 
 def test_measure_concurrency_records_end_to_end_throttle_and_retry_counts(
@@ -486,7 +597,9 @@ def test_measure_concurrency_records_end_to_end_throttle_and_retry_counts(
     assert rendered["operation"] == "measure_concurrency"
     assert rendered["throttle_count"] == 0
     assert rendered["retry_attempts"] == 0
-    assert rendered["cache_equivalent"] is True
+    assert rendered["workload_cache_equivalent"] is True
+    assert rendered["google_cache_equivalent"] is True
+    assert rendered["drive_result_equivalent"] is True
     assert drive.access_tokens == ["google-secret"] * 3
 
 
@@ -518,3 +631,40 @@ def test_measure_concurrency_records_throttled_retry_backoff(
     assert rendered["throttle_count"] == 1
     assert rendered["retry_attempts"] == 1
     assert rendered["backoff_ms"] == 100
+
+
+def test_measure_latency_does_not_infer_token_cache_from_matching_drive_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RotatingIdentity(MeasurementIdentity):
+        def workload_token(self, workload_name: str, user_token: str) -> str:
+            self.workload_calls += 1
+            return f"workload-{self.workload_calls}"
+
+        def google_token(
+            self,
+            workload_token: str,
+            provider: str,
+            scopes: list[str],
+            return_url: str,
+            state: str,
+            *,
+            force_authentication: bool = False,
+        ) -> OAuthToken:
+            return OAuthToken(f"google-for-{workload_token}")
+
+    runtime = _measurement_runtime(
+        RotatingIdentity(),
+        RecordingEvidence(),
+        clock=iter((0.0, 0.1, 0.1, 0.2)).__next__,
+        drive=MeasurementDrive([DriveMetadata(1, {"text/plain": 1}) for _ in range(2)]),
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(app, ["measure", "latency", "--samples", "2"])
+
+    assert result.exit_code == 0
+    rendered = json.loads(result.stdout)
+    assert rendered["workload_cache_equivalent"] is False
+    assert rendered["google_cache_equivalent"] is False
+    assert rendered["drive_result_equivalent"] is True

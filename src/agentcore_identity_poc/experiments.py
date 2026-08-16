@@ -122,6 +122,7 @@ class ExpiryObservation:
     token: str
     issued_at: float
     expires_at: float | None
+    drive_metadata_observed: bool = False
 
     @property
     def expiry_known(self) -> bool:
@@ -371,7 +372,10 @@ def _contains_jwt_shaped_value(value: object) -> bool:
     if isinstance(value, str):
         return _JWT_SHAPED_PATTERN.fullmatch(value) is not None
     if isinstance(value, Mapping):
-        return any(_contains_jwt_shaped_value(item) for item in value.values())
+        return any(
+            _contains_jwt_shaped_value(key) or _contains_jwt_shaped_value(item)
+            for key, item in value.items()
+        )
     if isinstance(value, list | tuple):
         return any(_contains_jwt_shaped_value(item) for item in value)
     return False
