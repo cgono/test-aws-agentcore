@@ -98,15 +98,23 @@ Authorize the Google provider once for each of two test users through the callba
 opaque aliases, not email addresses or Entra object IDs; the aliases are the only user values
 written to evidence. The concrete H4a command acquires and validates two separate Entra JWTs and
 requires their verified `sub` claims to differ in memory before it requests an approved-workload
-token or Drive metadata. It never writes subjects to output or evidence. By default it starts two
-device-code sign-ins. For noninteractive automation, pass exactly two JWTs on standard input in
-the same order as the aliases:
+token or Drive metadata. It never writes subjects to output or evidence.
+
+Before the H4a run, obtain a separate `connection_marker` from `google-list` while signed in as
+each test user. It is a SHA-256 fingerprint of only the aggregate item count and MIME-type
+histogram, not a Drive item ID or name. The two marker values must differ. Store them as opaque
+operator inputs; H4a compares each user result to that user's expected marker and rejects swapped
+or indistinguishable connection states. By default it starts two device-code sign-ins. For
+noninteractive automation, pass exactly two JWTs on standard input in the same order as the
+aliases:
 
 ```bash
 printf '%s\n%s\n' "$USER_A_JWT" "$USER_B_JWT" | \
   .venv/bin/agentcore-identity-poc user-isolation \
   --user-a-alias user-a \
   --user-b-alias user-b \
+  --user-a-drive-marker "$USER_A_DRIVE_MARKER" \
+  --user-b-drive-marker "$USER_B_DRIVE_MARKER" \
   --tokens-stdin
 ```
 
@@ -123,6 +131,8 @@ because it deliberately replaces an IAM inline policy.
 AGENTCORE_POC_LIVE=1 \
 AGENTCORE_POC_USER_A_ALIAS=user-a \
 AGENTCORE_POC_USER_B_ALIAS=user-b \
+AGENTCORE_POC_USER_A_DRIVE_MARKER="$USER_A_DRIVE_MARKER" \
+AGENTCORE_POC_USER_B_DRIVE_MARKER="$USER_B_DRIVE_MARKER" \
 AGENTCORE_POC_LIVE_RUNTIME=operator_live_runtime:create_runtime \
 .venv/bin/python -m pytest tests/integration/test_isolation_live.py -m integration -v -s
 ```
@@ -130,6 +140,9 @@ AGENTCORE_POC_LIVE_RUNTIME=operator_live_runtime:create_runtime \
 `operator_live_runtime:create_runtime` needs only `run_workload_isolation()` for H4b. The
 temporary broad-policy run requires the explicit acknowledgement documented by
 `agentcore-identity-poc workload-isolation --help` and restores the scoped policy in all cases.
+The concrete runner obtains and compares a hashed STS caller alias immediately before and after
+every broad and scoped workload attempt; it aborts rather than stamping an initial caller alias
+onto later rows.
 
 ## Cleanup
 

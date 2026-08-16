@@ -34,6 +34,7 @@ from agentcore_identity_poc.downstream import (
     GoogleDriveClient,
     SyntheticMetadata,
     SyntheticResourceClient,
+    drive_metadata_marker,
 )
 from agentcore_identity_poc.entra import EntraAuthError, EntraDeviceAuth
 from agentcore_identity_poc.evidence import EvidenceWriter
@@ -301,7 +302,11 @@ def google_list(
         "H6",
         "google_drive_metadata",
         "pass",
-        {"item_count": metadata.item_count, "type_counts": type_counts},
+        {
+            "item_count": metadata.item_count,
+            "type_counts": type_counts,
+            "connection_marker": drive_metadata_marker(metadata),
+        },
     )
     typer.echo(
         _json_line(
@@ -310,6 +315,7 @@ def google_list(
                 "operation": "google-list",
                 "item_count": metadata.item_count,
                 "type_counts": type_counts,
+                "connection_marker": drive_metadata_marker(metadata),
             }
         )
     )
@@ -352,6 +358,8 @@ def google_revoke_check(
 def user_isolation(
     user_a_alias: Annotated[str, typer.Option("--user-a-alias")],
     user_b_alias: Annotated[str, typer.Option("--user-b-alias")],
+    user_a_drive_marker: Annotated[str, typer.Option("--user-a-drive-marker")],
+    user_b_drive_marker: Annotated[str, typer.Option("--user-b-drive-marker")],
     tokens_stdin: Annotated[bool, typer.Option("--tokens-stdin")] = False,
     evidence_path: Annotated[Path, typer.Option()] = _DEFAULT_GOOGLE_EVIDENCE_PATH,
 ) -> None:
@@ -359,6 +367,12 @@ def user_isolation(
     runtime = runtime_factory()
     try:
         settings = runtime.load_settings()
+        expected_connection_markers = _expected_connection_markers(
+            user_a_alias,
+            user_a_drive_marker,
+            user_b_alias,
+            user_b_drive_marker,
+        )
         users = _get_isolation_users(
             runtime,
             settings,
@@ -381,7 +395,13 @@ def user_isolation(
 
     writer = runtime.evidence_writer(evidence_path)
     try:
-        rows = _run_user_isolation(runtime, settings, users, writer)
+        rows = _run_user_isolation(
+            runtime,
+            settings,
+            users,
+            writer,
+            expected_connection_markers=expected_connection_markers,
+        )
     except (EntraAuthError, TokenRejected):
         _emit_blocked("authentication", _AUTHENTICATION_EXIT, "inbound_token_rejected")
     except ExperimentConfigurationError:
@@ -397,6 +417,12 @@ def user_isolation(
     if any(row.outcome == "authorization_required" for row in rows):
         _emit_authorization_required()
     if any(row.outcome != "pass" for row in rows):
+        if any(
+            row.connection_marker is not None and row.outcome == "fail" for row in rows
+        ):
+            _emit_blocked(
+                "downstream_denied", _DOWNSTREAM_EXIT, "google_connection_state_mismatch"
+            )
         _emit_blocked("downstream_denied", _DOWNSTREAM_EXIT, "google_connection_unavailable")
     typer.echo(
         _json_line({"status": "pass", "operation": "user-isolation", "user_count": len(rows)})
@@ -564,6 +590,7 @@ def _run_user_isolation(
     users: tuple[tuple[str, str], tuple[str, str]],
     writer: ObservationSink,
     *,
+    expected_connection_markers: Mapping[str, str],
     on_verified_subject_count: Callable[[int], None] | None = None,
 ) -> tuple[MatrixRow, ...]:
     identity = runtime.agentcore(settings)
@@ -618,15 +645,17 @@ def _run_user_isolation(
                 "user_alias": user_alias,
                 "item_count": metadata.item_count,
                 "type_counts": dict(metadata.type_counts),
+                "connection_marker": drive_metadata_marker(metadata),
             },
         )
-        return WorkloadAttempt("pass")
+        return WorkloadAttempt("pass", connection_marker=drive_metadata_marker(metadata))
 
     return run_user_isolation(
         principal_alias="local-poc-worker",
         workload_name=settings.agentcore_workload_name,
         provider=settings.agentcore_google_provider,
         users=users,
+        expected_connection_markers=expected_connection_markers,
         validate_user=lambda _, token: _validated_subject(runtime.validate_token(settings, token)),
         get_workload_token=lambda _, token: identity.workload_token(
             settings.agentcore_workload_name, token
@@ -642,11 +671,19 @@ def run_live_user_isolation(
     """Run the opt-in H4a live path with two device-code authenticated users."""
     runtime = _default_runtime()
     settings = runtime.load_settings()
+    user_a_alias = os.environ.get("AGENTCORE_POC_USER_A_ALIAS", "").strip()
+    user_b_alias = os.environ.get("AGENTCORE_POC_USER_B_ALIAS", "").strip()
+    expected_connection_markers = _expected_connection_markers(
+        user_a_alias,
+        os.environ.get("AGENTCORE_POC_USER_A_DRIVE_MARKER", "").strip(),
+        user_b_alias,
+        os.environ.get("AGENTCORE_POC_USER_B_DRIVE_MARKER", "").strip(),
+    )
     users = _get_isolation_users(
         runtime,
         settings,
-        user_a_alias=os.environ.get("AGENTCORE_POC_USER_A_ALIAS", "").strip(),
-        user_b_alias=os.environ.get("AGENTCORE_POC_USER_B_ALIAS", "").strip(),
+        user_a_alias=user_a_alias,
+        user_b_alias=user_b_alias,
         tokens_stdin=False,
     )
     writer = runtime.evidence_writer(_DEFAULT_GOOGLE_EVIDENCE_PATH)
@@ -655,11 +692,28 @@ def run_live_user_isolation(
         settings,
         users,
         writer,
+        expected_connection_markers=expected_connection_markers,
         on_verified_subject_count=on_verified_subject_count,
     )
     for row in rows:
         _append(writer, "H4a", "user_isolation", row.outcome, row.as_details())
     return rows
+
+
+def _expected_connection_markers(
+    user_a_alias: str,
+    user_a_marker: str,
+    user_b_alias: str,
+    user_b_marker: str,
+) -> dict[str, str]:
+    markers = {user_a_alias: user_a_marker, user_b_alias: user_b_marker}
+    if len(markers) != 2 or len(set(markers.values())) != 2 or not all(
+        re.fullmatch(r"[0-9a-f]{64}", marker) for marker in markers.values()
+    ):
+        raise ExperimentConfigurationError(
+            "H4a requires one sanitized expected Drive marker for each user alias"
+        )
+    return markers
 
 
 def _load_json_policy(filename: str) -> Mapping[str, object]:

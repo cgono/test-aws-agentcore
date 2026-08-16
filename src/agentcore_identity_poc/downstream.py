@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import TracebackType
@@ -50,6 +52,16 @@ class SyntheticMetadata:
 class DriveMetadata:
     item_count: int
     type_counts: dict[str, int]
+
+
+def drive_metadata_marker(metadata: DriveMetadata) -> str:
+    """Fingerprint aggregate-only Drive metadata without retaining item identifiers."""
+    aggregate = {
+        "item_count": metadata.item_count,
+        "type_counts": metadata.type_counts,
+    }
+    encoded = json.dumps(aggregate, separators=(",", ":"), sort_keys=True).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class _DownstreamClient:

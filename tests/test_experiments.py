@@ -108,6 +108,7 @@ def test_user_isolation_requires_exactly_two_distinct_validated_users() -> None:
                 ("user-a", "inbound-a"),
                 ("user-a", "inbound-b"),
             ),
+            expected_connection_markers={"user-a": "a" * 64},
             validate_user=lambda alias, _: validated.append(alias),
             get_workload_token=lambda _, __: "workload-token",
             observe_connection=lambda _, __: WorkloadAttempt("pass"),
@@ -125,11 +126,14 @@ def test_user_isolation_records_each_distinct_validated_user() -> None:
         workload_name="approved-workload",
         provider="google-provider",
         users=(("user-a", "inbound-a"), ("user-b", "inbound-b")),
+        expected_connection_markers={"user-a": "a" * 64, "user-b": "b" * 64},
         validate_user=lambda alias, _: validated.append(alias) or f"subject-{alias}",
         get_workload_token=lambda alias, token: workload_bindings.append((alias, token))
         or f"workload-for-{alias}",
         observe_connection=lambda alias, _: WorkloadAttempt(
-            "pass", None if alias == "user-a" else ""
+            "pass",
+            None if alias == "user-a" else "",
+            "a" * 64 if alias == "user-a" else "b" * 64,
         ),
     )
 
@@ -139,6 +143,20 @@ def test_user_isolation_records_each_distinct_validated_user() -> None:
         ("user-a", "pass"),
         ("user-b", "pass"),
     ]
+
+
+def test_user_isolation_rejects_indistinguishable_connection_markers() -> None:
+    with pytest.raises(ExperimentConfigurationError, match="expected Drive marker"):
+        run_user_isolation(
+            principal_alias="development-role",
+            workload_name="approved-workload",
+            provider="google-provider",
+            users=(("user-a", "inbound-a"), ("user-b", "inbound-b")),
+            expected_connection_markers={"user-a": "a" * 64, "user-b": "a" * 64},
+            validate_user=lambda alias, _: f"subject-{alias}",
+            get_workload_token=lambda _, __: "workload-token",
+            observe_connection=lambda _, __: WorkloadAttempt("pass", connection_marker="a" * 64),
+        )
 
 
 def test_user_isolation_rejects_different_aliases_with_the_same_verified_subject() -> None:
@@ -153,6 +171,7 @@ def test_user_isolation_rejects_different_aliases_with_the_same_verified_subject
             workload_name="approved-workload",
             provider="google-provider",
             users=(("user-a", "first-jwt"), ("user-b", "refreshed-jwt")),
+            expected_connection_markers={"user-a": "a" * 64, "user-b": "b" * 64},
             validate_user=lambda alias, token: validated.append((alias, token)) or "same-subject",
             get_workload_token=lambda alias, token: workload_bindings.append((alias, token))
             or "workload-token",
@@ -194,9 +213,11 @@ class FakePolicyManager:
     def __init__(self, *, fail_scoped_restore: bool = False) -> None:
         self.policy_mode = "scoped"
         self.actions: list[str] = []
+        self.caller_identity_calls = 0
         self.fail_scoped_restore = fail_scoped_restore
 
     def caller_identity(self) -> str:
+        self.caller_identity_calls += 1
         return "development-role"
 
     def apply_broad_policy(self) -> None:
@@ -208,6 +229,15 @@ class FakePolicyManager:
         if self.fail_scoped_restore:
             raise RuntimeError("IAM unavailable")
         self.policy_mode = "scoped"
+
+
+class ChangingPrincipalPolicyManager(FakePolicyManager):
+    def __init__(self) -> None:
+        super().__init__()
+        self._principal_aliases = iter(("development-role", "unexpected-role"))
+
+    def caller_identity(self) -> str:
+        return next(self._principal_aliases)
 
 
 def test_workload_isolation_requires_acknowledgement_before_broad_policy() -> None:
@@ -257,7 +287,28 @@ def test_workload_isolation_records_broad_and_scoped_rows_under_one_principal() 
         ("scoped", "unapproved-workload", "denied"),
     ]
     assert {row.principal_alias for row in rows} == {"development-role"}
+    assert policy.caller_identity_calls == 8
     assert recorded == list(rows)
+
+
+def test_workload_isolation_rejects_a_principal_change_during_a_policy_attempt() -> None:
+    policy = ChangingPrincipalPolicyManager()
+
+    with pytest.raises(ExperimentConfigurationError, match="same AWS principal"):
+        run_workload_isolation(
+            policy_manager=policy,
+            workload_names=("approved-workload", "unapproved-workload"),
+            user_alias="user-a",
+            provider="google-provider",
+            acknowledge_broad_policy=True,
+            attempt_provider=lambda workload: WorkloadAttempt(
+                "pass"
+                if policy.policy_mode == "broad" or workload == "approved-workload"
+                else "denied"
+            ),
+        )
+
+    assert policy.actions == ["broad", "scoped"]
 
 
 def test_workload_isolation_fails_nonzero_when_scoped_restoration_fails() -> None:

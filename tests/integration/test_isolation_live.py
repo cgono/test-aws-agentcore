@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Sequence
 from importlib import import_module
 from typing import Protocol
@@ -57,6 +58,12 @@ def test_live_flag_presence_requires_runtime(monkeypatch: pytest.MonkeyPatch) ->
 @pytest.mark.integration
 def test_live_user_isolation_records_two_distinct_validated_users() -> None:
     _require_live()
+    expected_markers = {
+        _require_drive_marker("AGENTCORE_POC_USER_A_DRIVE_MARKER"),
+        _require_drive_marker("AGENTCORE_POC_USER_B_DRIVE_MARKER"),
+    }
+    if len(expected_markers) != 2:
+        pytest.fail("H4a requires two distinct expected Drive aggregate markers")
     verified_subject_counts: list[int] = []
     try:
         rows = run_live_user_isolation(on_verified_subject_count=verified_subject_counts.append)
@@ -68,6 +75,7 @@ def test_live_user_isolation_records_two_distinct_validated_users() -> None:
     assert len({row.user_alias for row in rows}) == 2
     assert all(row.policy_mode == "scoped" for row in rows)
     assert all(row.outcome == "pass" for row in rows)
+    assert {row.connection_marker for row in rows} == expected_markers
 
 
 @pytest.mark.integration
@@ -83,3 +91,10 @@ def test_live_workload_isolation_records_broad_and_scoped_same_principal(
     assert all(row.outcome == "pass" for row in broad_rows)
     assert len({row.asserted_workload for row in scoped_rows}) == 2
     assert {row.outcome for row in scoped_rows} == {"pass", "denied"}
+
+
+def _require_drive_marker(variable_name: str) -> str:
+    marker = os.environ.get(variable_name, "").strip()
+    if not re.fullmatch(r"[0-9a-f]{64}", marker):
+        pytest.fail(f"{variable_name} must be a sanitized Drive aggregate marker")
+    return marker

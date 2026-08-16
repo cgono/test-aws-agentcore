@@ -8,7 +8,11 @@ from typer.testing import CliRunner
 from agentcore_identity_poc.agentcore import AuthorizationRequired, OAuthToken
 from agentcore_identity_poc.cli import Runtime, app
 from agentcore_identity_poc.config import Settings
-from agentcore_identity_poc.downstream import DownstreamUnauthorized, DriveMetadata
+from agentcore_identity_poc.downstream import (
+    DownstreamUnauthorized,
+    DriveMetadata,
+    drive_metadata_marker,
+)
 from agentcore_identity_poc.models import Observation
 
 SETTINGS = Settings(
@@ -187,7 +191,8 @@ def test_google_list_outputs_only_aggregate_metadata_and_redacts_tokens(
     assert result.exit_code == 0
     assert result.stdout == (
         '{"status":"pass","operation":"google-list","item_count":3,'
-        '"type_counts":{"application/pdf":1,"text/plain":2}}\n'
+        '"type_counts":{"application/pdf":1,"text/plain":2},'
+        '"connection_marker":"f992c4f597ac194403cc028896f71f905ffd6e01e7a9a0bdf564f60ff1f2c34b"}\n'
     )
     assert identity.google_force_authentication == [False]
     assert drive.access_tokens == ["google-access-token"]
@@ -227,6 +232,10 @@ def test_user_isolation_uses_two_validated_stdin_tokens_and_records_sanitized_h4
             "user-a",
             "--user-b-alias",
             "user-b",
+            "--user-a-drive-marker",
+            drive_metadata_marker(DriveMetadata(1, {"application/pdf": 1})),
+            "--user-b-drive-marker",
+            drive_metadata_marker(DriveMetadata(2, {"text/plain": 2})),
             "--tokens-stdin",
         ],
         input="inbound-a\ninbound-b\n",
@@ -260,6 +269,65 @@ def test_user_isolation_uses_two_validated_stdin_tokens_and_records_sanitized_h4
     assert "google-access-b" not in repr(rendered_evidence)
 
 
+def test_user_isolation_requires_two_operator_supplied_drive_markers(
+    monkeypatch: object,
+) -> None:
+    runtime, evidence = _runtime()
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)  # type: ignore[attr-defined]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "user-isolation",
+            "--user-a-alias",
+            "user-a",
+            "--user-b-alias",
+            "user-b",
+            "--tokens-stdin",
+        ],
+        input="inbound-a\ninbound-b\n",
+    )
+
+    assert result.exit_code == 2
+    assert evidence.observations == []
+
+
+def test_user_isolation_rejects_an_invalid_drive_marker_before_acquiring_tokens(
+    monkeypatch: object,
+) -> None:
+    acquired = False
+    runtime, evidence = _runtime()
+    runtime = replace(
+        runtime,
+        acquire_token=lambda _, __: _mark_acquired(),
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)  # type: ignore[attr-defined]
+
+    def _mark_acquired() -> str:
+        nonlocal acquired
+        acquired = True
+        return "inbound-secret"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "user-isolation",
+            "--user-a-alias",
+            "user-a",
+            "--user-b-alias",
+            "user-b",
+            "--user-a-drive-marker",
+            "not-a-marker",
+            "--user-b-drive-marker",
+            "b" * 64,
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert acquired is False
+    assert evidence.observations == []
+
+
 def test_user_isolation_rejects_distinct_tokens_for_the_same_verified_subject(
     monkeypatch: object,
 ) -> None:
@@ -277,6 +345,10 @@ def test_user_isolation_rejects_distinct_tokens_for_the_same_verified_subject(
             "user-a",
             "--user-b-alias",
             "user-b",
+            "--user-a-drive-marker",
+            "a" * 64,
+            "--user-b-drive-marker",
+            "b" * 64,
             "--tokens-stdin",
         ],
         input="first-jwt\nrefreshed-jwt\n",
@@ -294,6 +366,52 @@ def test_user_isolation_rejects_distinct_tokens_for_the_same_verified_subject(
     assert "refreshed-jwt" not in result.output
 
 
+def test_user_isolation_rejects_swapped_google_connection_aggregates(
+    monkeypatch: object,
+) -> None:
+    metadata_a = DriveMetadata(1, {"application/pdf": 1})
+    metadata_b = DriveMetadata(2, {"text/plain": 2})
+    identity = FakeIdentity([OAuthToken("google-access-a"), OAuthToken("google-access-b")])
+    drive = FakeDrive([metadata_b, metadata_a])
+    runtime, evidence = _runtime(identity=identity, drive=drive)
+    runtime = replace(
+        runtime,
+        validate_token=lambda _, token: {"sub": f"subject-for-{token}"},
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)  # type: ignore[attr-defined]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "user-isolation",
+            "--user-a-alias",
+            "user-a",
+            "--user-b-alias",
+            "user-b",
+            "--user-a-drive-marker",
+            drive_metadata_marker(metadata_a),
+            "--user-b-drive-marker",
+            drive_metadata_marker(metadata_b),
+            "--tokens-stdin",
+        ],
+        input="inbound-a\ninbound-b\n",
+    )
+
+    assert result.exit_code == 5
+    assert result.stdout == (
+        '{"status":"blocked","category":"downstream_denied",'
+        '"detail":"google_connection_state_mismatch"}\n'
+    )
+    h4a_rows = [
+        observation
+        for observation in evidence.observations
+        if observation.hypothesis == "H4a"
+    ]
+    assert [row.outcome for row in h4a_rows] == ["fail", "fail"]
+    assert "subject-for-inbound-a" not in result.output
+    assert "subject-for-inbound-b" not in result.output
+    assert "google-access-a" not in result.output
+    assert "google-access-b" not in result.output
 def test_google_revoke_check_forces_one_new_authorization_after_drive_401(
     monkeypatch: object,
 ) -> None:

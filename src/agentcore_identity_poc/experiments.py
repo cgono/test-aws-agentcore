@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import re
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
@@ -12,6 +13,7 @@ Outcome = Literal["pass", "denied", "fail", "authorization_required"]
 _RECOVERY_COMMAND = (
     ".venv/bin/python scripts/provision_agentcore.py --apply"
 )
+_DRIVE_MARKER_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
 class ExperimentConfigurationError(ValueError):
@@ -42,10 +44,11 @@ class MatrixRow:
     provider: str
     outcome: Outcome
     aws_error_category: str | None
+    connection_marker: str | None = None
 
     def as_details(self) -> dict[str, str | None]:
         """Return only aliases and result metadata suitable for evidence output."""
-        return {
+        details = {
             "principal_alias": self.principal_alias,
             "asserted_workload": self.asserted_workload,
             "user_alias": self.user_alias,
@@ -53,6 +56,9 @@ class MatrixRow:
             "provider": self.provider,
             "aws_error_category": self.aws_error_category,
         }
+        if self.connection_marker is not None:
+            details["connection_marker"] = self.connection_marker
+        return details
 
 
 @dataclass(frozen=True)
@@ -61,6 +67,7 @@ class WorkloadAttempt:
 
     outcome: Outcome
     aws_error_category: str | None = None
+    connection_marker: str | None = None
 
 
 class WorkloadPolicyManager(Protocol):
@@ -79,6 +86,7 @@ def run_user_isolation(
     workload_name: str,
     provider: str,
     users: Sequence[tuple[str, str]],
+    expected_connection_markers: Mapping[str, str],
     validate_user: Callable[[str, str], str],
     get_workload_token: Callable[[str, str], str],
     observe_connection: Callable[[str, str], WorkloadAttempt],
@@ -87,6 +95,18 @@ def run_user_isolation(
     """Validate two distinct users and record their independent vault observations."""
     if len(users) != 2 or len({alias for alias, _ in users}) != 2:
         raise ExperimentConfigurationError("H4a requires exactly two distinct validated users")
+    user_aliases = {alias for alias, _ in users}
+    if (
+        set(expected_connection_markers) != user_aliases
+        or len(set(expected_connection_markers.values())) != len(user_aliases)
+        or not all(
+            _DRIVE_MARKER_PATTERN.fullmatch(marker)
+            for marker in expected_connection_markers.values()
+        )
+    ):
+        raise ExperimentConfigurationError(
+            "H4a requires one sanitized expected Drive marker for each user alias"
+        )
 
     validated_users = tuple(
         (user_alias, inbound_token, validate_user(user_alias, inbound_token))
@@ -101,6 +121,8 @@ def run_user_isolation(
     for user_alias, inbound_token, _ in validated_users:
         workload_token = get_workload_token(user_alias, inbound_token)
         attempt = observe_connection(user_alias, workload_token)
+        expected_marker = expected_connection_markers[user_alias]
+        connection_matches = attempt.connection_marker == expected_marker
         rows.append(
             MatrixRow(
                 principal_alias=principal_alias,
@@ -108,8 +130,13 @@ def run_user_isolation(
                 user_alias=user_alias,
                 policy_mode="scoped",
                 provider=provider,
-                outcome=attempt.outcome,
+                outcome=(
+                    attempt.outcome
+                    if attempt.outcome != "pass"
+                    else "pass" if connection_matches else "fail"
+                ),
                 aws_error_category=_empty_to_none(attempt.aws_error_category),
+                connection_marker=attempt.connection_marker,
             )
         )
     return tuple(rows)
@@ -151,11 +178,8 @@ def run_workload_isolation(
             "IAM propagation timeout must be greater than zero and at most 60"
         )
 
-    principal_alias = policy_manager.caller_identity()
-    if not principal_alias:
-        raise ExperimentConfigurationError("H4b requires a non-empty AWS principal alias")
-
     rows: list[MatrixRow] = []
+    expected_principal_alias: list[str] = []
     broad_applied = False
     restoration_failed = False
     try:
@@ -163,7 +187,8 @@ def run_workload_isolation(
         broad_applied = True
         _observe_until_converged(
             rows=rows,
-            principal_alias=principal_alias,
+            policy_manager=policy_manager,
+            expected_principal_alias=expected_principal_alias,
             workload_names=workload_names,
             user_alias=user_alias,
             provider=provider,
@@ -183,7 +208,8 @@ def run_workload_isolation(
             raise
         _observe_until_converged(
             rows=rows,
-            principal_alias=principal_alias,
+            policy_manager=policy_manager,
+            expected_principal_alias=expected_principal_alias,
             workload_names=workload_names,
             user_alias=user_alias,
             provider=provider,
@@ -211,7 +237,8 @@ def run_workload_isolation(
 def _observe_until_converged(
     *,
     rows: list[MatrixRow],
-    principal_alias: str,
+    policy_manager: WorkloadPolicyManager,
+    expected_principal_alias: list[str],
     workload_names: Sequence[str],
     user_alias: str,
     provider: str,
@@ -225,22 +252,30 @@ def _observe_until_converged(
 ) -> None:
     deadline = clock() + propagation_timeout_seconds
     while True:
-        attempts = tuple(attempt_provider(workload_name) for workload_name in workload_names)
-        matrix_rows = tuple(
-            MatrixRow(
-                principal_alias=principal_alias,
-                asserted_workload=workload_name,
-                user_alias=user_alias,
-                policy_mode=policy_mode,
-                provider=provider,
-                outcome=attempt.outcome,
-                aws_error_category=_empty_to_none(attempt.aws_error_category),
+        attempts: list[WorkloadAttempt] = []
+        matrix_rows: list[MatrixRow] = []
+        for workload_name in workload_names:
+            _verify_current_principal(policy_manager, expected_principal_alias)
+            attempt = attempt_provider(workload_name)
+            confirmed_principal_alias = _verify_current_principal(
+                policy_manager, expected_principal_alias
             )
-            for workload_name, attempt in zip(workload_names, attempts, strict=True)
-        )
+            attempts.append(attempt)
+            matrix_rows.append(
+                MatrixRow(
+                    principal_alias=confirmed_principal_alias,
+                    asserted_workload=workload_name,
+                    user_alias=user_alias,
+                    policy_mode=policy_mode,
+                    provider=provider,
+                    outcome=attempt.outcome,
+                    aws_error_category=_empty_to_none(attempt.aws_error_category),
+                )
+            )
+        matrix_rows_tuple = tuple(matrix_rows)
         rows.extend(matrix_rows)
         if record_row is not None:
-            for row in matrix_rows:
+            for row in matrix_rows_tuple:
                 record_row(row)
         if tuple(attempt.outcome for attempt in attempts) == expected_outcomes:
             return
@@ -251,3 +286,16 @@ def _observe_until_converged(
 
 def _empty_to_none(value: str | None) -> str | None:
     return value or None
+
+
+def _verify_current_principal(
+    policy_manager: WorkloadPolicyManager, expected_principal_alias: list[str]
+) -> str:
+    principal_alias = policy_manager.caller_identity()
+    if not principal_alias:
+        raise ExperimentConfigurationError("H4b requires a non-empty AWS principal alias")
+    if expected_principal_alias and principal_alias != expected_principal_alias[0]:
+        raise ExperimentConfigurationError("H4b requires every result under the same AWS principal")
+    if not expected_principal_alias:
+        expected_principal_alias.append(principal_alias)
+    return principal_alias
