@@ -81,11 +81,11 @@ def test_rejects_unsafe_raw_evidence_before_assessing(tmp_path) -> None:
         load_terminal_results(evidence)
 
 
-def test_rejects_raw_secret_looking_text_nested_in_a_provider_response(tmp_path) -> None:
+def test_rejects_raw_secret_looking_text_nested_in_an_ordinary_safe_field(tmp_path) -> None:
     rows = [terminal_row(hypothesis) for hypothesis in passing_results()]
     rows[0]["details"] = {
         "terminal": True,
-        "provider_response": '{"access_token":"not-a-jwt"}',
+        "provider_summary": '{"access_token":"not-a-jwt"}',
     }
     evidence = write_evidence(tmp_path, rows)
 
@@ -100,6 +100,54 @@ def test_rejects_invalid_measurement_units(tmp_path) -> None:
 
     with pytest.raises(AssessmentError, match="measurement"):
         load_terminal_results(evidence)
+
+
+def test_accepts_real_emitted_stage_latency_shape(tmp_path) -> None:
+    rows = [terminal_row(hypothesis) for hypothesis in passing_results()]
+    rows[0]["details"] = {
+        "terminal": True,
+        "stage_latency_ms": {
+            "workload": {
+                "cold_p50_ms": 10,
+                "cold_p95_ms": 12,
+                "warm_p50_ms": 4,
+                "warm_p95_ms": 5,
+            },
+            "google": {
+                "cold_p50_ms": None,
+                "cold_p95_ms": None,
+                "warm_p50_ms": 9,
+                "warm_p95_ms": 11,
+            },
+            "drive": {
+                "cold_p50_ms": 3,
+                "cold_p95_ms": 4,
+                "warm_p50_ms": None,
+                "warm_p95_ms": None,
+            },
+        },
+    }
+
+    assert load_terminal_results(write_evidence(tmp_path, rows)) == passing_results()
+
+
+@pytest.mark.parametrize(
+    "stage_latency",
+    [
+        {"workload": {"cold_p50_ms": 1}},
+        {
+            "workload": {"cold_p50_ms": 1, "cold_p95_ms": 1, "warm_p50_ms": 1, "warm_p95_ms": 1},
+            "google": {"cold_p50_ms": 1, "cold_p95_ms": 1, "warm_p50_ms": 1, "warm_p95_ms": 1},
+            "drive": {"cold_p50_ms": True, "cold_p95_ms": 1, "warm_p50_ms": 1, "warm_p95_ms": 1},
+        },
+    ],
+)
+def test_rejects_malformed_stage_latency_shape(tmp_path, stage_latency: object) -> None:
+    rows = [terminal_row(hypothesis) for hypothesis in passing_results()]
+    rows[0]["details"] = {"terminal": True, "stage_latency_ms": stage_latency}
+
+    with pytest.raises(AssessmentError, match="measurement"):
+        load_terminal_results(write_evidence(tmp_path, rows))
 
 
 def test_rejects_unacceptable_iam_dependency() -> None:
@@ -124,11 +172,11 @@ def test_rejects_unacceptable_operational_measurements(condition: str) -> None:
     ) == ("reject_or_defer")
 
 
-def test_report_command_writes_sanitized_summary_without_provider_response(tmp_path) -> None:
+def test_report_command_writes_sanitized_summary_without_detail_values(tmp_path) -> None:
     evidence = write_evidence(
         tmp_path,
         [
-            terminal_row(hypothesis, provider_response="this-must-not-be-rendered")
+            terminal_row(hypothesis, provider_summary="this-must-not-be-rendered")
             for hypothesis in passing_results()
         ],
     )
@@ -153,6 +201,29 @@ def test_report_command_writes_sanitized_summary_without_provider_response(tmp_p
     rendered = output.read_text(encoding="utf-8")
     assert "this-must-not-be-rendered" not in rendered
     assert "adopt_with_caveats" in rendered
+
+
+def test_report_command_rejects_raw_provider_response_field(tmp_path) -> None:
+    rows = [terminal_row(hypothesis) for hypothesis in passing_results()]
+    rows[0]["details"] = {"terminal": True, "provider_response": "safe-looking-content"}
+    evidence = write_evidence(tmp_path, rows)
+    output = tmp_path / "assessment.md"
+
+    result = CliRunner().invoke(
+        app,
+        ["report", "--evidence", str(evidence), "--output", str(output)],
+    )
+
+    assert result.exit_code == 2
+    assert not output.exists()
+
+
+def test_rejects_nested_response_body_field_alias(tmp_path) -> None:
+    rows = [terminal_row(hypothesis) for hypothesis in passing_results()]
+    rows[0]["details"] = {"terminal": True, "metadata": {"responseBody": "safe-looking"}}
+
+    with pytest.raises(AssessmentError, match="sanitized"):
+        load_terminal_results(write_evidence(tmp_path, rows))
 
 
 def test_rendered_report_marks_h3_api_limitation_when_it_fails() -> None:

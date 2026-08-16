@@ -6,7 +6,7 @@ import json
 import re
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Final
+from typing import Final, Never
 
 from agentcore_identity_poc.redaction import UnsafeEvidenceError, assert_safe_evidence
 
@@ -33,6 +33,16 @@ _COUNT_FIELDS: Final = frozenset(
 _RAW_SECRET_TEXT_PATTERN: Final = re.compile(
     r"(?:access_token|refresh_token|client_secret|authorization)\s*[\"':=]",
     re.IGNORECASE,
+)
+_CAMEL_CASE_BOUNDARY: Final = re.compile(r"([a-z0-9])([A-Z])")
+_ACRONYM_BOUNDARY: Final = re.compile(r"([A-Z]+)([A-Z][a-z])")
+_FIELD_SEPARATOR: Final = re.compile(r"[^A-Za-z0-9]+")
+_RAW_RESPONSE_FIELDS: Final = frozenset(
+    {"provider_response", "raw_response", "raw_provider_response", "response_body"}
+)
+_STAGE_NAMES: Final = frozenset({"workload", "google", "drive"})
+_STAGE_TIMING_FIELDS: Final = frozenset(
+    {"cold_p50_ms", "cold_p95_ms", "warm_p50_ms", "warm_p95_ms"}
 )
 
 
@@ -129,6 +139,8 @@ def render_markdown(
 def _validate_row(row: object, line_number: int) -> None:
     if not isinstance(row, Mapping):
         raise AssessmentError(f"sanitized evidence row {line_number} is not an object")
+    if _contains_raw_response_alias(row):
+        raise AssessmentError(f"sanitized evidence row {line_number} is unsafe")
     try:
         assert_safe_evidence(row)
     except UnsafeEvidenceError as error:
@@ -173,14 +185,7 @@ def _validate_measurements(value: Mapping[object, object], line_number: int) -> 
                     f"for {key}"
                 )
         elif key == "stage_latency_ms":
-            if not isinstance(item, Mapping) or any(
-                isinstance(stage, bool) or not isinstance(stage, int) or stage < 0
-                for stage in item.values()
-            ):
-                raise AssessmentError(
-                    f"sanitized evidence row {line_number} has an invalid measurement unit "
-                    f"for {key}"
-                )
+            _validate_stage_latency(item, line_number)
         elif isinstance(item, Mapping):
             _validate_measurements(item, line_number)
 
@@ -193,6 +198,45 @@ def _contains_raw_secret_text(value: object) -> bool:
     if isinstance(value, list | tuple):
         return any(_contains_raw_secret_text(item) for item in value)
     return False
+
+
+def _contains_raw_response_alias(value: object) -> bool:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if isinstance(key, str) and _normalize_field_name(key) in _RAW_RESPONSE_FIELDS:
+                return True
+            if _contains_raw_response_alias(item):
+                return True
+    if isinstance(value, list | tuple):
+        return any(_contains_raw_response_alias(item) for item in value)
+    return False
+
+
+def _normalize_field_name(key: str) -> str:
+    snake_case = _ACRONYM_BOUNDARY.sub(r"\1_\2", key)
+    snake_case = _CAMEL_CASE_BOUNDARY.sub(r"\1_\2", snake_case)
+    return _FIELD_SEPARATOR.sub("_", snake_case).strip("_").casefold()
+
+
+def _validate_stage_latency(value: object, line_number: int) -> None:
+    if not isinstance(value, Mapping) or set(value) != _STAGE_NAMES:
+        _raise_invalid_measurement(line_number, "stage_latency_ms")
+    for stage_name in _STAGE_NAMES:
+        stage = value.get(stage_name)
+        if not isinstance(stage, Mapping) or set(stage) != _STAGE_TIMING_FIELDS:
+            _raise_invalid_measurement(line_number, "stage_latency_ms")
+        for timing_name in _STAGE_TIMING_FIELDS:
+            timing = stage.get(timing_name)
+            if timing is not None and (
+                isinstance(timing, bool) or not isinstance(timing, int) or timing < 0
+            ):
+                _raise_invalid_measurement(line_number, "stage_latency_ms")
+
+
+def _raise_invalid_measurement(line_number: int, field: str) -> Never:
+    raise AssessmentError(
+        f"sanitized evidence row {line_number} has an invalid measurement unit for {field}"
+    )
 
 
 def _hypothesis_note(hypothesis: str, outcome: str) -> str:
