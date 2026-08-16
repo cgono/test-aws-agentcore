@@ -819,6 +819,35 @@ def test_measure_concurrency_reports_documented_quota_and_temporal_readiness(
     assert rendered["temporal_target"] == target
 
 
+def test_measure_concurrency_uses_actual_probe_concurrency_for_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _measurement_runtime(MeasurementIdentity(), RecordingEvidence())
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "measure",
+            "concurrency",
+            "--workers",
+            "5",
+            "--requests",
+            "1",
+            "--documented-quota",
+            "5",
+            "--temporal-target",
+            "5",
+        ],
+    )
+
+    assert result.exit_code == 0
+    rendered = json.loads(result.stdout)
+    assert rendered["workers"] == 1
+    assert rendered["probe_target_status"] == "probe_below_target"
+    assert rendered["readiness"] == "unknown"
+
+
 def test_cloudtrail_attribution_does_not_combine_categories_across_events() -> None:
     attribution = _cloudtrail_attribution_from_events(
         [

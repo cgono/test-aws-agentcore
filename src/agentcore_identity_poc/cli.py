@@ -359,7 +359,7 @@ def measure_concurrency_command(
     drive_result_equivalent = len({item.drive_marker for item in measurements}) == 1
     stage_latency_ms = _stage_latency_details(measurements)
     readiness_details = _concurrency_readiness(
-        workers=workers,
+        actual_probe_concurrency=report.maximum_workers,
         documented_quota=documented_quota,
         temporal_target=temporal_target,
     )
@@ -1532,7 +1532,7 @@ def _stage_latency_details(
 
 def _concurrency_readiness(
     *,
-    workers: int,
+    actual_probe_concurrency: int,
     documented_quota: int | None,
     temporal_target: int | None,
 ) -> dict[str, JsonValue]:
@@ -1541,7 +1541,7 @@ def _concurrency_readiness(
         "unknown"
         if documented_quota is None
         else "probe_within_quota"
-        if workers <= documented_quota
+        if actual_probe_concurrency <= documented_quota
         else "probe_exceeds_quota"
     )
     target_quota_status = (
@@ -1555,7 +1555,7 @@ def _concurrency_readiness(
         "unknown"
         if temporal_target is None
         else "probe_exercises_target"
-        if workers >= temporal_target
+        if actual_probe_concurrency >= temporal_target
         else "probe_below_target"
     )
     readiness = (
