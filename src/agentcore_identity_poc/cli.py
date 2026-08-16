@@ -1391,6 +1391,20 @@ def run_live_user_isolation(
     return rows
 
 
+def run_live_workload_isolation() -> tuple[MatrixRow, ...]:
+    """Run the opt-in H4b live path against real AWS IAM policy transitions."""
+    runtime = _default_runtime()
+    settings = runtime.load_settings()
+    writer = runtime.evidence_writer(_DEFAULT_GOOGLE_EVIDENCE_PATH)
+    return _run_workload_isolation(
+        runtime,
+        settings,
+        record_row=lambda row: _append(
+            writer, "H4b", "workload_isolation", row.outcome, row.as_details()
+        ),
+    )
+
+
 def _expected_connection_markers(
     user_a_alias: str,
     user_a_marker: str,

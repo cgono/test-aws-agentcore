@@ -27,6 +27,7 @@ from agentcore_identity_poc.cli import (
     _supported_token_expiry,
     app,
     run_live_user_isolation,
+    run_live_workload_isolation,
 )
 from agentcore_identity_poc.config import Settings, SettingsError
 from agentcore_identity_poc.downstream import (
@@ -548,6 +549,75 @@ def test_workload_isolation_uses_mocked_iam_policy_transitions_locally(
     assert [row.outcome for row in rows] == ["pass", "pass", "pass", "denied"]
     assert len(recorded) == 4
     assert iam.scoped is True
+
+
+def test_run_live_workload_isolation_writes_h4b_evidence_locally(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeIam:
+        scoped = False
+
+        def put_role_policy(self, *, PolicyDocument: str, **_kwargs: object) -> None:
+            self.scoped = "BroadObservationOnly" not in PolicyDocument
+
+    class FakeSts:
+        def get_caller_identity(self) -> dict[str, str]:
+            return {"Arn": "arn:aws:iam::123456789012:role/poc"}
+
+    class IsolationIdentity(MeasurementIdentity):
+        def __init__(self, iam: FakeIam) -> None:
+            super().__init__()
+            self.iam = iam
+
+        def workload_token(self, workload_name: str, user_token: str) -> str:
+            return f"workload-{workload_name}"
+
+        def google_token(
+            self,
+            workload_token: str,
+            provider: str,
+            scopes: list[str],
+            return_url: str,
+            state: str,
+            *,
+            force_authentication: bool = False,
+        ) -> OAuthToken:
+            if self.iam.scoped and workload_token.endswith(SETTINGS.agentcore_second_workload_name):
+                raise AgentCoreAccessDenied()
+            return OAuthToken("google-access")
+
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "directory_arn": "arn:directory",
+                "vault_arn": "arn:vault",
+                "workloads": [{"arn": "arn:approved"}, {"arn": "arn:unapproved"}],
+                "provider": {"arn": "arn:provider"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    iam = FakeIam()
+    identity = IsolationIdentity(iam)
+    evidence = RecordingEvidence()
+    runtime = replace(_measurement_runtime(identity, evidence), clock=lambda: 0.0)
+    monkeypatch.setenv("AGENTCORE_POC_IAM_ROLE_NAME", "poc-role")
+    monkeypatch.setenv("AGENTCORE_POC_USER_ALIAS", "user-a")
+    monkeypatch.setattr("agentcore_identity_poc.cli._STATE_PATH", state_path)
+    monkeypatch.setattr("agentcore_identity_poc.cli._default_runtime", lambda: runtime)
+    monkeypatch.setattr(
+        "agentcore_identity_poc.cli.boto3.client",
+        lambda service, **_kwargs: iam if service == "iam" else FakeSts(),
+    )
+
+    rows = run_live_workload_isolation()
+
+    assert [row.policy_mode for row in rows] == ["broad", "broad", "scoped", "scoped"]
+    assert [row.outcome for row in rows] == ["pass", "pass", "pass", "denied"]
+    observations = [item.as_dict() for item in evidence.observations]
+    assert [item["hypothesis"] for item in observations].count("H4b") == 4
+    assert all(item["operation"] == "workload_isolation" for item in observations)
 
 
 @pytest.mark.parametrize(

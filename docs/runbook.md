@@ -215,16 +215,28 @@ AGENTCORE_POC_USER_A_ALIAS=user-a \
 AGENTCORE_POC_USER_B_ALIAS=user-b \
 AGENTCORE_POC_USER_A_DRIVE_MARKER="$USER_A_DRIVE_MARKER" \
 AGENTCORE_POC_USER_B_DRIVE_MARKER="$USER_B_DRIVE_MARKER" \
+AGENTCORE_POC_IAM_ROLE_NAME=agentcore-poc-role \
+AGENTCORE_POC_USER_ALIAS=user-a \
 AGENTCORE_POC_LIVE_RUNTIME=operator_live_runtime:create_runtime \
 .venv/bin/python -m pytest tests/integration/test_isolation_live.py -m integration -v -s
 ```
 
-`operator_live_runtime:create_runtime` needs only `run_workload_isolation()` for H4b. The
-temporary broad-policy run requires the explicit acknowledgement documented by
+`AGENTCORE_POC_IAM_ROLE_NAME` and `AGENTCORE_POC_USER_ALIAS` are read directly by the H4b
+driver, separately from the H4a `_A`/`_B` aliases above; both must be set or the live H4b
+observation fails with a configuration error before any AWS call. `AGENTCORE_POC_USER_ALIAS`
+is the single opaque alias recorded against every H4b matrix row -- it does not need to match
+either H4a alias. `operator_live_runtime:create_runtime` needs only `run_workload_isolation()`
+for H4b. The temporary broad-policy run requires the explicit acknowledgement documented by
 `agentcore-identity-poc workload-isolation --help` and restores the scoped policy in all cases.
 The concrete runner obtains and compares a hashed STS caller alias immediately before and after
 every broad and scoped workload attempt; it aborts rather than stamping an initial caller alias
 onto later rows.
+
+IAM policy propagation on real AWS can occasionally take more than one internal retry pass
+(bounded at 60 seconds). If `run_workload_isolation()` returns extra rows that make the live
+test's outcome-set assertions fail even though no error was raised, this is a transient
+propagation delay, not a real IAM isolation failure -- wait a few seconds and rerun the same
+live test rather than treating it as a hypothesis failure.
 
 If the command reports a scoped-policy restoration failure, stop immediately. Restore the checked
 in final policy before any further live test, then rerun the scoped observation:
@@ -244,6 +256,8 @@ AGENTCORE_POC_USER_A_ALIAS=user-a \
 AGENTCORE_POC_USER_B_ALIAS=user-b \
 AGENTCORE_POC_USER_A_DRIVE_MARKER="$USER_A_DRIVE_MARKER" \
 AGENTCORE_POC_USER_B_DRIVE_MARKER="$USER_B_DRIVE_MARKER" \
+AGENTCORE_POC_IAM_ROLE_NAME=agentcore-poc-role \
+AGENTCORE_POC_USER_ALIAS=user-a \
 AGENTCORE_POC_LIVE_RUNTIME=operator_live_runtime:create_runtime \
 .venv/bin/python -m pytest \
   tests/integration/test_google_live.py tests/integration/test_isolation_live.py \
@@ -300,6 +314,16 @@ It exits `0` only when the configured runtime provides the observed lifecycle va
 Google post-expiry result is currently `failed` or `unproven`; it is not a reason to override the
 H3 evidence failure. Optional OneDrive observations are supplementary only and cannot replace the
 synthetic resource result for H2 or H6.
+
+The H7 inbound-token-expiry proof needs two separate runs of this command. The first run's
+`measure expiry` call seeds real (never sanitized-evidence-safe) token state to the
+already-ignored `evidence/raw/` directory and reports `post_expiry_obo_refresh` as `"unknown"` --
+this is expected, not a failure, because the source token has not actually expired yet at that
+point. Wait for a default Entra access token to actually expire (typically 60-90 minutes, not
+configurable by this POC), then rerun the identical command. The operator runtime checks real
+elapsed time itself; it never sleeps inside the process. A completed second run reports `True`
+only if the existing workload access token still obtained a fresh downstream token after its
+source JWT expired.
 
 ### Assessment
 
