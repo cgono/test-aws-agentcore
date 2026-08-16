@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import tempfile
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -42,6 +43,8 @@ class ControlPlaneClient(Protocol):
     def get_oauth2_credential_provider(self, *, name: str) -> Mapping[str, object]: ...
 
     def create_oauth2_credential_provider(self, **kwargs: object) -> Mapping[str, object]: ...
+
+    def update_workload_identity(self, **kwargs: object) -> Mapping[str, object]: ...
 
     def delete_workload_identity(self, *, name: str) -> Mapping[str, object]: ...
 
@@ -132,6 +135,9 @@ def apply_resources(
             "directory ARN, vault ARN, IAM client, and IAM role name are all required "
             "for policy install"
         )
+    existing_google_provider: object | None = None
+    if state_path.exists():
+        existing_google_provider = _load_state(state_path).get("google_provider")
     verify_budget(budgets_client, account_id, settings.aws_budget_name)
 
     provider = _find_provider(control_client, settings.agentcore_microsoft_provider)
@@ -159,9 +165,151 @@ def apply_resources(
         "directory_arn": cast(str, directory_arn),
         "vault_arn": cast(str, vault_arn),
     }
+    if isinstance(existing_google_provider, Mapping):
+        state["google_provider"] = dict(existing_google_provider)
     install_scoped_policy(iam_client, cast(str, iam_role_name), state)
     write_state(state_path, state)
     return state
+
+
+def create_google_provider(
+    control_client: ControlPlaneClient,
+    settings: Settings,
+    *,
+    state_path: Path = _STATE_PATH,
+    client_secret: str,
+) -> dict[str, object]:
+    """Create the Google provider and retain its returned callback for operator registration."""
+    client_id = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "").strip()
+    if not client_id:
+        raise ProvisioningError("GOOGLE_OAUTH_CLIENT_ID must be set before google-create --apply")
+    if not client_secret.strip():
+        raise ProvisioningError(
+            "a Google OAuth client secret is required from the environment or stdin"
+        )
+    state = _load_state(state_path)
+    prior_google = state.get("google_provider")
+    provider = _find_provider(control_client, settings.agentcore_google_provider)
+    if provider is None:
+        try:
+            response = control_client.create_oauth2_credential_provider(
+                name=settings.agentcore_google_provider,
+                credentialProviderVendor="GoogleOauth2",
+                oauth2ProviderConfigInput={
+                    "googleOauth2ProviderConfig": {
+                        "clientId": client_id,
+                        "clientSecret": client_secret,
+                    }
+                },
+                tags=_PROJECT_TAG,
+            )
+        except Exception as error:
+            raise ProvisioningError("could not create Google credential provider") from error
+        provider = _provider_state(response)
+
+    google_state = _google_provider_state(prior_google, provider)
+    updated = dict(state)
+    updated["google_provider"] = google_state
+    write_state(state_path, updated)
+    return updated
+
+
+def _google_provider_state(
+    prior: object, provider: Mapping[str, object]
+) -> dict[str, str]:
+    callback_url = _state_string(provider, "callback_url")
+    if not isinstance(prior, Mapping):
+        status = "google_console_registration_required"
+    elif prior.get("callback_url") != callback_url or prior.get("arn") != provider.get("arn"):
+        status = "google_console_update_required"
+    else:
+        previous_status = prior.get("console_status")
+        status = (
+            previous_status
+            if previous_status in {
+                "google_console_registration_required",
+                "google_console_update_required",
+                "google_console_registered",
+            }
+            else "google_console_registration_required"
+        )
+    return {
+        "name": _state_string(provider, "name"),
+        "arn": _state_string(provider, "arn"),
+        "callback_url": callback_url,
+        "console_status": status,
+    }
+
+
+def google_phase_two_plan(state: Mapping[str, object]) -> dict[str, str]:
+    """Describe whether the operator has acknowledged the generated Google callback."""
+    provider = state.get("google_provider")
+    if not isinstance(provider, Mapping):
+        return {
+            "status": "blocked",
+            "detail": "google_provider_missing; run google-create --apply",
+        }
+    callback_url = provider.get("callback_url")
+    status = provider.get("console_status")
+    if not isinstance(callback_url, str) or not callback_url:
+        return {"status": "blocked", "detail": "google_callback_missing"}
+    if status != "google_console_registered":
+        return {
+            "status": "blocked",
+            "detail": (
+                "register the recorded callback in Google then run "
+                "google-confirm-callback --apply"
+            ),
+        }
+    return {"status": "ready", "detail": "google_callback_registered"}
+
+
+def confirm_google_callback(
+    control_client: ControlPlaneClient, settings: Settings, *, state_path: Path = _STATE_PATH
+) -> dict[str, object]:
+    """Acknowledge Google registration and register the POC return URL on both workloads."""
+    state = _load_state(state_path)
+    provider = state.get("google_provider")
+    if not isinstance(provider, Mapping):
+        raise ProvisioningError("google-create --apply must finish before callback confirmation")
+    if provider.get("console_status") not in {
+        "google_console_registration_required",
+        "google_console_update_required",
+    }:
+        if provider.get("console_status") == "google_console_registered":
+            return state
+        raise ProvisioningError("Google callback state is invalid")
+
+    workloads = cast(list[Mapping[str, object]], state["workloads"])
+    updated_workloads: list[dict[str, object]] = []
+    for workload in workloads:
+        name = _state_string(workload, "name")
+        existing_return_urls = _string_list(workload.get("callback_urls"))
+        return_urls = list(dict.fromkeys([*existing_return_urls, settings.google_return_url]))
+        try:
+            response = control_client.update_workload_identity(
+                name=name,
+                allowedResourceOauth2ReturnUrls=return_urls,
+            )
+        except Exception as error:
+            raise ProvisioningError(
+                "could not register the POC return URL on a workload identity"
+            ) from error
+        updated_workloads.append(
+            {
+                "name": _required_string(response, "name"),
+                "arn": _required_string(response, "workloadIdentityArn"),
+                "callback_urls": _string_list(response.get("allowedResourceOauth2ReturnUrls")),
+            }
+        )
+
+    updated_provider = dict(provider)
+    updated_provider["console_status"] = "google_console_registered"
+    updated = dict(state)
+    updated["workloads"] = updated_workloads
+    updated["google_provider"] = updated_provider
+    write_state(state_path, updated)
+    return updated
 
 
 def install_scoped_policy(
@@ -378,17 +526,39 @@ def _valid_state(value: object) -> bool:
         and isinstance(workload.get("arn"), str)
         for workload in workloads
     )
-    return workload_fields_valid and all(
+    standard_provider_valid = all(
         isinstance(provider.get(field), str) and provider[field]
         for field in ("name", "arn", "callback_url")
     )
+    google_provider = value.get("google_provider")
+    google_provider_valid = google_provider is None or (
+        isinstance(google_provider, dict)
+        and all(
+            isinstance(google_provider.get(field), str) and google_provider[field]
+            for field in ("name", "arn", "callback_url")
+        )
+        and google_provider.get("console_status")
+        in {
+            "google_console_registration_required",
+            "google_console_update_required",
+            "google_console_registered",
+        }
+    )
+    return workload_fields_valid and standard_provider_valid and google_provider_valid
 
 
 def _cleanup_identifiers(state: Mapping[str, object]) -> list[str]:
     provider = cast(Mapping[str, str], state["provider"])
     workloads = cast(list[Mapping[str, str]], state["workloads"])
+    google_provider = state.get("google_provider")
+    google_identifier = (
+        [f"google provider: {google_provider['name']} ({google_provider['arn']})"]
+        if isinstance(google_provider, Mapping)
+        else []
+    )
     return [
         f"provider: {provider['name']} ({provider['arn']})",
+        *google_identifier,
         *[f"workload: {workload['name']} ({workload['arn']})" for workload in workloads],
     ]
 
@@ -401,7 +571,23 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--state-path", type=Path, default=_STATE_PATH)
     parser.add_argument("--account-id", help="AWS account ID for dry-run output")
     parser.add_argument("--confirm", help="required confirmation text for cleanup")
-    parser.add_argument("command", choices=("plan", "cleanup"), nargs="?", default="plan")
+    parser.add_argument(
+        "--google-secret-stdin",
+        action="store_true",
+        help="read the Google OAuth client secret from standard input for google-create",
+    )
+    parser.add_argument(
+        "command",
+        choices=(
+            "plan",
+            "cleanup",
+            "google-create",
+            "google-show-callback",
+            "google-confirm-callback",
+        ),
+        nargs="?",
+        default="plan",
+    )
     return parser.parse_args(argv)
 
 
@@ -421,6 +607,30 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         return 0
 
+    if args.command == "google-show-callback":
+        try:
+            state = _load_state(args.state_path)
+            provider = state.get("google_provider")
+            if not isinstance(provider, Mapping):
+                raise ProvisioningError(
+                    "google-create --apply must finish before google-show-callback"
+                )
+            print(
+                json.dumps(
+                    {
+                        "callback_url": _state_string(provider, "callback_url"),
+                        "console_status": _state_string(provider, "console_status"),
+                        "phase_2": google_phase_two_plan(state),
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
+        except ProvisioningError as error:
+            print(str(error))
+            return 2
+        return 0
+
     try:
         settings = Settings.from_mapping(os.environ)
     except SettingsError as error:
@@ -428,10 +638,75 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     account_id = args.account_id or os.environ.get("AWS_ACCOUNT_ID") or "unresolved"
-    if not args.apply:
+    if args.command == "plan" and not args.apply:
+        plan = plan_resources(settings, account_id)
+        try:
+            plan["phase_2"] = google_phase_two_plan(_load_state(args.state_path))
+        except ProvisioningError:
+            plan["phase_2"] = {
+                "status": "blocked",
+                "detail": "google_provider_missing; run google-create --apply",
+            }
         print(
-            json.dumps(plan_resources(settings, account_id), separators=(",", ":"), sort_keys=True)
+            json.dumps(plan, separators=(",", ":"), sort_keys=True)
         )
+        return 0
+
+    if args.command == "google-create":
+        if not args.apply:
+            print("google-create requires --apply")
+            return 2
+        try:
+            secret = _read_google_client_secret(from_stdin=args.google_secret_stdin)
+            session = boto3.session.Session(region_name=settings.aws_region)
+            state = create_google_provider(
+                cast(
+                    ControlPlaneClient,
+                    session.client("bedrock-agentcore-control", region_name=settings.aws_region),
+                ),
+                settings,
+                state_path=args.state_path,
+                client_secret=secret,
+            )
+        except ProvisioningError as error:
+            print(str(error))
+            return 2
+        print(json.dumps({"google_provider": state["google_provider"]}, separators=(",", ":")))
+        return 0
+
+    if args.command == "google-confirm-callback":
+        if not args.apply:
+            print("google-confirm-callback requires --apply")
+            return 2
+        try:
+            state = _load_state(args.state_path)
+            provider = state.get("google_provider")
+            if not isinstance(provider, Mapping):
+                raise ProvisioningError(
+                    "google-create --apply must finish before callback confirmation"
+                )
+            callback_status = provider.get("console_status")
+            if callback_status == "google_console_registered":
+                print(json.dumps({"phase_2": google_phase_two_plan(state)}, separators=(",", ":")))
+                return 0
+            if callback_status not in {
+                "google_console_registration_required",
+                "google_console_update_required",
+            }:
+                raise ProvisioningError("Google callback state is invalid")
+            session = boto3.session.Session(region_name=settings.aws_region)
+            state = confirm_google_callback(
+                cast(
+                    ControlPlaneClient,
+                    session.client("bedrock-agentcore-control", region_name=settings.aws_region),
+                ),
+                settings,
+                state_path=args.state_path,
+            )
+        except ProvisioningError as error:
+            print(str(error))
+            return 2
+        print(json.dumps({"phase_2": google_phase_two_plan(state)}, separators=(",", ":")))
         return 0
 
     directory_arn = os.environ.get("AGENTCORE_DIRECTORY_ARN")
@@ -467,10 +742,28 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def _read_google_client_secret(*, from_stdin: bool) -> str:
+    environment_secret = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
+    if from_stdin and environment_secret:
+        raise ProvisioningError(
+            "set only one Google client-secret source: GOOGLE_OAUTH_CLIENT_SECRET or "
+            "--google-secret-stdin"
+        )
+    secret = sys.stdin.readline().rstrip("\r\n") if from_stdin else environment_secret
+    if not isinstance(secret, str) or not secret.strip():
+        raise ProvisioningError(
+            "set GOOGLE_OAUTH_CLIENT_SECRET or pass --google-secret-stdin for google-create --apply"
+        )
+    return secret
+
+
 def _delete_recorded_resources(
     client: ControlPlaneClient, state: Mapping[str, object], state_path: Path
 ) -> None:
     provider = cast(Mapping[str, str], state["provider"])
+    google_provider = state.get("google_provider")
+    if isinstance(google_provider, Mapping):
+        _delete_provider_if_present(client, _state_string(google_provider, "name"))
     _delete_provider_if_present(client, provider["name"])
     for workload in cast(list[Mapping[str, str]], state["workloads"]):
         _delete_workload_if_present(client, workload["name"])

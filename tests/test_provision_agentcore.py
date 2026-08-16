@@ -14,6 +14,9 @@ from scripts.provision_agentcore import (
     ProvisioningError,
     apply_resources,
     cleanup_resources,
+    confirm_google_callback,
+    create_google_provider,
+    google_phase_two_plan,
     main,
     plan_resources,
     render_policy_template,
@@ -131,6 +134,13 @@ class RecordingControlClient:
             "callbackUrl": f"https://callback.example.test/{name}",
         }
         self.providers[name] = response
+        return response
+
+    def update_workload_identity(self, **kwargs: object) -> dict[str, object]:
+        self.calls.append(("update_workload_identity", kwargs))
+        name = str(kwargs["name"])
+        response = self.workloads[name]
+        response["allowedResourceOauth2ReturnUrls"] = kwargs["allowedResourceOauth2ReturnUrls"]
         return response
 
     def delete_workload_identity(self, *, name: str) -> dict[str, object]:
@@ -267,6 +277,225 @@ def test_apply_creates_only_absent_named_resources_and_records_returned_values(
     }
     assert again == state
     assert "not-logged" not in state_path.read_text(encoding="utf-8")
+
+
+def test_google_provider_creation_records_returned_callback_and_blocks_phase_two(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "google-client-id")
+    control = RecordingControlClient()
+    state_path = tmp_path / ".poc-state.json"
+    write_state(state_path, _base_state())
+
+    state = create_google_provider(
+        control,
+        SETTINGS,
+        state_path=state_path,
+        client_secret="not-logged",
+    )
+
+    assert state["google_provider"] == {
+        "name": "google-provider",
+        "arn": "arn:provider:google-provider",
+        "callback_url": "https://callback.example.test/google-provider",
+        "console_status": "google_console_registration_required",
+    }
+    assert google_phase_two_plan(state)["status"] == "blocked"
+    persisted = state_path.read_text(encoding="utf-8")
+    assert "not-logged" not in persisted
+    assert "https://callback.example.test/google-provider" in persisted
+
+
+def test_google_callback_confirmation_unblocks_phase_two_and_sets_both_workload_return_urls(
+    tmp_path: Path,
+) -> None:
+    control = RecordingControlClient()
+    state_path = tmp_path / ".poc-state.json"
+    _seed_workloads(control)
+    write_state(
+        state_path,
+        _base_state(
+            google_provider={
+                "name": "google-provider",
+                "arn": "arn:provider:google-provider",
+                "callback_url": "https://callback.example.test/google-provider",
+                "console_status": "google_console_registration_required",
+            }
+        ),
+    )
+
+    state = confirm_google_callback(control, SETTINGS, state_path=state_path)
+
+    assert state["google_provider"] == {
+        "name": "google-provider",
+        "arn": "arn:provider:google-provider",
+        "callback_url": "https://callback.example.test/google-provider",
+        "console_status": "google_console_registered",
+    }
+    assert google_phase_two_plan(state)["status"] == "ready"
+    assert [call[0] for call in control.calls] == [
+        "update_workload_identity",
+        "update_workload_identity",
+    ]
+    assert all(
+        call[1]["allowedResourceOauth2ReturnUrls"] == [SETTINGS.google_return_url]
+        for call in control.calls
+    )
+
+
+def test_google_provider_recreation_requires_a_new_console_update(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "google-client-id")
+    control = RecordingControlClient()
+    state_path = tmp_path / ".poc-state.json"
+    write_state(
+        state_path,
+        _base_state(
+            google_provider={
+                "name": "google-provider",
+                "arn": "arn:provider:prior-google-provider",
+                "callback_url": "https://callback.example.test/prior-google-provider",
+                "console_status": "google_console_registered",
+            }
+        ),
+    )
+
+    state = create_google_provider(
+        control,
+        SETTINGS,
+        state_path=state_path,
+        client_secret="not-logged",
+    )
+
+    assert state["google_provider"] == {
+        "name": "google-provider",
+        "arn": "arn:provider:google-provider",
+        "callback_url": "https://callback.example.test/google-provider",
+        "console_status": "google_console_update_required",
+    }
+    assert google_phase_two_plan(state)["status"] == "blocked"
+
+
+def test_core_apply_preserves_confirmed_google_provider_state(tmp_path: Path) -> None:
+    control = RecordingControlClient()
+    iam = RecordingIamClient()
+    state_path = tmp_path / ".poc-state.json"
+    google_provider = {
+        "name": "google-provider",
+        "arn": "arn:provider:google-provider",
+        "callback_url": "https://callback.example.test/google-provider",
+        "console_status": "google_console_registered",
+    }
+    write_state(state_path, _base_state(google_provider=google_provider))
+
+    state = apply_resources(
+        SETTINGS,
+        "123456789012",
+        budgets_client=PresentBudgetClient(),
+        control_client=control,
+        state_path=state_path,
+        entra_client_secret="not-logged",
+        directory_arn="arn:directory:returned",
+        vault_arn="arn:vault:returned",
+        iam_client=iam,
+        iam_role_name="agentcore-poc-role",
+    )
+
+    assert state["google_provider"] == google_provider
+
+
+def test_google_create_requires_a_secret_source_before_constructing_an_aws_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "scripts.provision_agentcore.Settings.from_mapping", lambda _: SETTINGS
+    )
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "google-client-id")
+    monkeypatch.delenv("GOOGLE_OAUTH_CLIENT_SECRET", raising=False)
+    monkeypatch.setattr(
+        "scripts.provision_agentcore.boto3.session.Session",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("AWS session must stay local")),
+    )
+
+    assert main(["google-create", "--apply"]) == 2
+
+
+def test_google_callback_confirmation_rejects_missing_provider_before_aws_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_path = tmp_path / ".poc-state.json"
+    write_state(state_path, _base_state())
+    monkeypatch.setattr(
+        "scripts.provision_agentcore.Settings.from_mapping", lambda _: SETTINGS
+    )
+    monkeypatch.setattr(
+        "scripts.provision_agentcore.boto3.session.Session",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("AWS session must stay local")),
+    )
+
+    assert main(["google-confirm-callback", "--apply", "--state-path", str(state_path)]) == 2
+
+
+def test_plan_blocks_phase_two_before_google_callback_is_acknowledged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        "scripts.provision_agentcore.Settings.from_mapping", lambda _: SETTINGS
+    )
+    write_state(
+        tmp_path / ".poc-state.json",
+        _base_state(
+            google_provider={
+                "name": "google-provider",
+                "arn": "arn:provider:google-provider",
+                "callback_url": "https://callback.example.test/google-provider",
+                "console_status": "google_console_registration_required",
+            }
+        ),
+    )
+
+    assert main(["--state-path", str(tmp_path / ".poc-state.json")]) == 0
+
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["phase_2"]["status"] == "blocked"
+
+
+def _base_state(*, google_provider: dict[str, str] | None = None) -> dict[str, object]:
+    state: dict[str, object] = {
+        "version": 1,
+        "account_id": "123456789012",
+        "region": "us-west-2",
+        "workloads": [
+            {
+                "name": "approved-workload",
+                "arn": "arn:workload:approved-workload",
+                "callback_urls": [],
+            },
+            {
+                "name": "unapproved-workload",
+                "arn": "arn:workload:unapproved-workload",
+                "callback_urls": [],
+            },
+        ],
+        "provider": {
+            "name": "microsoft-provider",
+            "arn": "arn:provider:microsoft-provider",
+            "callback_url": "https://callback.example.test/microsoft-provider",
+        },
+    }
+    if google_provider is not None:
+        state["google_provider"] = google_provider
+    return state
+
+
+def _seed_workloads(control: RecordingControlClient) -> None:
+    for name in ("approved-workload", "unapproved-workload"):
+        control.workloads[name] = {
+            "name": name,
+            "workloadIdentityArn": f"arn:workload:{name}",
+            "allowedResourceOauth2ReturnUrls": [],
+        }
 
 
 def test_apply_renders_and_installs_scoped_policy_from_recorded_arns(tmp_path: Path) -> None:
@@ -424,6 +653,48 @@ def test_cleanup_deletes_only_recorded_resources_after_exact_confirmation(tmp_pa
         "workload: unapproved-workload (arn:workload:unapproved-workload)",
     ]
     assert [call[0] for call in control.calls[-3:]] == [
+        "delete_oauth2_credential_provider",
+        "delete_workload_identity",
+        "delete_workload_identity",
+    ]
+    assert not state_path.exists()
+
+
+def test_cleanup_deletes_a_recorded_google_provider_before_workloads(tmp_path: Path) -> None:
+    control = RecordingControlClient()
+    state_path = tmp_path / ".poc-state.json"
+    control.providers["microsoft-provider"] = {
+        "name": "microsoft-provider",
+        "credentialProviderArn": "arn:provider:microsoft-provider",
+        "callbackUrl": "https://callback.example.test/microsoft-provider",
+    }
+    control.providers["google-provider"] = {
+        "name": "google-provider",
+        "credentialProviderArn": "arn:provider:google-provider",
+        "callbackUrl": "https://callback.example.test/google-provider",
+    }
+    _seed_workloads(control)
+    write_state(
+        state_path,
+        _base_state(
+            google_provider={
+                "name": "google-provider",
+                "arn": "arn:provider:google-provider",
+                "callback_url": "https://callback.example.test/google-provider",
+                "console_status": "google_console_registered",
+            }
+        ),
+    )
+
+    cleanup_resources(
+        control,
+        state_path=state_path,
+        apply=True,
+        confirm="agentcore-identity-poc",
+    )
+
+    assert [call[0] for call in control.calls] == [
+        "delete_oauth2_credential_provider",
         "delete_oauth2_credential_provider",
         "delete_workload_identity",
         "delete_workload_identity",

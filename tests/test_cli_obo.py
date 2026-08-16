@@ -148,7 +148,10 @@ def test_preflight_checks_agentcore_after_valid_configuration(monkeypatch: objec
     result = CliRunner().invoke(app, ["preflight", "--json"])
 
     assert result.exit_code == 0
-    assert result.stdout == '{"status":"ready","category":"configuration"}\n'
+    assert result.stdout == (
+        '{"status":"ready","category":"configuration",'
+        '"agentcore_authorized_domain":"bedrock-agentcore.us-west-2.amazonaws.com"}\n'
+    )
     assert events == ["configuration", "reachability"]
 
 

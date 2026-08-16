@@ -142,7 +142,17 @@ def preflight(json_output: Annotated[bool, typer.Option("--json")] = False) -> N
         _emit_blocked("identity_broker", _AGENTCORE_EXIT, "agentcore_unreachable")
 
     if json_output:
-        typer.echo(_json_line({"status": "ready", "category": "configuration"}))
+        typer.echo(
+            _json_line(
+                {
+                    "status": "ready",
+                    "category": "configuration",
+                    "agentcore_authorized_domain": (
+                        f"bedrock-agentcore.{settings.aws_region}.amazonaws.com"
+                    ),
+                }
+            )
+        )
     else:
         typer.echo("Local configuration is valid")
 

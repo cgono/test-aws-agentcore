@@ -46,6 +46,9 @@ Validate local configuration first:
 .venv/bin/agentcore-identity-poc preflight --json
 ```
 
+Record `agentcore_authorized_domain` from this output. It is the exact regional AgentCore
+domain that must be added to Google before the credential provider is created.
+
 Review the exact resource plan without cloud writes:
 
 ```bash
@@ -91,6 +94,62 @@ the tenant JWKS.
 Expose port 8001 through an authenticated public HTTPS tunnel, set `PUBLIC_BASE_URL` to that
 tunnel origin, then add `https://<tunnel-origin>/auth/entra/callback` as the public client
 redirect URI in Entra before beginning the browser callback test.
+
+Verify the public callback service before beginning Google consent:
+
+```bash
+curl --fail https://<tunnel-origin>/healthz
+```
+
+## Google Provider Setup
+
+This is a two-stage workflow. The Google console registration cannot be automated because
+AgentCore returns a unique provider callback only after creation. Do not begin Phase 2 while the
+provisioning plan reports `"phase_2":{"status":"blocked"}`.
+
+1. In Google Cloud, create or select the POC project. On the OAuth consent-screen App domain
+   page, add the exact `agentcore_authorized_domain` printed by preflight to Authorized domains.
+   Configure the low-risk `https://www.googleapis.com/auth/drive.metadata.readonly` scope and
+   the intended test users.
+2. Create a Web application OAuth client. Leave Authorized redirect URIs empty at this stage.
+   Keep its client ID and client secret out of shell history and tracked files.
+3. Create the named AgentCore Google provider. The client secret is accepted only through the
+   environment or standard input, never through a command argument. The script stores only the
+   returned provider ARN and callback URL in the mode-`0600` local state file.
+
+```bash
+GOOGLE_OAUTH_CLIENT_ID=... \
+GOOGLE_OAUTH_CLIENT_SECRET=... \
+.venv/bin/python scripts/provision_agentcore.py google-create --apply
+```
+
+For a protected standard-input source instead:
+
+```bash
+export GOOGLE_OAUTH_CLIENT_ID=...
+secret-command | \
+  .venv/bin/python scripts/provision_agentcore.py google-create --apply --google-secret-stdin
+```
+
+4. Print the unique callback URL and register that exact value in the Google OAuth client's
+   Authorized redirect URIs. A recreated provider has a different callback and changes local
+   state to `google_console_update_required`; repeat this console step before continuing.
+
+```bash
+.venv/bin/python scripts/provision_agentcore.py google-show-callback
+```
+
+5. After saving the Google console change, acknowledge it and register the POC
+   `PUBLIC_BASE_URL/oauth/google/return` URL on both workload identities:
+
+```bash
+.venv/bin/python scripts/provision_agentcore.py google-confirm-callback --apply
+```
+
+The command must report `"phase_2":{"status":"ready"}`. Complete the first Google consent
+within ten minutes, which is the authorization-session lifetime. For the H3 refresh observation,
+wait for natural Google access-token expiry; do not treat a second immediate retrieval as refresh
+evidence.
 
 ## Phase 2 Isolation
 
@@ -143,6 +202,22 @@ temporary broad-policy run requires the explicit acknowledgement documented by
 The concrete runner obtains and compares a hashed STS caller alias immediately before and after
 every broad and scoped workload attempt; it aborts rather than stamping an initial caller alias
 onto later rows.
+
+Run the complete opt-in Phase 2 gate only after the Google callback confirmation, browser health
+check, and first consent have succeeded:
+
+```bash
+AGENTCORE_POC_LIVE=1 \
+AGENTCORE_POC_LIVE_RUNTIME=operator_live_runtime:create_runtime \
+.venv/bin/python -m pytest \
+  tests/integration/test_google_live.py tests/integration/test_isolation_live.py \
+  -m integration -v -s
+```
+
+The operator runtime supplies `run_google_provider_gate()` for callback binding, completed
+consent, and durable-vault connection evidence, and `run_workload_isolation()` for H4b. Stop the
+POC if callback binding or durable vaulting fails. H3 remains pending until Task 13 records a
+post-expiry retrieval; H7 and H8 remain pending as well.
 
 ## Cleanup
 
