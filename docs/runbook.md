@@ -78,6 +78,20 @@ AGENTCORE_POC_LIVE_RUNTIME=operator_live_runtime:create_runtime \
 requested live run without this runtime fails clearly. It must run both aliases and record H1,
 H2, and H6. Stop before Google work when this gate fails.
 
+## Google Browser Callback
+
+Run the callback service with its production factory. The factory reads the existing POC
+environment variables, including `PUBLIC_BASE_URL`, and validates Entra callback tokens against
+the tenant JWKS.
+
+```bash
+.venv/bin/uvicorn agentcore_identity_poc.web:create_production_app --factory --host 127.0.0.1 --port 8001
+```
+
+Expose port 8001 through an authenticated public HTTPS tunnel, set `PUBLIC_BASE_URL` to that
+tunnel origin, then add `https://<tunnel-origin>/auth/entra/callback` as the public client
+redirect URI in Entra before beginning the browser callback test.
+
 ## Cleanup
 
 Print the exact recorded resources first:

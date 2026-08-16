@@ -55,3 +55,4 @@ select = ["E", "F", "I", "B", "UP", "S"]
 python_version = "3.12"
 strict = true
 packages = ["agentcore_identity_poc"]
+mypy_path = "src"

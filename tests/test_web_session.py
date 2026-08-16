@@ -8,7 +8,12 @@ from fastapi.testclient import TestClient
 
 from agentcore_identity_poc.agentcore import AuthorizationRequired
 from agentcore_identity_poc.config import Settings
-from agentcore_identity_poc.web import WebRuntime, create_app
+from agentcore_identity_poc.web import (
+    WebRuntime,
+    _SessionCookies,
+    create_app,
+    create_production_app,
+)
 
 USER_TOKEN = "user-token-value"
 OTHER_USER_TOKEN = "other-user-token-value"
@@ -120,7 +125,98 @@ def _start_google(client: TestClient) -> dict[str, object]:
         "/oauth/google/start", headers={"Authorization": f"Bearer {USER_TOKEN}"}
     )
     assert response.status_code == 200
-    return response.json()
+    body: object = json.loads(response.text)
+    assert isinstance(body, dict)
+    assert all(isinstance(key, str) for key in body)
+    return {key: value for key, value in body.items()}
+
+
+def test_production_factory_wires_settings_msal_jwks_and_agentcore(
+    monkeypatch: pytest.MonkeyPatch, settings: Settings
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakePolicy:
+        def __init__(self, *, issuer: str, audience: str, jwks_loader: object) -> None:
+            captured["issuer"] = issuer
+            captured["audience"] = audience
+            captured["jwks_loader"] = jwks_loader
+
+        def validate(self, token: str) -> Mapping[str, object]:
+            return {"sub": token}
+
+    class FakePublicClientApplication:
+        def __init__(self, client_id: str, *, authority: str) -> None:
+            captured["client_id"] = client_id
+            captured["authority"] = authority
+
+        def initiate_auth_code_flow(
+            self, *, scopes: list[str], redirect_uri: str
+        ) -> Mapping[str, object]:
+            return {"auth_uri": "https://login.example.test/authorize"}
+
+        def acquire_token_by_auth_code_flow(
+            self, flow: Mapping[str, object], auth_response: Mapping[str, str]
+        ) -> Mapping[str, object]:
+            return {"access_token": "token"}
+
+    class FakeBotoClient:
+        pass
+
+    fake_boto_client = FakeBotoClient()
+    monkeypatch.setattr(
+        "agentcore_identity_poc.web.Settings.from_mapping", lambda _: settings
+    )
+    monkeypatch.setattr("agentcore_identity_poc.web.JwtPolicy", FakePolicy)
+    monkeypatch.setattr(
+        "agentcore_identity_poc.web.make_http_jwks_loader",
+        lambda url: captured.setdefault("jwks_url", url),
+    )
+    monkeypatch.setattr(
+        "agentcore_identity_poc.web.msal.PublicClientApplication",
+        FakePublicClientApplication,
+    )
+    monkeypatch.setattr(
+        "agentcore_identity_poc.web.boto3.client",
+        lambda service_name, *, region_name: captured.update(
+            service_name=service_name, region_name=region_name
+        )
+        or fake_boto_client,
+    )
+
+    app = create_production_app()
+    runtime = app.state.runtime
+
+    assert isinstance(runtime, WebRuntime)
+    assert runtime.settings is settings
+    assert captured["issuer"] == settings.entra_issuer
+    assert captured["audience"] == "api://middle-tier-client"
+    assert captured["jwks_url"] == (
+        "https://login.microsoftonline.com/tenant-id/discovery/v2.0/keys"
+    )
+    assert "client_id" not in captured
+    assert "service_name" not in captured
+    msal_client = runtime.msal(settings)
+    assert isinstance(msal_client, FakePublicClientApplication)
+    assert captured["client_id"] == "public-client"
+    assert captured["authority"] == "https://login.microsoftonline.com/tenant-id"
+    identity = runtime.identity(settings)
+    assert captured["service_name"] == "bedrock-agentcore"
+    assert captured["region_name"] == "us-west-2"
+    assert identity.__class__.__name__ == "AgentCoreIdentity"
+
+
+def test_consumed_nonces_are_pruned_after_cookie_expiry() -> None:
+    clock = [1_000.0]
+    cookies = _SessionCookies(clock=lambda: clock[0], signing_key=b"x" * 32)
+    payload = {"nonce": "one", "expires_at": 1_600.0}
+
+    assert cookies.consume(payload)
+    assert cookies.consumed_nonces == {"one": 1_600.0}
+
+    clock[0] = 1_600.0
+    assert cookies.consume({"nonce": "two", "expires_at": 2_200.0})
+    assert cookies.consumed_nonces == {"two": 2_200.0}
 
 
 def test_google_return_does_not_complete_without_live_browser_token(
@@ -131,6 +227,19 @@ def test_google_return_does_not_complete_without_live_browser_token(
     assert response.status_code == 200
     assert "sessionStorage" in response.text
     assert fake_identity.complete_calls == []
+
+
+def test_google_return_page_reports_completion_outcome_and_clears_browser_token(
+    client: TestClient,
+) -> None:
+    response = client.get("/oauth/google/return")
+
+    assert response.status_code == 200
+    assert "Connection complete. Return to the CLI." in response.text
+    assert "Connection could not be completed. Return to the CLI." in response.text
+    assert ".then((response) => finish(response.ok))" in response.text
+    assert 'window.sessionStorage.removeItem("agentcore_entra_access_token")' in response.text
+    assert "finish(false)" in response.text
 
 
 def test_complete_rejects_state_mismatch(client: TestClient, fake_identity: FakeIdentity) -> None:

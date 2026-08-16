@@ -6,18 +6,27 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from importlib.resources import files
-from typing import Protocol
+from typing import Protocol, cast
 
+import boto3  # type: ignore[import-untyped]
+import msal  # type: ignore[import-untyped]
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-from agentcore_identity_poc.agentcore import AuthorizationRequired, OAuthToken
+from agentcore_identity_poc.agentcore import (
+    AgentCoreDataPlane,
+    AgentCoreIdentity,
+    AuthorizationRequired,
+    OAuthToken,
+)
 from agentcore_identity_poc.config import Settings
+from agentcore_identity_poc.jwt_validation import JwtPolicy, make_http_jwks_loader
 
 _COOKIE_MAX_AGE_SECONDS = 600
 _ENTRA_FLOW_COOKIE = "agentcore_entra_flow"
@@ -73,7 +82,7 @@ class _SessionCookies:
 
     clock: Callable[[], float]
     signing_key: bytes = field(default_factory=lambda: secrets.token_bytes(32))
-    consumed_nonces: set[str] = field(default_factory=set)
+    consumed_nonces: dict[str, float] = field(default_factory=dict)
 
     def encode(self, payload: Mapping[str, object]) -> str:
         body = _encode_json(dict(payload))
@@ -81,6 +90,7 @@ class _SessionCookies:
         return f"{_urlsafe(body)}.{_urlsafe(signature)}"
 
     def decode(self, value: str | None) -> dict[str, object] | None:
+        self._prune_consumed_nonces()
         if not value or "." not in value:
             return None
         body_part, signature_part = value.split(".", 1)
@@ -112,16 +122,35 @@ class _SessionCookies:
         return payload
 
     def consume(self, payload: Mapping[str, object]) -> bool:
+        self._prune_consumed_nonces()
         nonce = payload.get("nonce")
-        if not isinstance(nonce, str) or not nonce or nonce in self.consumed_nonces:
+        expires_at = payload.get("expires_at")
+        if (
+            not isinstance(nonce, str)
+            or not nonce
+            or nonce in self.consumed_nonces
+            or not isinstance(expires_at, int | float)
+            or isinstance(expires_at, bool)
+        ):
             return False
-        self.consumed_nonces.add(nonce)
+        self.consumed_nonces[nonce] = min(
+            float(expires_at), self.clock() + _COOKIE_MAX_AGE_SECONDS
+        )
         return True
+
+    def _prune_consumed_nonces(self) -> None:
+        now = self.clock()
+        self.consumed_nonces = {
+            nonce: expires_at
+            for nonce, expires_at in self.consumed_nonces.items()
+            if expires_at > now
+        }
 
 
 def create_app(runtime: WebRuntime) -> FastAPI:
     """Create a callback app with no persistent token cache or remote session store."""
     app = FastAPI()
+    app.state.runtime = runtime
     cookies = _SessionCookies(clock=runtime.clock)
 
     @app.get("/healthz")
@@ -249,6 +278,40 @@ def create_app(runtime: WebRuntime) -> FastAPI:
         return response
 
     return app
+
+
+def create_production_app() -> FastAPI:
+    """Create the Uvicorn callback app from POC environment configuration."""
+    settings = Settings.from_mapping(os.environ)
+    jwks_url = f"https://login.microsoftonline.com/{settings.entra_tenant_id}/discovery/v2.0/keys"
+    policy = JwtPolicy(
+        issuer=settings.entra_issuer,
+        audience=f"api://{settings.entra_api_client_id}",
+        jwks_loader=make_http_jwks_loader(jwks_url),
+    )
+    return create_app(
+        WebRuntime(
+            settings=settings,
+            msal=_authorization_code_client,
+            validate_token=policy.validate,
+            identity=_agentcore_identity,
+        )
+    )
+
+
+def _authorization_code_client(settings: Settings) -> AuthorizationCodeClient:
+    return cast(
+        AuthorizationCodeClient,
+        msal.PublicClientApplication(
+            settings.entra_public_client_id,
+            authority=f"https://login.microsoftonline.com/{settings.entra_tenant_id}",
+        ),
+    )
+
+
+def _agentcore_identity(settings: Settings) -> GoogleIdentityClient:
+    client = boto3.client("bedrock-agentcore", region_name=settings.aws_region)
+    return AgentCoreIdentity(cast(AgentCoreDataPlane, client))
 
 
 def _flow_payload(flow: Mapping[str, object], clock: float, nonce: str) -> dict[str, object]:
