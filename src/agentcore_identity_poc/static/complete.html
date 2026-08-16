@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Completing connection</title></head>
+<body>
+<script nonce="__CSP_NONCE__">
+(() => {
+  const parameters = new URLSearchParams(window.location.search);
+  const state = parameters.get("state");
+  const sessionUri = parameters.get("session_uri") || parameters.get("session_id");
+  const accessToken = window.sessionStorage.getItem("agentcore_entra_access_token");
+  window.history.replaceState({}, document.title, "/oauth/google/return");
+  if (!state || !sessionUri || !accessToken) {
+    window.sessionStorage.removeItem("agentcore_entra_access_token");
+    return;
+  }
+  window.fetch("/oauth/google/complete", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: {Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json"},
+    body: JSON.stringify({session_uri: sessionUri, state})
+  }).finally(() => window.sessionStorage.removeItem("agentcore_entra_access_token"));
+})();
+</script>
+</body>
+</html>
