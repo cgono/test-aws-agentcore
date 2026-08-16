@@ -94,7 +94,8 @@ class _SessionCookies:
 
     def decode(self, value: str | None) -> dict[str, object] | None:
         with self._lock:
-            self._prune_consumed_nonces()
+            now = self.clock()
+            self._prune_consumed_nonces(now)
             if not value or "." not in value:
                 return None
             body_part, signature_part = value.split(".", 1)
@@ -117,7 +118,7 @@ class _SessionCookies:
             if (
                 not isinstance(expires_at, int | float)
                 or isinstance(expires_at, bool)
-                or expires_at <= self.clock()
+                or expires_at <= now
                 or not isinstance(nonce, str)
                 or not nonce
                 or nonce in self.consumed_nonces
@@ -127,25 +128,24 @@ class _SessionCookies:
 
     def consume(self, payload: Mapping[str, object]) -> bool:
         with self._lock:
-            self._prune_consumed_nonces()
+            now = self.clock()
+            self._prune_consumed_nonces(now)
             nonce = payload.get("nonce")
             expires_at = payload.get("expires_at")
             if (
                 not isinstance(nonce, str)
                 or not nonce
-                or nonce in self.consumed_nonces
-                or len(self.consumed_nonces) >= _MAX_CONSUMED_NONCES
                 or not isinstance(expires_at, int | float)
                 or isinstance(expires_at, bool)
+                or expires_at <= now
+                or nonce in self.consumed_nonces
+                or len(self.consumed_nonces) >= _MAX_CONSUMED_NONCES
             ):
                 return False
-            self.consumed_nonces[nonce] = min(
-                float(expires_at), self.clock() + _COOKIE_MAX_AGE_SECONDS
-            )
+            self.consumed_nonces[nonce] = min(float(expires_at), now + _COOKIE_MAX_AGE_SECONDS)
             return True
 
-    def _prune_consumed_nonces(self) -> None:
-        now = self.clock()
+    def _prune_consumed_nonces(self, now: float) -> None:
         self.consumed_nonces = {
             nonce: expires_at
             for nonce, expires_at in self.consumed_nonces.items()

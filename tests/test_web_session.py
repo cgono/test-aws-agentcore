@@ -220,6 +220,19 @@ def test_consumed_nonces_are_pruned_after_cookie_expiry() -> None:
     assert cookies.consumed_nonces == {"two": 2_200.0}
 
 
+def test_consume_rejects_a_cookie_that_expires_after_decode() -> None:
+    clock = [1_000.0]
+    cookies = _SessionCookies(clock=lambda: clock[0], signing_key=b"x" * 32)
+    encoded = cookies.encode({"nonce": "one", "expires_at": 1_600.0})
+
+    payload = cookies.decode(encoded)
+    assert payload is not None
+    clock[0] = 1_600.0
+
+    assert not cookies.consume(payload)
+    assert cookies.consumed_nonces == {}
+
+
 def test_consumed_nonces_fail_closed_at_capacity_without_evicting_live_entries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
