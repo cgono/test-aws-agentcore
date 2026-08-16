@@ -3,14 +3,16 @@ from __future__ import annotations
 import json
 import os
 import stat
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
 
-from agentcore_identity_poc.agentcore import AuthorizationRequired, OAuthToken
+from agentcore_identity_poc.agentcore import AgentCoreThrottled, AuthorizationRequired, OAuthToken
 from agentcore_identity_poc.cli import Runtime, app
 from agentcore_identity_poc.config import Settings
+from agentcore_identity_poc.downstream import DownstreamUnauthorized, DriveMetadata
 from agentcore_identity_poc.experiments import (
     ExpiryObservation,
     MeasurementConfigurationError,
@@ -38,6 +40,7 @@ SETTINGS = Settings(
     resource_api_url="https://resource.example.test/metadata",
     public_base_url="https://callback.example.test",
 )
+_INBOUND_TOKEN = "inbound-secret"
 
 
 class RecordingEvidence:
@@ -49,19 +52,21 @@ class RecordingEvidence:
 
 
 class MeasurementIdentity:
-    def __init__(self) -> None:
+    def __init__(self, *, inbound_token: str = _INBOUND_TOKEN, token_suffix: str = "") -> None:
+        self.inbound_token = inbound_token
+        self.token_suffix = token_suffix
         self.workload_calls = 0
         self.force_authentication: list[bool] = []
 
     def workload_token(self, workload_name: str, user_token: str) -> str:
         assert workload_name == SETTINGS.agentcore_workload_name
-        assert user_token == "inbound-secret"
+        assert user_token == self.inbound_token
         self.workload_calls += 1
-        return "workload-secret"
+        return f"workload-secret{self.token_suffix}"
 
     def obo_token(self, workload_token: str, provider: str, scopes: list[str]) -> str:
-        assert workload_token == "workload-secret"
-        return "obo-secret"
+        assert workload_token == f"workload-secret{self.token_suffix}"
+        return f"obo-secret{self.token_suffix}"
 
     def google_token(
         self,
@@ -74,7 +79,23 @@ class MeasurementIdentity:
         force_authentication: bool = False,
     ) -> OAuthToken | AuthorizationRequired:
         self.force_authentication.append(force_authentication)
-        return OAuthToken("google-secret")
+        return OAuthToken(f"google-secret{self.token_suffix}")
+
+
+class MeasurementDrive:
+    def __init__(self, results: list[DriveMetadata | Exception] | None = None) -> None:
+        self.results = results or [DriveMetadata(1, {"text/plain": 1})]
+        self.access_tokens: list[str] = []
+
+    def list(self, access_token: str) -> DriveMetadata:
+        self.access_tokens.append(access_token)
+        result = self.results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def close(self) -> None:
+        return None
 
 
 def _measurement_runtime(
@@ -82,14 +103,18 @@ def _measurement_runtime(
     evidence: RecordingEvidence,
     *,
     clock: object = lambda: 0.0,
+    drive: MeasurementDrive | None = None,
+    inbound_expiry: float = 100.0,
 ) -> Runtime:
+    measurement_drive = drive or MeasurementDrive()
     return Runtime(
         load_settings=lambda: SETTINGS,
         check_reachability=lambda _: None,
-        acquire_token=lambda _, __: "inbound-secret",
-        validate_token=lambda _, __: {"sub": "subject", "exp": 100.0},
+        acquire_token=lambda _, __: identity.inbound_token,
+        validate_token=lambda _, __: {"sub": "subject", "exp": inbound_expiry},
         agentcore=lambda _: identity,
         downstream=lambda _: None,  # type: ignore[arg-type]
+        google_drive=lambda _: measurement_drive,
         clock=clock,  # type: ignore[arg-type]
         evidence_writer=lambda _: evidence,
         stdin_isatty=lambda: False,
@@ -256,13 +281,35 @@ def test_resume_state_requires_private_mode_matching_project_and_no_jwt_values(
         load_expiry_resume_state(path, project_id="project-a")
 
 
+def test_resume_state_rejects_jwt_shaped_values_anywhere_in_decoded_json(tmp_path: Path) -> None:
+    path = tmp_path / "resume.json"
+    record_expiry_state(
+        path,
+        project_id="project-a",
+        run_salt="salt",
+        entries=(
+            ExpiryObservation("inbound_jwt", "inbound", 1, 2),
+            ExpiryObservation("workload_token", "workload", 1, 2),
+            ExpiryObservation("obo_token", "obo", 1, 2),
+            ExpiryObservation("google_token", "google", 1, 2),
+        ),
+    )
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["unrelated"] = {"nested": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1In0.signature"}
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(MeasurementConfigurationError, match="JWT-shaped"):
+        load_expiry_resume_state(path, project_id="project-a")
+
+
 def test_measure_latency_reports_cold_warm_percentiles_and_no_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     identity = MeasurementIdentity()
     evidence = RecordingEvidence()
+    drive = MeasurementDrive([DriveMetadata(1, {"text/plain": 1}) for _ in range(3)])
     clock = iter((0.0, 0.100, 0.100, 0.120, 0.120, 0.150))
-    runtime = _measurement_runtime(identity, evidence, clock=lambda: next(clock))
+    runtime = _measurement_runtime(identity, evidence, clock=lambda: next(clock), drive=drive)
     monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
 
     result = CliRunner().invoke(app, ["measure", "latency", "--samples", "3"])
@@ -270,9 +317,11 @@ def test_measure_latency_reports_cold_warm_percentiles_and_no_tokens(
     assert result.exit_code == 0
     assert result.stdout == (
         '{"status":"pass","operation":"measure_latency","samples":3,'
-        '"cold_samples":1,"warm_samples":2,"p50_ms":30,"p95_ms":100}\n'
+        '"cold_samples":1,"warm_samples":2,"p50_ms":30,"p95_ms":100,'
+        '"cache_equivalent":true}\n'
     )
     assert identity.workload_calls == 3
+    assert drive.access_tokens == ["google-secret"] * 3
     assert "inbound-secret" not in result.output
     assert "workload-secret" not in result.output
 
@@ -297,6 +346,9 @@ def test_measure_expiry_writes_private_resume_state_and_exits_immediately(
     assert "workload-secret" not in state_path.read_text(encoding="utf-8")
     assert "obo-secret" not in state_path.read_text(encoding="utf-8")
     assert "google-secret" not in state_path.read_text(encoding="utf-8")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert [entry["expiry_known"] for entry in state["entries"]] == [True, False, False, False]
+    assert [entry["expires_at"] for entry in state["entries"]] == [100.0, None, None, None]
 
 
 def test_measure_expiry_does_not_call_identity_again_before_resume_time(
@@ -327,7 +379,77 @@ def test_measure_expiry_does_not_call_identity_again_before_resume_time(
     assert resumed_identity.workload_calls == 0
 
 
-def test_offboard_google_forces_authentication_but_never_deletes_shared_provider(
+def test_measure_expiry_compares_old_and_new_fingerprints_after_known_expiry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state_path = tmp_path / "expiry-state.json"
+    first_evidence = RecordingEvidence()
+    first_runtime = _measurement_runtime(MeasurementIdentity(), first_evidence, clock=lambda: 10.0)
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: first_runtime)
+    assert (
+        CliRunner().invoke(app, ["measure", "expiry", "--resume-state", str(state_path)]).exit_code
+        == 0
+    )
+
+    resumed_evidence = RecordingEvidence()
+    resumed_runtime = _measurement_runtime(
+        MeasurementIdentity(inbound_token="inbound-new", token_suffix="-new"),
+        resumed_evidence,
+        clock=lambda: 101.0,
+        inbound_expiry=200.0,
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: resumed_runtime)
+    result = CliRunner().invoke(app, ["measure", "expiry", "--resume-state", str(state_path)])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["status"] == "pass"
+    observations = [item.as_dict() for item in resumed_evidence.observations]
+    inbound = next(item for item in observations if item["details"]["token_kind"] == "inbound_jwt")
+    google = next(item for item in observations if item["details"]["token_kind"] == "google_token")
+    assert (inbound["operation"], inbound["outcome"]) == ("post_expiry_refresh", "pass")
+    assert inbound["details"]["fingerprint_changed"] is True
+    assert (google["operation"], google["outcome"]) == ("refresh_unproven", "unknown")
+    assert google["details"]["prior_expiry_known"] is False
+    assert "inbound-new" not in repr(observations)
+
+
+def test_offboard_google_detects_drive_revocation_before_forcing_authentication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = MeasurementIdentity()
+    evidence = RecordingEvidence()
+    drive = MeasurementDrive([DownstreamUnauthorized()])
+    runtime = _measurement_runtime(identity, evidence, drive=drive)
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(app, ["offboard", "google", "--user-alias", "user-a", "--apply"])
+
+    assert result.exit_code == 0
+    assert identity.force_authentication == [False, True]
+    assert drive.access_tokens == ["google-secret"]
+    rendered = json.loads(result.stdout)
+    assert rendered == {
+        "status": "failed",
+        "operation": "offboard_google",
+        "hypothesis": "H8",
+        "detail": "per_user_purge_unavailable",
+    }
+    observations = [item.as_dict() for item in evidence.observations]
+    assert observations[-2] == {
+        "hypothesis": "H8",
+        "operation": "google_revocation_probe",
+        "outcome": "pass",
+        "details": {
+            "user_alias": "user-a",
+            "detail": "drive_revoked_401_force_authentication_requested",
+            "reauthentication": "token_reissued",
+        },
+    }
+    assert observations[-1]["outcome"] == "fail"
+    assert "inbound-secret" not in repr(observations)
+
+
+def test_offboard_google_does_not_force_authentication_without_drive_revocation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     identity = MeasurementIdentity()
@@ -338,14 +460,61 @@ def test_offboard_google_forces_authentication_but_never_deletes_shared_provider
     result = CliRunner().invoke(app, ["offboard", "google", "--user-alias", "user-a", "--apply"])
 
     assert result.exit_code == 0
-    assert identity.force_authentication == [False, True]
+    assert identity.force_authentication == [False]
+    assert json.loads(result.stdout)["detail"] == "drive_revocation_not_observed"
+    assert [item.as_dict()["operation"] for item in evidence.observations] == [
+        "google_revocation_probe"
+    ]
+
+
+def test_measure_concurrency_records_end_to_end_throttle_and_retry_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = MeasurementIdentity()
+    evidence = RecordingEvidence()
+    drive = MeasurementDrive([DriveMetadata(1, {"text/plain": 1}) for _ in range(3)])
+    runtime = _measurement_runtime(identity, evidence, drive=drive)
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(
+        app,
+        ["measure", "concurrency", "--workers", "1", "--requests", "3"],
+    )
+
+    assert result.exit_code == 0
     rendered = json.loads(result.stdout)
-    assert rendered == {
-        "status": "failed",
-        "operation": "offboard_google",
-        "hypothesis": "H8",
-        "detail": "per_user_purge_unavailable",
-    }
-    observations = [item.as_dict() for item in evidence.observations]
-    assert observations[-1]["outcome"] == "fail"
-    assert "inbound-secret" not in repr(observations)
+    assert rendered["operation"] == "measure_concurrency"
+    assert rendered["throttle_count"] == 0
+    assert rendered["retry_attempts"] == 0
+    assert rendered["cache_equivalent"] is True
+    assert drive.access_tokens == ["google-secret"] * 3
+
+
+def test_measure_concurrency_records_throttled_retry_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ThrottledIdentity(MeasurementIdentity):
+        def workload_token(self, workload_name: str, user_token: str) -> str:
+            if self.workload_calls == 0:
+                self.workload_calls += 1
+                raise AgentCoreThrottled()
+            return super().workload_token(workload_name, user_token)
+
+    identity = ThrottledIdentity()
+    runtime = replace(
+        _measurement_runtime(identity, RecordingEvidence()),
+        sleep=lambda _: None,
+        random_unit=lambda: 0.0,
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(
+        app,
+        ["measure", "concurrency", "--workers", "1", "--requests", "1"],
+    )
+
+    assert result.exit_code == 0
+    rendered = json.loads(result.stdout)
+    assert rendered["throttle_count"] == 1
+    assert rendered["retry_attempts"] == 1
+    assert rendered["backoff_ms"] == 100

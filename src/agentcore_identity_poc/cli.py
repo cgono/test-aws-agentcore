@@ -14,6 +14,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Lock
 from typing import Annotated, NoReturn, Protocol, cast
 
 import boto3  # type: ignore[import-untyped]
@@ -31,6 +32,7 @@ from agentcore_identity_poc.agentcore import (
 from agentcore_identity_poc.config import Settings, SettingsError
 from agentcore_identity_poc.downstream import (
     DownstreamError,
+    DownstreamThrottled,
     DownstreamUnauthorized,
     DriveMetadata,
     GoogleDriveClient,
@@ -43,13 +45,16 @@ from agentcore_identity_poc.evidence import EvidenceWriter
 from agentcore_identity_poc.experiments import (
     ExperimentConfigurationError,
     ExperimentTimeout,
+    ExpiryComparison,
     ExpiryObservation,
     MatrixRow,
     MeasurementConfigurationError,
     PolicyRestorationError,
     RetryableMeasurementError,
+    StoredExpiryObservation,
     WorkloadAttempt,
     WorkloadPolicyManager,
+    compare_expiry_observations,
     load_expiry_resume_state,
     measure_bounded_concurrency,
     measure_latency,
@@ -136,6 +141,25 @@ class Runtime:
     )
 
 
+class _RetryCounters:
+    """Thread-safe aggregate retry evidence for one measurement command."""
+
+    def __init__(self) -> None:
+        self.throttle_count = 0
+        self.retry_attempts = 0
+        self.backoff_ms = 0
+        self._lock = Lock()
+
+    def record_throttle(self) -> None:
+        with self._lock:
+            self.throttle_count += 1
+
+    def record_retry(self, delay: float) -> None:
+        with self._lock:
+            self.retry_attempts += 1
+            self.backoff_ms += max(0, round(delay * 1_000))
+
+
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 measure_app = typer.Typer(no_args_is_help=True)
 offboard_app = typer.Typer(no_args_is_help=True)
@@ -183,17 +207,17 @@ def measure_latency_command(
     samples: Annotated[int, typer.Option("--samples")] = 10,
     evidence_path: Annotated[Path, typer.Option()] = _DEFAULT_GOOGLE_EVIDENCE_PATH,
 ) -> None:
-    """Record cold and warm workload-token latency without retaining tokens."""
+    """Measure cold and warm workload-to-Google-Drive latency without retaining tokens."""
     runtime = runtime_factory()
     try:
         settings = runtime.load_settings()
         writer = runtime.evidence_writer(evidence_path)
         inbound_token, identity = _measurement_identity(runtime, settings, writer)
+        markers: list[str] = []
         report = measure_latency(
             samples=samples,
-            operation=lambda _: _retry_agentcore(
-                lambda: identity.workload_token(settings.agentcore_workload_name, inbound_token),
-                runtime,
+            operation=lambda _: markers.append(
+                _google_drive_measurement(runtime, settings, identity, inbound_token)
             ),
             clock=runtime.clock,
         )
@@ -203,6 +227,7 @@ def measure_latency_command(
         _emit_blocked("configuration", _CONFIGURATION_EXIT, str(error))
     except AgentCoreError:
         _emit_blocked("identity_broker", _AGENTCORE_EXIT, "workload_token_unavailable")
+    cache_equivalent = len(set(markers)) == 1
     _append(
         writer,
         "H7",
@@ -214,6 +239,7 @@ def measure_latency_command(
             "warm_sample_count": sum(not sample.cold for sample in report.samples),
             "p50_ms": report.p50_ms,
             "p95_ms": report.p95_ms,
+            "cache_equivalent": cache_equivalent,
         },
     )
     typer.echo(
@@ -226,6 +252,7 @@ def measure_latency_command(
                 "warm_samples": sum(not sample.cold for sample in report.samples),
                 "p50_ms": report.p50_ms,
                 "p95_ms": report.p95_ms,
+                "cache_equivalent": cache_equivalent,
             }
         )
     )
@@ -237,19 +264,31 @@ def measure_concurrency_command(
     requests: Annotated[int, typer.Option("--requests")] = 20,
     evidence_path: Annotated[Path, typer.Option()] = _DEFAULT_GOOGLE_EVIDENCE_PATH,
 ) -> None:
-    """Measure workload-token throttling while bounding concurrent requests."""
+    """Measure end-to-end throttling while bounding concurrent Google Drive requests."""
     runtime = runtime_factory()
     try:
         settings = runtime.load_settings()
         writer = runtime.evidence_writer(evidence_path)
         inbound_token, identity = _measurement_identity(runtime, settings, writer)
+        markers: list[str] = []
+        marker_lock = Lock()
+        counters = _RetryCounters()
+
+        def request(_: int) -> None:
+            marker = _google_drive_measurement(
+                runtime,
+                settings,
+                identity,
+                inbound_token,
+                counters=counters,
+            )
+            with marker_lock:
+                markers.append(marker)
+
         report = measure_bounded_concurrency(
             workers=workers,
             requests=requests,
-            request=lambda _: _retry_agentcore(
-                lambda: identity.workload_token(settings.agentcore_workload_name, inbound_token),
-                runtime,
-            ),
+            request=request,
         )
     except SettingsError as error:
         _emit_configuration_failure(error, json_output=True)
@@ -257,12 +296,20 @@ def measure_concurrency_command(
         _emit_blocked("configuration", _CONFIGURATION_EXIT, str(error))
     except AgentCoreError:
         _emit_blocked("identity_broker", _AGENTCORE_EXIT, "workload_token_unavailable")
+    cache_equivalent = len(set(markers)) == 1
     _append(
         writer,
         "H7",
         "measure_concurrency",
         "pass",
-        {"workers": report.maximum_workers, "requests": report.completed},
+        {
+            "workers": report.maximum_workers,
+            "requests": report.completed,
+            "cache_equivalent": cache_equivalent,
+            "throttle_count": counters.throttle_count,
+            "retry_attempts": counters.retry_attempts,
+            "backoff_ms": counters.backoff_ms,
+        },
     )
     typer.echo(
         _json_line(
@@ -271,6 +318,10 @@ def measure_concurrency_command(
                 "operation": "measure_concurrency",
                 "workers": report.maximum_workers,
                 "requests": report.completed,
+                "cache_equivalent": cache_equivalent,
+                "throttle_count": counters.throttle_count,
+                "retry_attempts": counters.retry_attempts,
+                "backoff_ms": counters.backoff_ms,
             }
         )
     )
@@ -288,10 +339,14 @@ def measure_expiry_command(
         writer = runtime.evidence_writer(evidence_path)
         project_id = _measurement_project_id(settings)
         resumed = resume_state.exists()
+        prior_entries: tuple[StoredExpiryObservation, ...] = ()
         if resumed:
             prior_entries = load_expiry_resume_state(resume_state, project_id=project_id)
-            resume_at = min(entry.expires_at for entry in prior_entries)
-            if runtime.clock() < resume_at:
+            known_expiries = [
+                entry.expires_at for entry in prior_entries if entry.expires_at is not None
+            ]
+            resume_at = min(known_expiries) if known_expiries else None
+            if resume_at is not None and runtime.clock() < resume_at:
                 typer.echo(
                     _json_line(
                         {
@@ -303,7 +358,19 @@ def measure_expiry_command(
                 )
                 return
         entries = _issue_expiry_observations(runtime, settings, writer)
-        run_salt = runtime.random_urlsafe()
+        now = runtime.clock()
+        run_salt = _expiry_run_salt(project_id, now)
+        comparisons: tuple[ExpiryComparison, ...] = ()
+        if prior_entries:
+            prior_run_salt = _expiry_run_salt(
+                project_id,
+                min(entry.issued_at for entry in prior_entries),
+            )
+            comparisons = compare_expiry_observations(
+                prior_entries,
+                entries,
+                prior_run_salt=prior_run_salt,
+            )
         resume_at = record_expiry_state(
             resume_state,
             project_id=project_id,
@@ -316,25 +383,47 @@ def measure_expiry_command(
         _emit_blocked("configuration", _CONFIGURATION_EXIT, str(error))
     except AgentCoreError:
         _emit_blocked("identity_broker", _AGENTCORE_EXIT, "expiry_token_unavailable")
-    outcome = "pass" if resumed else "resume_required"
+    comparisons_by_kind = {comparison.kind: comparison for comparison in comparisons}
     for entry in entries:
         hypothesis = "H3" if entry.kind == "google_token" else "H7"
-        _append(
-            writer,
-            hypothesis,
-            "post_expiry_refresh" if resumed else "expiry_issue",
-            outcome,
-            {
+        comparison = comparisons_by_kind.get(entry.kind)
+        if comparison is None:
+            outcome = "resume_required"
+            operation = "expiry_issue"
+            details: dict[str, JsonValue] = {
                 "token_kind": entry.kind,
                 "issued_at": entry.issued_at,
                 "expires_at": entry.expires_at,
+                "expiry_known": entry.expiry_known,
                 "fingerprint": token_fingerprint(entry.token, run_salt=run_salt),
-            },
+            }
+        else:
+            post_expiry = (
+                comparison.prior_expiry_known
+                and comparison.prior_expires_at is not None
+                and now >= comparison.prior_expires_at
+            )
+            outcome = "pass" if post_expiry and comparison.fingerprint_changed else "unknown"
+            operation = "post_expiry_refresh" if outcome == "pass" else "refresh_unproven"
+            details = {
+                "token_kind": entry.kind,
+                "prior_expiry_known": comparison.prior_expiry_known,
+                "prior_expires_at": comparison.prior_expires_at,
+                "previous_fingerprint": comparison.previous_fingerprint,
+                "new_fingerprint": comparison.new_fingerprint,
+                "fingerprint_changed": comparison.fingerprint_changed,
+            }
+        _append(
+            writer,
+            hypothesis,
+            operation,
+            outcome,
+            details,
         )
     typer.echo(
         _json_line(
             {
-                "status": outcome,
+                "status": "pass" if comparisons else "resume_required",
                 "operation": "measure_expiry",
                 "resume_at": resume_at,
                 "token_kinds": [entry.kind for entry in entries],
@@ -399,7 +488,7 @@ def offboard_google(
             lambda: identity.workload_token(settings.agentcore_workload_name, inbound_token),
             runtime,
         )
-        _retry_agentcore(
+        authorization = _retry_agentcore(
             lambda: identity.google_token(
                 workload_token,
                 settings.agentcore_google_provider,
@@ -410,7 +499,35 @@ def offboard_google(
             ),
             runtime,
         )
-        _retry_agentcore(
+        if isinstance(authorization, AuthorizationRequired):
+            _emit_authorization_required()
+        drive = runtime.google_drive(settings)
+        try:
+            drive.list(authorization.access_token)
+        except DownstreamUnauthorized:
+            pass
+        else:
+            _append(
+                writer,
+                "H8",
+                "google_revocation_probe",
+                "fail",
+                {"user_alias": user_alias, "detail": "drive_revocation_not_observed"},
+            )
+            typer.echo(
+                _json_line(
+                    {
+                        "status": "failed",
+                        "operation": "offboard_google",
+                        "hypothesis": "H8",
+                        "detail": "drive_revocation_not_observed",
+                    }
+                )
+            )
+            return
+        finally:
+            _close_resource_client(drive)
+        reauthentication = _retry_agentcore(
             lambda: identity.google_token(
                 workload_token,
                 settings.agentcore_google_provider,
@@ -420,6 +537,21 @@ def offboard_google(
                 force_authentication=True,
             ),
             runtime,
+        )
+        _append(
+            writer,
+            "H8",
+            "google_revocation_probe",
+            "pass",
+            {
+                "user_alias": user_alias,
+                "detail": "drive_revoked_401_force_authentication_requested",
+                "reauthentication": (
+                    "authorization_required"
+                    if isinstance(reauthentication, AuthorizationRequired)
+                    else "token_reissued"
+                ),
+            },
         )
     except SettingsError as error:
         _emit_configuration_failure(error, json_output=True)
@@ -1156,17 +1288,69 @@ def _measurement_identity(
     return inbound_token, runtime.agentcore(settings)
 
 
-def _retry_agentcore[R](operation: Callable[[], R], runtime: Runtime) -> R:
+def _retry_agentcore[R](
+    operation: Callable[[], R], runtime: Runtime, *, counters: _RetryCounters | None = None
+) -> R:
     def retryable_operation() -> R:
         try:
             return operation()
         except AgentCoreThrottled as error:
+            if counters is not None:
+                counters.record_throttle()
             raise RetryableMeasurementError("agentcore_throttled") from error
 
     return retry_with_backoff(
         retryable_operation,
         sleep=runtime.sleep,
         random_unit=runtime.random_unit,
+        on_retry=counters.record_retry if counters is not None else None,
+    )
+
+
+def _google_drive_measurement(
+    runtime: Runtime,
+    settings: Settings,
+    identity: IdentityClient,
+    inbound_token: str,
+    *,
+    counters: _RetryCounters | None = None,
+) -> str:
+    """Run the workload, Google provider, and aggregate Drive operation as one measurement."""
+
+    def operation() -> str:
+        workload_token = _retry_agentcore(
+            lambda: identity.workload_token(settings.agentcore_workload_name, inbound_token),
+            runtime,
+            counters=counters,
+        )
+        authorization = _retry_agentcore(
+            lambda: identity.google_token(
+                workload_token,
+                settings.agentcore_google_provider,
+                [_GOOGLE_DRIVE_METADATA_SCOPE],
+                settings.google_return_url,
+                runtime.random_urlsafe(),
+            ),
+            runtime,
+            counters=counters,
+        )
+        if isinstance(authorization, AuthorizationRequired):
+            _emit_authorization_required()
+        drive = runtime.google_drive(settings)
+        try:
+            return drive_metadata_marker(drive.list(authorization.access_token))
+        except DownstreamThrottled as error:
+            if counters is not None:
+                counters.record_throttle()
+            raise RetryableMeasurementError("drive_throttled") from error
+        finally:
+            _close_resource_client(drive)
+
+    return retry_with_backoff(
+        operation,
+        sleep=runtime.sleep,
+        random_unit=runtime.random_unit,
+        on_retry=counters.record_retry if counters is not None else None,
     )
 
 
@@ -1205,12 +1389,18 @@ def _issue_expiry_observations(
     )
     if isinstance(google, AuthorizationRequired):
         _emit_authorization_required()
-    assumed_opaque_expiry = now + 3_600
     return (
         ExpiryObservation("inbound_jwt", inbound_token, now, float(inbound_expiry)),
-        ExpiryObservation("workload_token", workload_token, now, assumed_opaque_expiry),
-        ExpiryObservation("obo_token", obo_token, now, assumed_opaque_expiry),
-        ExpiryObservation("google_token", google.access_token, now, assumed_opaque_expiry),
+        ExpiryObservation(
+            "workload_token", workload_token, now, _supported_token_expiry(workload_token)
+        ),
+        ExpiryObservation("obo_token", obo_token, now, _supported_token_expiry(obo_token)),
+        ExpiryObservation(
+            "google_token",
+            google.access_token,
+            now,
+            _supported_token_expiry(google.access_token),
+        ),
     )
 
 
@@ -1219,6 +1409,27 @@ def _measurement_project_id(settings: Settings) -> str:
         (settings.aws_region, settings.agentcore_workload_name, settings.agentcore_google_provider)
     )
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _expiry_run_salt(project_id: str, issued_at: float) -> str:
+    """Derive an opaque lifecycle-run salt from persisted, non-token timing metadata."""
+    return hashlib.sha256(f"{project_id}:{issued_at:.6f}".encode()).hexdigest()
+
+
+def _supported_token_expiry(token: str) -> float | None:
+    """Read an ``exp`` claim only from a well-formed JWT; opaque tokens remain unknown."""
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        import base64
+
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return None
+    expiry = claims.get("exp") if isinstance(claims, Mapping) else None
+    return float(expiry) if isinstance(expiry, int | float) else None
 
 
 def _cloudtrail_event_count(settings: Settings, lookback_minutes: int) -> int:

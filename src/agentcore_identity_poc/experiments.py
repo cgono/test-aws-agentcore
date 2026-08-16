@@ -121,7 +121,12 @@ class ExpiryObservation:
     kind: str
     token: str
     issued_at: float
-    expires_at: float
+    expires_at: float | None
+
+    @property
+    def expiry_known(self) -> bool:
+        """Whether a supported claim or response supplied an expiry timestamp."""
+        return self.expires_at is not None
 
 
 @dataclass(frozen=True)
@@ -130,8 +135,21 @@ class StoredExpiryObservation:
 
     kind: str
     issued_at: float
-    expires_at: float
+    expires_at: float | None
+    expiry_known: bool
     fingerprint: str
+
+
+@dataclass(frozen=True)
+class ExpiryComparison:
+    """Token-safe comparison of one resumed token type to its original observation."""
+
+    kind: str
+    previous_fingerprint: str
+    new_fingerprint: str
+    fingerprint_changed: bool
+    prior_expiry_known: bool
+    prior_expires_at: float | None
 
 
 def measure_latency(
@@ -177,6 +195,7 @@ def retry_with_backoff[T](
     sleep: Callable[[float], None] = time.sleep,
     random_unit: Callable[[], float] | None = None,
     max_attempts: int = 4,
+    on_retry: Callable[[float], None] | None = None,
 ) -> T:
     """Retry only explicit throttling failures using jittered exponential delays."""
     if max_attempts < 1 or max_attempts > 5:
@@ -193,7 +212,10 @@ def retry_with_backoff[T](
                 raise MeasurementConfigurationError(
                     "retry jitter must be between zero and one"
                 ) from error
-            sleep(0.1 * (2**attempt) * (1 + jitter / 2))
+            delay = 0.1 * (2**attempt) * (1 + jitter / 2)
+            if on_retry is not None:
+                on_retry(delay)
+            sleep(delay)
     raise AssertionError("retry loop must either return or raise")
 
 
@@ -210,7 +232,7 @@ def record_expiry_state(
     project_id: str,
     entries: Sequence[ExpiryObservation],
     run_salt: str | None = None,
-) -> float:
+) -> float | None:
     """Persist only token fingerprints and timestamps, then return the next resume time."""
     if not project_id:
         raise MeasurementConfigurationError("project ID must be non-empty")
@@ -218,7 +240,10 @@ def record_expiry_state(
         raise MeasurementConfigurationError(
             "expiry evidence requires one entry for each token kind"
         )
-    if any(not entry.token or entry.expires_at < entry.issued_at for entry in entries):
+    if any(
+        not entry.token or (entry.expires_at is not None and entry.expires_at < entry.issued_at)
+        for entry in entries
+    ):
         raise MeasurementConfigurationError("expiry observations must have valid token timestamps")
     salt = run_salt or secrets.token_urlsafe(32)
     stored_entries = [
@@ -226,12 +251,14 @@ def record_expiry_state(
             "kind": entry.kind,
             "issued_at": entry.issued_at,
             "expires_at": entry.expires_at,
+            "expiry_known": entry.expiry_known,
             "fingerprint": token_fingerprint(entry.token, run_salt=salt),
         }
         for entry in entries
     ]
     _write_private_json(path, {"project_id": project_id, "entries": stored_entries})
-    return min(entry.expires_at for entry in entries)
+    known_expiries = [entry.expires_at for entry in entries if entry.expires_at is not None]
+    return min(known_expiries) if known_expiries else None
 
 
 def load_expiry_resume_state(path: Path, *, project_id: str) -> tuple[StoredExpiryObservation, ...]:
@@ -244,6 +271,8 @@ def load_expiry_resume_state(path: Path, *, project_id: str) -> tuple[StoredExpi
         raise MeasurementConfigurationError("could not read expiry resume state") from error
     except json.JSONDecodeError as error:
         raise MeasurementConfigurationError("expiry resume state must be JSON") from error
+    if _contains_jwt_shaped_value(state):
+        raise MeasurementConfigurationError("expiry resume state contains JWT-shaped values")
     if not isinstance(state, Mapping) or state.get("project_id") != project_id:
         raise MeasurementConfigurationError(
             "expiry resume state does not belong to current project"
@@ -258,25 +287,59 @@ def load_expiry_resume_state(path: Path, *, project_id: str) -> tuple[StoredExpi
         kind = entry.get("kind")
         issued_at = entry.get("issued_at")
         expires_at = entry.get("expires_at")
+        expiry_known = entry.get("expiry_known")
         fingerprint = entry.get("fingerprint")
         if (
             kind not in _EXPIRY_KINDS
             or not isinstance(issued_at, int | float)
-            or not isinstance(expires_at, int | float)
+            or not isinstance(expiry_known, bool)
+            or (expiry_known and not isinstance(expires_at, int | float))
+            or (not expiry_known and expires_at is not None)
             or not isinstance(fingerprint, str)
-            or _JWT_SHAPED_PATTERN.fullmatch(fingerprint)
             or not _FINGERPRINT_PATTERN.fullmatch(fingerprint)
-            or expires_at < issued_at
+            or (isinstance(expires_at, int | float) and expires_at < issued_at)
         ):
             raise MeasurementConfigurationError(
                 "expiry resume state contains JWT-shaped or invalid values"
             )
         results.append(
-            StoredExpiryObservation(kind, float(issued_at), float(expires_at), fingerprint)
+            StoredExpiryObservation(
+                kind,
+                float(issued_at),
+                float(expires_at) if isinstance(expires_at, int | float) else None,
+                expiry_known,
+                fingerprint,
+            )
         )
     if {entry.kind for entry in results} != _EXPIRY_KINDS:
         raise MeasurementConfigurationError("expiry resume state token kinds are invalid")
     return tuple(results)
+
+
+def compare_expiry_observations(
+    previous: Sequence[StoredExpiryObservation],
+    fresh: Sequence[ExpiryObservation],
+    *,
+    prior_run_salt: str,
+) -> tuple[ExpiryComparison, ...]:
+    """Compare fresh tokens with the prior lifecycle run using the prior opaque salt."""
+    prior_by_kind = {entry.kind: entry for entry in previous}
+    if set(prior_by_kind) != _EXPIRY_KINDS or {entry.kind for entry in fresh} != _EXPIRY_KINDS:
+        raise MeasurementConfigurationError("expiry comparison requires every token kind")
+    return tuple(
+        ExpiryComparison(
+            kind=entry.kind,
+            previous_fingerprint=prior_by_kind[entry.kind].fingerprint,
+            new_fingerprint=token_fingerprint(entry.token, run_salt=prior_run_salt),
+            fingerprint_changed=(
+                prior_by_kind[entry.kind].fingerprint
+                != token_fingerprint(entry.token, run_salt=prior_run_salt)
+            ),
+            prior_expiry_known=prior_by_kind[entry.kind].expiry_known,
+            prior_expires_at=prior_by_kind[entry.kind].expires_at,
+        )
+        for entry in fresh
+    )
 
 
 def _nearest_rank(values: Sequence[int], percentile: float) -> int:
@@ -302,6 +365,16 @@ def _write_private_json(path: Path, value: Mapping[str, object]) -> None:
     except Exception:
         temporary_path.unlink(missing_ok=True)
         raise
+
+
+def _contains_jwt_shaped_value(value: object) -> bool:
+    if isinstance(value, str):
+        return _JWT_SHAPED_PATTERN.fullmatch(value) is not None
+    if isinstance(value, Mapping):
+        return any(_contains_jwt_shaped_value(item) for item in value.values())
+    if isinstance(value, list | tuple):
+        return any(_contains_jwt_shaped_value(item) for item in value)
+    return False
 
 
 class WorkloadPolicyManager(Protocol):
