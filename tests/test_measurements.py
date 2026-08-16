@@ -5,6 +5,7 @@ import os
 import stat
 from dataclasses import replace
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 from typer.testing import CliRunner
@@ -180,7 +181,7 @@ def test_token_fingerprints_are_salted_per_run_and_do_not_include_token() -> Non
     assert token not in first
 
 
-def test_bounded_concurrency_never_exceeds_requested_workers() -> None:
+def test_bounded_concurrency_reports_observed_serial_peak_within_requested_workers() -> None:
     active = 0
     maximum_active = 0
 
@@ -194,8 +195,21 @@ def test_bounded_concurrency_never_exceeds_requested_workers() -> None:
     result = measure_bounded_concurrency(workers=2, requests=5, request=request)
 
     assert result.completed == 5
-    assert result.maximum_workers == 2
+    assert result.maximum_workers == 1
     assert maximum_active <= 2
+
+
+def test_bounded_concurrency_reports_peak_for_controlled_overlapping_requests() -> None:
+    barrier = Barrier(2)
+
+    def request(index: int) -> int:
+        barrier.wait(timeout=1)
+        return index
+
+    result = measure_bounded_concurrency(workers=2, requests=2, request=request)
+
+    assert result.completed == 2
+    assert result.maximum_workers == 2
 
 
 def test_retry_uses_jittered_exponential_backoff_for_retryable_failures() -> None:
@@ -788,7 +802,7 @@ def test_measure_cloudtrail_reports_unknown_when_attribution_fields_are_missing(
         (5, 20, "not_ready"),
         (1, 20, "not_ready"),
         (5, 5, "unknown"),
-        (5, 2, "ready"),
+        (5, 2, "unknown"),
         (None, None, "unknown"),
     ],
 )
@@ -846,6 +860,48 @@ def test_measure_concurrency_uses_actual_probe_concurrency_for_readiness(
     assert rendered["workers"] == 1
     assert rendered["probe_target_status"] == "probe_below_target"
     assert rendered["readiness"] == "unknown"
+
+
+def test_measure_concurrency_reports_ready_only_for_overlapping_target_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BlockingDrive(MeasurementDrive):
+        def __init__(self) -> None:
+            super().__init__([DriveMetadata(1, {"text/plain": 1}) for _ in range(2)])
+            self.barrier = Barrier(2)
+
+        def list(self, access_token: str) -> DriveMetadata:
+            self.barrier.wait(timeout=1)
+            return super().list(access_token)
+
+    runtime = _measurement_runtime(
+        MeasurementIdentity(),
+        RecordingEvidence(),
+        drive=BlockingDrive(),
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "measure",
+            "concurrency",
+            "--workers",
+            "2",
+            "--requests",
+            "2",
+            "--documented-quota",
+            "2",
+            "--temporal-target",
+            "2",
+        ],
+    )
+
+    assert result.exit_code == 0
+    rendered = json.loads(result.stdout)
+    assert rendered["workers"] == 2
+    assert rendered["probe_target_status"] == "probe_exercises_target"
+    assert rendered["readiness"] == "ready"
 
 
 def test_cloudtrail_attribution_does_not_combine_categories_across_events() -> None:

@@ -14,6 +14,7 @@ from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import Literal, Protocol
 
 PolicyMode = Literal["broad", "scoped"]
@@ -240,16 +241,31 @@ def cold_warm_latency_report(
 def measure_bounded_concurrency(
     *, workers: int, requests: int, request: Callable[[int], object]
 ) -> ConcurrencyReport:
-    """Execute a fixed number of requests while capping executor parallelism."""
+    """Execute a fixed number of requests and report the observed in-flight peak."""
     if workers < 1 or workers > 20:
         raise MeasurementConfigurationError("workers must be between 1 and 20")
     if requests < 1 or requests > 200:
         raise MeasurementConfigurationError("requests must be between 1 and 200")
+    active = 0
+    observed_peak = 0
+    active_lock = Lock()
+
+    def tracked_request(index: int) -> object:
+        nonlocal active, observed_peak
+        with active_lock:
+            active += 1
+            observed_peak = max(observed_peak, active)
+        try:
+            return request(index)
+        finally:
+            with active_lock:
+                active -= 1
+
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [executor.submit(request, index) for index in range(requests)]
+        futures = [executor.submit(tracked_request, index) for index in range(requests)]
         for future in futures:
             future.result()
-    return ConcurrencyReport(completed=requests, maximum_workers=min(workers, requests))
+    return ConcurrencyReport(completed=requests, maximum_workers=observed_peak)
 
 
 def retry_with_backoff[T](
