@@ -107,7 +107,7 @@ def test_google_token_returns_authorization_required_when_agentcore_requires_con
         authorization_url="https://accounts.example.test/authorize?secret=value",
         session_uri="session-uri-value",
     )
-    assert client.calls[0][1]["forceAuthentication"] is False
+    assert "forceAuthentication" not in client.calls[0][1]
 
 
 def test_complete_google_binds_the_signed_user_jwt_to_the_session() -> None:

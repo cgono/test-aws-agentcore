@@ -144,18 +144,31 @@ class AgentCoreIdentity:
         *,
         force_authentication: bool = False,
     ) -> OAuthToken | AuthorizationRequired:
-        response = self._request(
-            lambda: self._client.get_resource_oauth2_token(
-                workloadIdentityToken=workload_token,
-                resourceCredentialProviderName=provider,
-                scopes=scopes,
-                oauth2Flow="USER_FEDERATION",
-                resourceOauth2ReturnUrl=return_url,
-                forceAuthentication=force_authentication,
-                customParameters={"access_type": "offline"},
-                customState=state,
+        if force_authentication:
+            response = self._request(
+                lambda: self._client.get_resource_oauth2_token(
+                    workloadIdentityToken=workload_token,
+                    resourceCredentialProviderName=provider,
+                    scopes=scopes,
+                    oauth2Flow="USER_FEDERATION",
+                    resourceOauth2ReturnUrl=return_url,
+                    forceAuthentication=True,
+                    customParameters={"access_type": "offline"},
+                    customState=state,
+                )
             )
-        )
+        else:
+            response = self._request(
+                lambda: self._client.get_resource_oauth2_token(
+                    workloadIdentityToken=workload_token,
+                    resourceCredentialProviderName=provider,
+                    scopes=scopes,
+                    oauth2Flow="USER_FEDERATION",
+                    resourceOauth2ReturnUrl=return_url,
+                    customParameters={"access_type": "offline"},
+                    customState=state,
+                )
+            )
         token = response.get("accessToken")
         if isinstance(token, str) and token:
             return OAuthToken(token)

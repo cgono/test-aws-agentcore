@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import sys
 import time
-from collections.abc import Callable
+import webbrowser
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Protocol, cast
+from typing import Annotated, NoReturn, Protocol, cast
 
 import boto3  # type: ignore[import-untyped]
 import typer
@@ -19,37 +21,61 @@ from agentcore_identity_poc.agentcore import (
     AgentCoreError,
     AgentCoreIdentity,
     AgentCoreInternalError,
+    AuthorizationRequired,
+    OAuthToken,
 )
 from agentcore_identity_poc.config import Settings, SettingsError
 from agentcore_identity_poc.downstream import (
     DownstreamError,
+    DownstreamUnauthorized,
+    DriveMetadata,
+    GoogleDriveClient,
     SyntheticMetadata,
     SyntheticResourceClient,
 )
 from agentcore_identity_poc.entra import EntraAuthError, EntraDeviceAuth
 from agentcore_identity_poc.evidence import EvidenceWriter
 from agentcore_identity_poc.jwt_validation import JwtPolicy, TokenRejected, make_http_jwks_loader
-from agentcore_identity_poc.models import Observation
+from agentcore_identity_poc.models import JsonValue, Observation
 
 _CONFIGURATION_EXIT = 2
 _AUTHENTICATION_EXIT = 3
 _AGENTCORE_EXIT = 4
 _DOWNSTREAM_EXIT = 5
 _DEFAULT_EVIDENCE_PATH = Path("evidence/phase-1.jsonl")
+_DEFAULT_GOOGLE_EVIDENCE_PATH = Path("evidence/phase-2.jsonl")
+_GOOGLE_DRIVE_METADATA_SCOPE = "https://www.googleapis.com/auth/drive.metadata.readonly"
 
 
 class IdentityClient(Protocol):
-    """Only the token operations required by the Entra OBO command."""
+    """The token operations used by the Entra and Google commands."""
 
     def workload_token(self, workload_name: str, user_token: str) -> str: ...
 
     def obo_token(self, workload_token: str, provider: str, scopes: list[str]) -> str: ...
+
+    def google_token(
+        self,
+        workload_token: str,
+        provider: str,
+        scopes: list[str],
+        return_url: str,
+        state: str,
+        *,
+        force_authentication: bool = False,
+    ) -> OAuthToken | AuthorizationRequired: ...
 
 
 class ResourceClient(Protocol):
     """The narrow synthetic-resource boundary used by this command."""
 
     def list(self, access_token: str) -> SyntheticMetadata: ...
+
+
+class GoogleDriveResourceClient(Protocol):
+    """The aggregate-only Google Drive surface used by Google commands."""
+
+    def list(self, access_token: str) -> DriveMetadata: ...
 
 
 class ObservationSink(Protocol):
@@ -72,6 +98,9 @@ class Runtime:
     evidence_writer: Callable[[Path], ObservationSink]
     stdin_isatty: Callable[[], bool]
     read_stdin_line: Callable[[], str] = lambda: sys.stdin.readline()
+    google_drive: Callable[[Settings], GoogleDriveResourceClient] = lambda _: GoogleDriveClient()
+    open_browser: Callable[[str], bool] = webbrowser.open
+    random_urlsafe: Callable[[], str] = lambda: secrets.token_urlsafe(32)
 
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -195,8 +224,192 @@ def entra_obo(
     typer.echo(_json_line({"status": "pass", "operation": "entra-obo", "resource_status": 200}))
 
 
+@app.command("google-connect")
+def google_connect(
+    open_browser: Annotated[bool, typer.Option("--open-browser/--print-url")] = True,
+) -> None:
+    """Open or print the same-origin browser session-binding entry point."""
+    runtime = runtime_factory()
+    try:
+        settings = runtime.load_settings()
+    except SettingsError as error:
+        _emit_configuration_failure(error, json_output=True)
+
+    connect_url = f"{settings.public_base_url}/connect"
+    if open_browser:
+        runtime.open_browser(connect_url)
+        typer.echo(_json_line({"status": "authorization_started"}))
+        return
+    typer.echo(_json_line({"status": "authorization_started", "url": connect_url}))
+
+
+@app.command("google-list")
+def google_list(
+    evidence_path: Annotated[Path, typer.Option()] = _DEFAULT_GOOGLE_EVIDENCE_PATH,
+) -> None:
+    """Retrieve a vaulted Google token and list aggregate Drive metadata."""
+    runtime = runtime_factory()
+    try:
+        settings = runtime.load_settings()
+    except SettingsError as error:
+        _emit_configuration_failure(error, json_output=True)
+
+    writer = runtime.evidence_writer(evidence_path)
+    _, identity, workload_token = _validated_google_identity(runtime, settings, writer)
+    authorization = _request_google_token(runtime, settings, identity, workload_token, writer)
+    if isinstance(authorization, AuthorizationRequired):
+        _emit_authorization_required()
+
+    try:
+        metadata = _list_google_metadata(runtime, settings, authorization.access_token, writer)
+    except DownstreamUnauthorized:
+        _emit_blocked("downstream_denied", _DOWNSTREAM_EXIT, "google_drive_unauthorized")
+    type_counts: dict[str, JsonValue] = {
+        mime_type: count for mime_type, count in metadata.type_counts.items()
+    }
+    _append(
+        writer,
+        "H6",
+        "google_drive_metadata",
+        "pass",
+        {"item_count": metadata.item_count, "type_counts": type_counts},
+    )
+    typer.echo(
+        _json_line(
+            {
+                "status": "pass",
+                "operation": "google-list",
+                "item_count": metadata.item_count,
+                "type_counts": type_counts,
+            }
+        )
+    )
+
+
+@app.command("google-revoke-check")
+def google_revoke_check(
+    evidence_path: Annotated[Path, typer.Option()] = _DEFAULT_GOOGLE_EVIDENCE_PATH,
+) -> None:
+    """Detect a revoked Google token and request one new browser authorization."""
+    runtime = runtime_factory()
+    try:
+        settings = runtime.load_settings()
+    except SettingsError as error:
+        _emit_configuration_failure(error, json_output=True)
+
+    writer = runtime.evidence_writer(evidence_path)
+    _, identity, workload_token = _validated_google_identity(runtime, settings, writer)
+    authorization = _request_google_token(runtime, settings, identity, workload_token, writer)
+    if isinstance(authorization, AuthorizationRequired):
+        _emit_authorization_required()
+
+    try:
+        _list_google_metadata(runtime, settings, authorization.access_token, writer)
+    except DownstreamUnauthorized:
+        _request_google_token(
+            runtime,
+            settings,
+            identity,
+            workload_token,
+            writer,
+            force_authentication=True,
+        )
+        _emit_authorization_required()
+
+    typer.echo(_json_line({"status": "pass", "operation": "google-revoke-check"}))
+
+
 class _InteractiveStdinError(ValueError):
     """Raised when a token could be exposed by terminal input."""
+
+
+def _validated_google_identity(
+    runtime: Runtime,
+    settings: Settings,
+    writer: ObservationSink,
+) -> tuple[str, IdentityClient, str]:
+    try:
+        token = runtime.acquire_token(settings, typer.echo)
+        runtime.validate_token(settings, token)
+    except (EntraAuthError, TokenRejected):
+        _append(writer, "H1", "validate_inbound_token", "fail", {"category": "authentication"})
+        _emit_blocked("authentication", _AUTHENTICATION_EXIT, "inbound_token_rejected")
+
+    try:
+        identity = runtime.agentcore(settings)
+        workload_token = identity.workload_token(settings.agentcore_workload_name, token)
+    except AgentCoreError:
+        _append(writer, "H1", "workload_token", "fail", {"category": "identity_broker"})
+        _emit_blocked("identity_broker", _AGENTCORE_EXIT, "workload_token_unavailable")
+
+    _append(
+        writer,
+        "H1",
+        "workload_token",
+        "pass",
+        {"workload_name": settings.agentcore_workload_name},
+    )
+    return token, identity, workload_token
+
+
+def _request_google_token(
+    runtime: Runtime,
+    settings: Settings,
+    identity: IdentityClient,
+    workload_token: str,
+    writer: ObservationSink,
+    *,
+    force_authentication: bool = False,
+) -> OAuthToken | AuthorizationRequired:
+    try:
+        authorization = identity.google_token(
+            workload_token,
+            settings.agentcore_google_provider,
+            [_GOOGLE_DRIVE_METADATA_SCOPE],
+            settings.google_return_url,
+            runtime.random_urlsafe(),
+            force_authentication=force_authentication,
+        )
+    except AgentCoreError:
+        _append(writer, "H3", "google_vault_token", "fail", {"category": "identity_broker"})
+        _emit_blocked("identity_broker", _AGENTCORE_EXIT, "google_token_unavailable")
+
+    if isinstance(authorization, AuthorizationRequired):
+        _append(
+            writer,
+            "H3",
+            "google_vault_token",
+            "authorization_required",
+            {"provider": settings.agentcore_google_provider},
+        )
+    else:
+        _append(
+            writer,
+            "H3",
+            "google_vault_token",
+            "pass",
+            {"provider": settings.agentcore_google_provider},
+        )
+    return authorization
+
+
+def _list_google_metadata(
+    runtime: Runtime,
+    settings: Settings,
+    access_token: str,
+    writer: ObservationSink,
+) -> DriveMetadata:
+    drive = runtime.google_drive(settings)
+    try:
+        return drive.list(access_token)
+    except DownstreamUnauthorized:
+        _append(writer, "H6", "google_drive_metadata", "fail", {"category": "unauthorized"})
+        raise
+    except DownstreamError:
+        _append(writer, "H6", "google_drive_metadata", "fail", {"category": "denied"})
+        _emit_blocked("downstream_denied", _DOWNSTREAM_EXIT, "google_drive_denied")
+    finally:
+        _close_resource_client(drive)
 
 
 def _get_inbound_token(runtime: Runtime, settings: Settings, *, token_stdin: bool) -> str:
@@ -216,7 +429,7 @@ def _append(
     hypothesis: str,
     operation: str,
     outcome: str,
-    details: dict[str, bool | int | str],
+    details: Mapping[str, JsonValue],
 ) -> None:
     writer.append(Observation(hypothesis, operation, outcome, details))
 
@@ -225,7 +438,7 @@ def _elapsed_milliseconds(runtime: Runtime, started_at: float) -> int:
     return max(0, round((runtime.clock() - started_at) * 1_000))
 
 
-def _close_resource_client(resource_client: ResourceClient) -> None:
+def _close_resource_client(resource_client: object) -> None:
     close = getattr(resource_client, "close", None)
     if callable(close):
         close()
@@ -243,12 +456,25 @@ def _emit_configuration_failure(error: SettingsError, *, json_output: bool) -> N
     raise typer.Exit(code=_CONFIGURATION_EXIT)
 
 
-def _emit_blocked(category: str, exit_code: int, detail: str) -> None:
+def _emit_blocked(category: str, exit_code: int, detail: str) -> NoReturn:
     typer.echo(_json_line({"status": "blocked", "category": category, "detail": detail}))
     raise typer.Exit(code=exit_code)
 
 
-def _json_line(value: dict[str, bool | int | str]) -> str:
+def _emit_authorization_required() -> NoReturn:
+    typer.echo(
+        _json_line(
+            {
+                "status": "authorization_required",
+                "category": "authentication",
+                "detail": "google_authorization_required",
+            }
+        )
+    )
+    raise typer.Exit(code=_AUTHENTICATION_EXIT)
+
+
+def _json_line(value: Mapping[str, JsonValue]) -> str:
     return json.dumps(value, separators=(",", ":"), sort_keys=False)
 
 

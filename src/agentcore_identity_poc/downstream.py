@@ -26,6 +26,12 @@ class DownstreamAccessDenied(DownstreamError):
     message = "Downstream request was denied"
 
 
+class DownstreamUnauthorized(DownstreamAccessDenied):
+    """The downstream token is no longer accepted by the provider."""
+
+    message = "Downstream request was unauthorized"
+
+
 class DownstreamThrottled(DownstreamError):
     message = "Downstream request was throttled"
 
@@ -124,7 +130,9 @@ def _get_json(client: httpx.Client, url: str, access_token: str) -> Mapping[str,
 
 
 def _raise_for_downstream_status(response: httpx.Response) -> None:
-    if response.status_code in {401, 403}:
+    if response.status_code == 401:
+        raise DownstreamUnauthorized()
+    if response.status_code == 403:
         raise DownstreamAccessDenied()
     if response.status_code == 429:
         raise DownstreamThrottled()
