@@ -115,3 +115,34 @@ def test_google_drive_client_rejects_invalid_schema() -> None:
 
     with pytest.raises(DownstreamFailure):
         GoogleDriveClient().list("token")
+
+
+def test_downstream_clients_share_injected_client_without_closing_it() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url == httpx.URL("https://resource.example.test/metadata"):
+            return httpx.Response(200, json={"subject_alias": "user-a", "items": []})
+        if request.url == httpx.URL("https://www.googleapis.com/drive/v3/files"):
+            return httpx.Response(200, json={"files": [{"mimeType": "text/plain"}]})
+        return httpx.Response(404)
+
+    shared_client = httpx.Client(transport=httpx.MockTransport(handler))
+    resource_client = SyntheticResourceClient(
+        "https://resource.example.test/metadata", client=shared_client
+    )
+    drive_client = GoogleDriveClient(client=shared_client)
+
+    assert resource_client.list("resource-token").subject_alias == "user-a"
+    assert drive_client.list("drive-token").type_counts == {"text/plain": 1}
+
+    resource_client.close()
+    drive_client.close()
+
+    assert not shared_client.is_closed
+    shared_client.close()
+
+
+def test_owned_downstream_client_closes_at_context_exit() -> None:
+    with SyntheticResourceClient("https://resource.example.test/metadata") as resource_client:
+        assert not resource_client.is_closed
+
+    assert resource_client.is_closed

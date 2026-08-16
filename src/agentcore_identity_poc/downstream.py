@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from types import TracebackType
+from typing import Self
 
 import httpx
 
@@ -44,12 +46,37 @@ class DriveMetadata:
     type_counts: dict[str, int]
 
 
-class SyntheticResourceClient:
+class _DownstreamClient:
+    def __init__(self, *, client: httpx.Client | None = None) -> None:
+        self._client = client or httpx.Client(timeout=_TIMEOUT)
+        self._owns_client = client is None
+
+    @property
+    def is_closed(self) -> bool:
+        return self._client.is_closed
+
+    def close(self) -> None:
+        if self._owns_client:
+            self._client.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.close()
+
+
+class SyntheticResourceClient(_DownstreamClient):
     """Read normalized metadata from the synthetic downstream API."""
 
     def __init__(self, metadata_url: str, *, client: httpx.Client | None = None) -> None:
+        super().__init__(client=client)
         self._metadata_url = metadata_url
-        self._client = client or httpx.Client(timeout=_TIMEOUT)
 
     def list(self, access_token: str) -> SyntheticMetadata:
         payload = _get_json(self._client, self._metadata_url, access_token)
@@ -60,11 +87,11 @@ class SyntheticResourceClient:
         return SyntheticMetadata(subject_alias=subject_alias, items=tuple(items))
 
 
-class GoogleDriveClient:
+class GoogleDriveClient(_DownstreamClient):
     """List only aggregate Google Drive metadata, discarding user content identifiers."""
 
     def __init__(self, *, client: httpx.Client | None = None) -> None:
-        self._client = client or httpx.Client(timeout=_TIMEOUT)
+        super().__init__(client=client)
 
     def list(self, access_token: str) -> DriveMetadata:
         payload = _get_json(self._client, _GOOGLE_FILES_URL, access_token)
