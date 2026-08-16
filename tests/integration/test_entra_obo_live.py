@@ -20,7 +20,11 @@ class LiveRuntime(Protocol):
 
 @pytest.fixture
 def live_runtime() -> LiveRuntime:
-    if os.environ.get("AGENTCORE_POC_LIVE") != "1":
+    return _load_live_runtime()
+
+
+def _load_live_runtime() -> LiveRuntime:
+    if "AGENTCORE_POC_LIVE" not in os.environ:
         pytest.skip("set AGENTCORE_POC_LIVE=1 and configure live Entra/AWS credentials")
     target = os.environ.get("AGENTCORE_POC_LIVE_RUNTIME")
     if not target or ":" not in target:
@@ -37,6 +41,14 @@ def live_runtime() -> LiveRuntime:
     if not callable(getattr(runtime, "run_entra_obo", None)):
         pytest.fail("AGENTCORE_POC_LIVE_RUNTIME factory did not return a LiveRuntime")
     return runtime
+
+
+def test_live_flag_presence_requires_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AGENTCORE_POC_LIVE", "0")
+    monkeypatch.delenv("AGENTCORE_POC_LIVE_RUNTIME", raising=False)
+
+    with pytest.raises(pytest.fail.Exception, match="AGENTCORE_POC_LIVE_RUNTIME"):
+        _load_live_runtime()
 
 
 @pytest.mark.integration

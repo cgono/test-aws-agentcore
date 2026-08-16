@@ -53,10 +53,16 @@ Review the exact resource plan without cloud writes:
 ```
 
 Apply only after reviewing the plan. The script checks the named budget before writes, tags
-all resources `Project=agentcore-identity-poc`, and writes a private `.poc-state.json` inventory.
+all resources `Project=agentcore-identity-poc`, renders and installs the final no-wildcard scoped
+IAM policy, and writes a private `.poc-state.json` inventory. Supply the recorded directory and
+token-vault ARNs plus the IAM role that receives the inline policy before applying.
 
 ```bash
-ENTRA_API_CLIENT_SECRET=... .venv/bin/python scripts/provision_agentcore.py --apply
+ENTRA_API_CLIENT_SECRET=... \
+AGENTCORE_DIRECTORY_ARN=arn:... \
+AGENTCORE_TOKEN_VAULT_ARN=arn:... \
+AGENTCORE_POC_IAM_ROLE_NAME=agentcore-poc-role \
+.venv/bin/python scripts/provision_agentcore.py --apply
 ```
 
 Run the live gate only after preflight and provisioning succeed:

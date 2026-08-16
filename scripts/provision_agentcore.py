@@ -128,6 +128,13 @@ def apply_resources(
     """Create absent POC resources and persist only their returned identifiers."""
     verify_budget(budgets_client, account_id, settings.aws_budget_name)
 
+    policy_inputs = (directory_arn, vault_arn, iam_client, iam_role_name)
+    if not all(item is not None for item in policy_inputs):
+        raise ProvisioningError(
+            "directory ARN, vault ARN, IAM client, and IAM role name are all required "
+            "for policy install"
+        )
+
     provider = _find_provider(control_client, settings.agentcore_microsoft_provider)
     secret = entra_client_secret if entra_client_secret is not None else os.environ.get(
         "ENTRA_API_CLIENT_SECRET"
@@ -144,26 +151,16 @@ def apply_resources(
     if provider is None:
         provider = _create_microsoft_provider(control_client, settings, cast(str, secret))
 
-    policy_inputs = (directory_arn, vault_arn, iam_client, iam_role_name)
-    if any(item is not None for item in policy_inputs) and not all(
-        item is not None for item in policy_inputs
-    ):
-        raise ProvisioningError(
-            "directory ARN, vault ARN, IAM client, and IAM role name are all required "
-            "for policy install"
-        )
-
     state: dict[str, object] = {
         "version": 1,
         "account_id": account_id,
         "region": settings.aws_region,
         "workloads": workloads,
         "provider": provider,
+        "directory_arn": cast(str, directory_arn),
+        "vault_arn": cast(str, vault_arn),
     }
-    if directory_arn is not None and vault_arn is not None:
-        state["directory_arn"] = directory_arn
-        state["vault_arn"] = vault_arn
-        install_scoped_policy(cast(IamPolicyClient, iam_client), cast(str, iam_role_name), state)
+    install_scoped_policy(cast(IamPolicyClient, iam_client), cast(str, iam_role_name), state)
     write_state(state_path, state)
     return state
 

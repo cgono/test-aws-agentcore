@@ -178,6 +178,7 @@ def test_apply_creates_only_absent_named_resources_and_records_returned_values(
     tmp_path: Path,
 ) -> None:
     control = RecordingControlClient()
+    iam = RecordingIamClient()
     state_path = tmp_path / ".poc-state.json"
 
     state = apply_resources(
@@ -187,6 +188,10 @@ def test_apply_creates_only_absent_named_resources_and_records_returned_values(
         control_client=control,
         state_path=state_path,
         entra_client_secret="not-logged",
+        directory_arn="arn:directory:returned",
+        vault_arn="arn:vault:returned",
+        iam_client=iam,
+        iam_role_name="agentcore-poc-role",
     )
     again = apply_resources(
         SETTINGS,
@@ -195,6 +200,10 @@ def test_apply_creates_only_absent_named_resources_and_records_returned_values(
         control_client=control,
         state_path=state_path,
         entra_client_secret="not-logged",
+        directory_arn="arn:directory:returned",
+        vault_arn="arn:vault:returned",
+        iam_client=iam,
+        iam_role_name="agentcore-poc-role",
     )
 
     assert [call[0] for call in control.calls] == [
@@ -245,8 +254,25 @@ def test_apply_renders_and_installs_scoped_policy_from_recorded_arns(tmp_path: P
     assert "bedrock-agentcore:GetWorkloadAccessTokenForUserId" in json.dumps(policy)
 
 
+def test_apply_rejects_missing_scoped_policy_prerequisites_before_creation(tmp_path: Path) -> None:
+    control = RecordingControlClient()
+
+    with pytest.raises(ProvisioningError, match="all required for policy install"):
+        apply_resources(
+            SETTINGS,
+            "123456789012",
+            budgets_client=PresentBudgetClient(),
+            control_client=control,
+            state_path=tmp_path / ".poc-state.json",
+            entra_client_secret="not-logged",
+        )
+
+    assert control.calls == []
+
+
 def test_cleanup_deletes_only_recorded_resources_after_exact_confirmation(tmp_path: Path) -> None:
     control = RecordingControlClient()
+    iam = RecordingIamClient()
     state_path = tmp_path / ".poc-state.json"
     apply_resources(
         SETTINGS,
@@ -255,6 +281,10 @@ def test_cleanup_deletes_only_recorded_resources_after_exact_confirmation(tmp_pa
         control_client=control,
         state_path=state_path,
         entra_client_secret="not-logged",
+        directory_arn="arn:directory:returned",
+        vault_arn="arn:vault:returned",
+        iam_client=iam,
+        iam_role_name="agentcore-poc-role",
     )
     output: list[str] = []
 
