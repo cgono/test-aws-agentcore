@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import webbrowser
+from dataclasses import dataclass, field, replace
 
 from typer.testing import CliRunner
 
@@ -136,6 +137,41 @@ def test_google_connect_opens_the_same_origin_callback_url(monkeypatch: object) 
     assert result.exit_code == 0
     assert result.stdout == '{"status":"authorization_started"}\n'
     assert opened_urls == ["https://callback.example.test/connect"]
+
+
+def test_google_connect_prints_the_url_when_browser_launch_returns_false(
+    monkeypatch: object,
+) -> None:
+    runtime, _ = _runtime()
+    runtime = replace(runtime, open_browser=lambda _: False)
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)  # type: ignore[attr-defined]
+
+    result = CliRunner().invoke(app, ["google-connect", "--open-browser"])
+
+    assert result.exit_code == 0
+    assert result.stdout == (
+        '{"status":"authorization_started","mode":"print_url",'
+        '"url":"https://callback.example.test/connect"}\n'
+    )
+
+
+def test_google_connect_prints_the_url_when_browser_launch_raises(
+    monkeypatch: object,
+) -> None:
+    def browser_unavailable(_: str) -> bool:
+        raise webbrowser.Error("no browser")
+
+    runtime, _ = _runtime()
+    runtime = replace(runtime, open_browser=browser_unavailable)
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)  # type: ignore[attr-defined]
+
+    result = CliRunner().invoke(app, ["google-connect", "--open-browser"])
+
+    assert result.exit_code == 0
+    assert result.stdout == (
+        '{"status":"authorization_started","mode":"print_url",'
+        '"url":"https://callback.example.test/connect"}\n'
+    )
 
 
 def test_google_list_outputs_only_aggregate_metadata_and_redacts_tokens(

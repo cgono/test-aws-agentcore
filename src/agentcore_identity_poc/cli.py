@@ -237,8 +237,22 @@ def google_connect(
 
     connect_url = f"{settings.public_base_url}/connect"
     if open_browser:
-        runtime.open_browser(connect_url)
-        typer.echo(_json_line({"status": "authorization_started"}))
+        try:
+            browser_opened = runtime.open_browser(connect_url)
+        except webbrowser.Error:
+            browser_opened = False
+        if browser_opened:
+            typer.echo(_json_line({"status": "authorization_started"}))
+            return
+        typer.echo(
+            _json_line(
+                {
+                    "status": "authorization_started",
+                    "mode": "print_url",
+                    "url": connect_url,
+                }
+            )
+        )
         return
     typer.echo(_json_line({"status": "authorization_started", "url": connect_url}))
 
