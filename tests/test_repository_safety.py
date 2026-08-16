@@ -17,7 +17,8 @@ _JWT_PATTERN = re.compile(
     r"[A-Za-z0-9_-]{12,}(?![A-Za-z0-9_-])"
 )
 _AUTHORIZATION_HEADER_PATTERN = re.compile(
-    r"(?i)authorization\s*[:=]\s*(?:f?[\"'`{[]*)?bearer\s+([A-Za-z0-9._~-]{24,})"
+    r"(?ix)\bauthorization\b\s*[\"']?\s*[:=]\s*(?:f\s*)?[\"'`{\[]*\s*"
+    r"bearer\s+[A-Za-z0-9._~-]{24,}"
 )
 _PRIVATE_KEY_PATTERN = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
 _EMAIL_PATTERN = re.compile(
@@ -35,6 +36,21 @@ _ENTRA_AUTHORITY_UUID_PATTERN = re.compile(
 _URL_PATTERN = re.compile(r"https?://[^\s\"'`<>]+", re.IGNORECASE)
 _AUTHORIZATION_QUERY_KEYS = frozenset(
     {"access_token", "code", "id_token", "refresh_token", "session_id", "state", "token"}
+)
+_AUTHORIZATION_QUERY_PLACEHOLDERS = frozenset(
+    {
+        "authorization-code",
+        "entra-state",
+        "example",
+        "first-code",
+        "not-a-token",
+        "placeholder",
+        "redacted",
+        "second-code",
+        "secret",
+        "short-example",
+        "value",
+    }
 )
 _FORBIDDEN_EVIDENCE_KEYS = frozenset(
     {
@@ -60,6 +76,29 @@ _FORBIDDEN_EVIDENCE_KEYS = frozenset(
         "username",
     }
 )
+_SENSITIVE_EVIDENCE_KEY_COMPONENTS = frozenset(
+    {
+        "access",
+        "api",
+        "authorization",
+        "bearer",
+        "client",
+        "code",
+        "cookie",
+        "id",
+        "key",
+        "password",
+        "refresh",
+        "secret",
+        "session",
+        "set",
+        "state",
+        "token",
+    }
+)
+_CAMEL_CASE_BOUNDARY = re.compile(r"([a-z0-9])([A-Z])")
+_ACRONYM_BOUNDARY = re.compile(r"([A-Z]+)([A-Z][a-z])")
+_FIELD_SEPARATOR = re.compile(r"[^A-Za-z0-9]+")
 _EXAMPLE_EMAIL_DOMAINS = frozenset({"example.com", "example.test", "invalid", "localhost"})
 _EXCLUDED_PREFIXES = (".git/", ".venv/", "evidence/raw/")
 _DOCUMENTED_EXAMPLE_JWTS = frozenset(
@@ -107,6 +146,34 @@ def test_examples_and_callback_placeholders_are_not_reported() -> None:
     assert _scan_text_file(Path("docs/example.md"), content) == []
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        lambda: '{"' + "Authorization" + '": "Bearer ' + "a" * 24 + '"}',
+        lambda: "{'" + "Authorization" + "': 'Bearer " + "a" * 24 + "'}",
+    ],
+)
+def test_quoted_authorization_headers_are_reported(content: Callable[[], str]) -> None:
+    assert _scan_text_file(Path("fixture.txt"), content()) == [
+        "fixture.txt: authorization_header"
+    ]
+
+
+def test_substantive_callback_query_on_example_domain_is_reported() -> None:
+    content = "https://poc.example.test/callback?code=" + "a" * 24
+
+    assert _scan_text_file(Path("fixture.txt"), content) == ["fixture.txt: oauth_callback_query"]
+
+
+@pytest.mark.parametrize(
+    "value", ["%3Ccallback-code%3E", "example", "redacted", "short-example"]
+)
+def test_recognized_callback_placeholders_are_not_reported(value: str) -> None:
+    content = "https://poc.example.test/callback?code=" + value
+
+    assert _scan_text_file(Path("docs/example.md"), content) == []
+
+
 def test_jsonl_evidence_rejects_forbidden_keys(tmp_path: Path) -> None:
     evidence = tmp_path / "evidence.jsonl"
     evidence.write_text(
@@ -116,6 +183,28 @@ def test_jsonl_evidence_rejects_forbidden_keys(tmp_path: Path) -> None:
 
     assert _scan_text_file(evidence, evidence.read_text(encoding="utf-8")) == [
         f"{evidence}: evidence_forbidden_key:access_token"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("key", "expected"),
+    [
+        (lambda: "access" + "Token", "access_token"),
+        (lambda: "user" + "Principal" + "Name", "user_principal_name"),
+        (lambda: "client" + "Secret" + "Value", "client_secret_value"),
+    ],
+)
+def test_jsonl_evidence_rejects_camel_case_and_nested_sensitive_keys(
+    tmp_path: Path, key: Callable[[], str], expected: str
+) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    evidence.write_text(
+        json.dumps({"hypothesis": "H1", "details": {"nested": {key(): "value"}}}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert _scan_text_file(evidence, evidence.read_text(encoding="utf-8")) == [
+        f"{evidence}: evidence_forbidden_key:{expected}"
     ]
 
 
@@ -188,14 +277,23 @@ def _scan_string_values(path: Path, content: str) -> list[str]:
 def _contains_authorization_query_value(content: str) -> bool:
     for candidate in _URL_PATTERN.findall(content):
         parsed = urlsplit(candidate.rstrip(".,;)"))
-        if _is_example_domain(parsed.hostname):
-            continue
         if any(
-            key.casefold() in _AUTHORIZATION_QUERY_KEYS and value
+            key.casefold() in _AUTHORIZATION_QUERY_KEYS
+            and value
+            and not _is_authorization_query_placeholder(value)
             for key, value in parse_qsl(parsed.query, keep_blank_values=True)
         ):
             return True
     return False
+
+
+def _is_authorization_query_placeholder(value: str) -> bool:
+    normalized = value.casefold()
+    return (
+        normalized in _AUTHORIZATION_QUERY_PLACEHOLDERS
+        or value.startswith("<")
+        and value.endswith(">")
+    )
 
 
 def _is_example_email(value: str) -> bool:
@@ -231,8 +329,10 @@ def _scan_jsonl_evidence(path: Path, content: str) -> list[str]:
 def _first_forbidden_evidence_key(value: object) -> str | None:
     if isinstance(value, dict):
         for key, nested_value in value.items():
-            if isinstance(key, str) and key.casefold() in _FORBIDDEN_EVIDENCE_KEYS:
-                return key.casefold()
+            if isinstance(key, str):
+                normalized_key = _normalize_evidence_key(key)
+                if _is_forbidden_evidence_key(normalized_key):
+                    return normalized_key
             forbidden_key = _first_forbidden_evidence_key(nested_value)
             if forbidden_key is not None:
                 return forbidden_key
@@ -242,3 +342,17 @@ def _first_forbidden_evidence_key(value: object) -> str | None:
             if forbidden_key is not None:
                 return forbidden_key
     return None
+
+
+def _normalize_evidence_key(key: str) -> str:
+    snake_case = _ACRONYM_BOUNDARY.sub(r"\1_\2", key)
+    snake_case = _CAMEL_CASE_BOUNDARY.sub(r"\1_\2", snake_case)
+    return _FIELD_SEPARATOR.sub("_", snake_case).strip("_").casefold()
+
+
+def _is_forbidden_evidence_key(normalized_key: str) -> bool:
+    if normalized_key == "correlation_id":
+        return False
+    return normalized_key in _FORBIDDEN_EVIDENCE_KEYS or bool(
+        _SENSITIVE_EVIDENCE_KEY_COMPONENTS.intersection(normalized_key.split("_"))
+    )
