@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import stat
@@ -10,20 +11,30 @@ from threading import Barrier
 import pytest
 from typer.testing import CliRunner
 
-from agentcore_identity_poc.agentcore import AgentCoreThrottled, AuthorizationRequired, OAuthToken
+from agentcore_identity_poc.agentcore import (
+    AgentCoreAccessDenied,
+    AgentCoreThrottled,
+    AuthorizationRequired,
+    OAuthToken,
+)
 from agentcore_identity_poc.cli import (
     Runtime,
+    _cloudtrail_attribution,
     _cloudtrail_attribution_from_events,
     _expiry_run_salt,
     _measurement_project_id,
+    _run_workload_isolation,
+    _supported_token_expiry,
     app,
+    run_live_user_isolation,
 )
-from agentcore_identity_poc.config import Settings
+from agentcore_identity_poc.config import Settings, SettingsError
 from agentcore_identity_poc.downstream import (
     DownstreamAccessDenied,
     DownstreamThrottled,
     DownstreamUnauthorized,
     DriveMetadata,
+    drive_metadata_marker,
 )
 from agentcore_identity_poc.experiments import (
     CloudTrailAttribution,
@@ -419,6 +430,289 @@ def test_measure_latency_reports_cold_warm_percentiles_and_no_tokens(
     assert drive.access_tokens == ["google-secret"] * 3
     assert "inbound-secret" not in result.output
     assert "workload-secret" not in result.output
+
+
+def test_live_user_isolation_executes_two_distinct_validated_users_locally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class IsolationIdentity(MeasurementIdentity):
+        def workload_token(self, workload_name: str, user_token: str) -> str:
+            assert workload_name == SETTINGS.agentcore_workload_name
+            return f"workload-{user_token}"
+
+        def google_token(
+            self,
+            workload_token: str,
+            provider: str,
+            scopes: list[str],
+            return_url: str,
+            state: str,
+            *,
+            force_authentication: bool = False,
+        ) -> OAuthToken:
+            assert provider == SETTINGS.agentcore_google_provider
+            assert not force_authentication
+            return OAuthToken(f"google-{workload_token}")
+
+    metadata_a = DriveMetadata(1, {"text/plain": 1})
+    metadata_b = DriveMetadata(2, {"application/json": 2})
+    evidence = RecordingEvidence()
+    tokens = iter(("inbound-a", "inbound-b"))
+    runtime = replace(
+        _measurement_runtime(
+            IsolationIdentity(),
+            evidence,
+            drive=MeasurementDrive([metadata_a, metadata_b]),
+        ),
+        acquire_token=lambda _, __: next(tokens),
+        validate_token=lambda _, token: {"sub": f"subject-{token}"},
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli._default_runtime", lambda: runtime)
+    monkeypatch.setenv("AGENTCORE_POC_USER_A_ALIAS", "user-a")
+    monkeypatch.setenv("AGENTCORE_POC_USER_B_ALIAS", "user-b")
+    monkeypatch.setenv("AGENTCORE_POC_USER_A_DRIVE_MARKER", drive_metadata_marker(metadata_a))
+    monkeypatch.setenv("AGENTCORE_POC_USER_B_DRIVE_MARKER", drive_metadata_marker(metadata_b))
+    verified_subject_counts: list[int] = []
+
+    rows = run_live_user_isolation(on_verified_subject_count=verified_subject_counts.append)
+
+    assert [row.outcome for row in rows] == ["pass", "pass"]
+    assert verified_subject_counts == [2]
+    observations = [item.as_dict() for item in evidence.observations]
+    assert [item["hypothesis"] for item in observations].count("H4a") == 2
+    assert [item["hypothesis"] for item in observations].count("H6") == 2
+
+
+def test_workload_isolation_uses_mocked_iam_policy_transitions_locally(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeIam:
+        scoped = False
+
+        def put_role_policy(self, *, PolicyDocument: str, **_kwargs: object) -> None:
+            self.scoped = "BroadObservationOnly" not in PolicyDocument
+
+    class FakeSts:
+        def get_caller_identity(self) -> dict[str, str]:
+            return {"Arn": "arn:aws:iam::123456789012:role/poc"}
+
+    class IsolationIdentity(MeasurementIdentity):
+        def __init__(self, iam: FakeIam) -> None:
+            super().__init__()
+            self.iam = iam
+
+        def workload_token(self, workload_name: str, user_token: str) -> str:
+            return f"workload-{workload_name}"
+
+        def google_token(
+            self,
+            workload_token: str,
+            provider: str,
+            scopes: list[str],
+            return_url: str,
+            state: str,
+            *,
+            force_authentication: bool = False,
+        ) -> OAuthToken:
+            if self.iam.scoped and workload_token.endswith(SETTINGS.agentcore_second_workload_name):
+                raise AgentCoreAccessDenied()
+            return OAuthToken("google-access")
+
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "directory_arn": "arn:directory",
+                "vault_arn": "arn:vault",
+                "workloads": [{"arn": "arn:approved"}, {"arn": "arn:unapproved"}],
+                "provider": {"arn": "arn:provider"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    iam = FakeIam()
+    identity = IsolationIdentity(iam)
+    runtime = replace(_measurement_runtime(identity, RecordingEvidence()), clock=lambda: 0.0)
+    monkeypatch.setenv("AGENTCORE_POC_IAM_ROLE_NAME", "poc-role")
+    monkeypatch.setenv("AGENTCORE_POC_USER_ALIAS", "user-a")
+    monkeypatch.setattr("agentcore_identity_poc.cli._STATE_PATH", state_path)
+    monkeypatch.setattr(
+        "agentcore_identity_poc.cli.boto3.client",
+        lambda service, **_kwargs: iam if service == "iam" else FakeSts(),
+    )
+    recorded = []
+
+    rows = _run_workload_isolation(runtime, SETTINGS, record_row=recorded.append)
+
+    assert [row.policy_mode for row in rows] == ["broad", "broad", "scoped", "scoped"]
+    assert [row.outcome for row in rows] == ["pass", "pass", "pass", "denied"]
+    assert len(recorded) == 4
+    assert iam.scoped is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["measure", "latency"],
+        ["measure", "concurrency"],
+        ["measure", "expiry"],
+    ],
+)
+def test_lifecycle_commands_report_configuration_blocks_without_provider_calls(
+    monkeypatch: pytest.MonkeyPatch, command: list[str]
+) -> None:
+    def unavailable_settings() -> Settings:
+        raise SettingsError("required configuration is absent")
+
+    runtime = replace(
+        _measurement_runtime(MeasurementIdentity(), RecordingEvidence()),
+        load_settings=unavailable_settings,
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(app, command)
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout) == {
+        "status": "blocked",
+        "category": "configuration",
+        "detail": "required configuration is absent",
+    }
+
+
+def test_measure_latency_maps_drive_access_denied_without_provider_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _measurement_runtime(
+        MeasurementIdentity(),
+        RecordingEvidence(),
+        drive=MeasurementDrive([DownstreamAccessDenied()]),
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(app, ["measure", "latency", "--samples", "2"])
+
+    assert result.exit_code == 5
+    assert json.loads(result.stdout) == {
+        "status": "blocked",
+        "category": "downstream_denied",
+        "detail": "google_drive_denied",
+    }
+
+
+def test_offboard_rejects_missing_apply_and_unsafe_alias() -> None:
+    runner = CliRunner()
+
+    missing_apply = runner.invoke(app, ["offboard", "google", "--user-alias", "user-a"])
+    unsafe_alias = runner.invoke(
+        app,
+        ["offboard", "google", "--user-alias", "not an alias", "--apply"],
+    )
+
+    assert missing_apply.exit_code == 2
+    assert json.loads(missing_apply.stdout)["detail"] == "offboard_google_requires_apply"
+    assert unsafe_alias.exit_code == 2
+    assert json.loads(unsafe_alias.stdout)["detail"] == "invalid_user_alias"
+
+
+def test_offboard_records_narrow_purge_failure_without_deleting_shared_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingPurgeIdentity(MeasurementIdentity):
+        def purge_google_user_connection(self, user_alias: str) -> None:
+            assert user_alias == "user-a"
+            raise RuntimeError("purge operation failed")
+
+    evidence = RecordingEvidence()
+    runtime = _measurement_runtime(FailingPurgeIdentity(), evidence)
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(app, ["offboard", "google", "--user-alias", "user-a", "--apply"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == {
+        "status": "failed",
+        "operation": "offboard_google",
+        "hypothesis": "H8",
+        "detail": "per_user_purge_failed",
+    }
+    assert evidence.observations[-1].as_dict()["details"] == {
+        "user_alias": "user-a",
+        "detail": "per_user_purge_failed",
+    }
+
+
+def test_supported_token_expiry_reads_only_a_well_formed_jwt_payload() -> None:
+    payload = base64.urlsafe_b64encode(json.dumps({"exp": 42}).encode("utf-8")).decode().rstrip("=")
+
+    assert _supported_token_expiry(f"header.{payload}.signature") == 42.0
+    assert _supported_token_expiry("opaque-token") is None
+
+
+def test_cloudtrail_measurement_uses_a_narrow_provider_event_query_locally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePaginator:
+        def __init__(self) -> None:
+            self.query: dict[str, object] | None = None
+
+        def paginate(self, **kwargs: object) -> list[dict[str, object]]:
+            self.query = kwargs
+            return [
+                {
+                    "Events": [
+                        {
+                            "CloudTrailEvent": json.dumps(
+                                {
+                                    "eventName": "GetResourceOauth2Token",
+                                    "userIdentity": {"principalId": "opaque"},
+                                    "requestParameters": {
+                                        "workloadName": "approved-workload",
+                                        "userIdentifier": "opaque",
+                                    },
+                                }
+                            )
+                        }
+                    ]
+                }
+            ]
+
+    class FakeCloudTrail:
+        def __init__(self, paginator: FakePaginator) -> None:
+            self.paginator = paginator
+
+        def get_paginator(self, operation_name: str) -> FakePaginator:
+            assert operation_name == "lookup_events"
+            return self.paginator
+
+    paginator = FakePaginator()
+    monkeypatch.setattr(
+        "agentcore_identity_poc.cli.boto3.client",
+        lambda service, **_kwargs: FakeCloudTrail(paginator),
+    )
+
+    attribution = _cloudtrail_attribution(SETTINGS, 30)
+
+    assert attribution.outcome == "pass"
+    assert paginator.query is not None
+    assert paginator.query["LookupAttributes"] == [
+        {
+            "AttributeKey": "EventSource",
+            "AttributeValue": "bedrock-agentcore.amazonaws.com",
+        }
+    ]
+    assert "StartTime" in paginator.query
+
+
+def test_cloudtrail_command_rejects_out_of_range_lookback_before_runtime_creation() -> None:
+    result = CliRunner().invoke(app, ["measure", "cloudtrail", "--lookback-minutes", "0"])
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout) == {
+        "status": "blocked",
+        "category": "configuration",
+        "detail": "lookback_minutes_must_be_1_to_1440",
+    }
 
 
 def test_measure_expiry_writes_private_resume_state_and_exits_immediately(

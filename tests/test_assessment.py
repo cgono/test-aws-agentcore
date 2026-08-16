@@ -7,6 +7,8 @@ from agentcore_identity_poc import cli
 from agentcore_identity_poc.assessment import (
     AssessmentError,
     decide,
+    finalize_terminal_evidence,
+    load_sanitized_observations,
     load_terminal_results,
     render_markdown,
 )
@@ -61,6 +63,61 @@ def test_rejects_when_a_required_terminal_result_is_missing(tmp_path) -> None:
 
     with pytest.raises(AssessmentError, match="terminal evidence"):
         load_terminal_results(evidence)
+
+
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        ("\n", "empty row"),
+        ("not-json\n", "invalid JSON"),
+        ("[]\n", "not an object"),
+    ],
+)
+def test_sanitized_observation_loader_rejects_malformed_rows(
+    tmp_path, content: str, message: str
+) -> None:
+    evidence = tmp_path / "sanitized.jsonl"
+    evidence.write_text(content, encoding="utf-8")
+
+    with pytest.raises(AssessmentError, match=message):
+        load_sanitized_observations(evidence)
+
+
+def test_sanitized_observation_loader_hides_missing_file_details(tmp_path) -> None:
+    with pytest.raises(AssessmentError, match="sanitized evidence is unavailable"):
+        load_sanitized_observations(tmp_path / "missing.jsonl")
+
+
+def test_finalization_rejects_preexisting_terminal_evidence(tmp_path) -> None:
+    evidence = write_evidence(tmp_path, [terminal_row("H1")])
+
+    with pytest.raises(AssessmentError, match="terminal evidence"):
+        finalize_terminal_evidence(
+            evidence,
+            [f"{hypothesis}=pass" for hypothesis in passing_results()],
+            tmp_path / "terminal.jsonl",
+            h5_compatibility_reviewed=True,
+            allow_deferred_failures=False,
+        )
+
+
+def test_terminalization_requires_h5_compatibility_acknowledgement(tmp_path) -> None:
+    evidence = write_evidence(tmp_path, _all_supported_nonterminal_rows())
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "assessment-finalize",
+            "--evidence",
+            str(evidence),
+            "--output",
+            str(tmp_path / "terminal.jsonl"),
+            *_result_arguments(),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert result.stdout == '{"status":"blocked","category":"assessment_incomplete"}\n'
 
 
 def test_rejects_ambiguous_terminal_results(tmp_path) -> None:

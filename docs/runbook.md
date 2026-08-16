@@ -18,6 +18,26 @@ Before a live run, inspect the inbound access token: its `aud` must equal
 `api://<ENTRA_API_CLIENT_ID>`, and the public CLI client must already be pre-authorized. A
 consent prompt is a failed Phase 1 condition.
 
+## Phase 0: Local Verification
+
+This phase is deterministic and must not use AWS, Entra, Google, browser, or provider
+credentials. Each command must exit `0` before a live phase begins:
+
+```bash
+.venv/bin/python -m pytest -m 'not integration' --cov=agentcore_identity_poc \
+  --cov-report=term-missing --cov-fail-under=90
+.venv/bin/ruff check .
+.venv/bin/mypy src
+.venv/bin/python -m pytest tests/test_repository_safety.py -q
+git diff --check
+```
+
+The safety test scans tracked UTF-8 text files. It rejects credential-shaped JWTs,
+authorization-header values, OAuth callback query values, private keys, email addresses,
+non-example Entra tenant IDs, and forbidden JSONL evidence keys. Git metadata, the virtual
+environment, and `evidence/raw/` are the only path exclusions. A failure is a stop condition:
+remove or redact the value rather than suppressing the check.
+
 ## Phase 1
 
 Start the synthetic resource API with its app factory:
@@ -206,6 +226,15 @@ The concrete runner obtains and compares a hashed STS caller alias immediately b
 every broad and scoped workload attempt; it aborts rather than stamping an initial caller alias
 onto later rows.
 
+If the command reports a scoped-policy restoration failure, stop immediately. Restore the checked
+in final policy before any further live test, then rerun the scoped observation:
+
+```bash
+.venv/bin/python scripts/provision_agentcore.py --apply
+```
+
+The temporary broad policy is evidence-only and must never remain installed after the experiment.
+
 Run the complete opt-in Phase 2 gate only after the Google callback confirmation, browser health
 check, and first consent have succeeded:
 
@@ -231,7 +260,76 @@ H7 and H8 remain pending as well.
 marker is the distinct SHA-256 fingerprint emitted by `google-list` for that alias's aggregate
 Drive item count and MIME-type histogram; it is not a Drive item identifier or name.
 
-## Cleanup
+## Phase 3: Lifecycle, Assessment, and Handoff
+
+Run lifecycle work only after both Phase 1 and the complete Phase 2 gate pass. It appends only
+sanitized rows to `evidence/phase-2.jsonl`; that ignored file and the mode-`0600`
+`.poc-expiry-state.json` resume state must not be added to Git.
+
+```bash
+.venv/bin/agentcore-identity-poc measure latency --samples 10
+.venv/bin/agentcore-identity-poc measure concurrency --workers 5 --requests 20
+.venv/bin/agentcore-identity-poc measure expiry --resume-state .poc-expiry-state.json
+.venv/bin/agentcore-identity-poc measure cloudtrail --lookback-minutes 30
+.venv/bin/agentcore-identity-poc offboard google --user-alias user-a --apply
+```
+
+The latency, concurrency, CloudTrail, and successful offboarding commands exit `0`. A blocked
+configuration or provider condition exits nonzero and stops the interpretation of that result.
+Offboarding may exit `0` while reporting `"status":"failed"`: that is an explicit H8 failure,
+not a pass, when the installed SDK has no narrow per-user purge or Drive revocation was not
+observed. It must never delete the shared Google provider as a substitute.
+
+`measure expiry` exits `0` with `"status":"resume_required"` and a `resume_at` value while an
+inbound, workload, or OBO boundary remains in the future. Wait until that timestamp, then rerun
+the same command with the same resume-state path. Do not alter the state file, sleep inside the
+command, or use a synthetic expiry. The Google token response has no trustworthy expiry metadata;
+the command records `H3/provider_expiry_unavailable` as `fail` while retaining no raw provider
+token. This is the current H3 feasibility limitation, so a second retrieval is not refresh proof.
+
+Run the lifecycle integration gate with an operator-provided runtime only after those commands
+and their required provider state are ready:
+
+```bash
+AGENTCORE_POC_LIVE=1 \
+AGENTCORE_POC_LIVE_RUNTIME=operator_live_runtime:create_runtime \
+.venv/bin/python -m pytest tests/integration/test_lifecycle_live.py -m integration -v -s
+```
+
+It exits `0` only when the configured runtime provides the observed lifecycle values. The expected
+Google post-expiry result is currently `failed` or `unproven`; it is not a reason to override the
+H3 evidence failure. Optional OneDrive observations are supplementary only and cannot replace the
+synthetic resource result for H2 or H6.
+
+### Assessment
+
+Do not create `docs/assessment.md` until all required live gates have produced and an operator has
+reviewed sanitized evidence. First finalize one terminal result for every hypothesis, then render
+the report. Both commands exit `0` only with complete, safe evidence; a missing hypothesis,
+unsafe row, or unacknowledged decision exits `2` and leaves the report absent or unchanged.
+
+```bash
+.venv/bin/agentcore-identity-poc assessment-finalize \
+  --evidence evidence/sanitized.jsonl \
+  --output evidence/assessment-terminal.jsonl \
+  --h5-compatibility-reviewed \
+  --result H1=pass --result H2=pass --result H3=fail \
+  --result H4a=pass --result H4b=pass --result H5=fail \
+  --result H6=pass --result H7=fail --result H8=fail
+
+.venv/bin/agentcore-identity-poc report \
+  --evidence evidence/assessment-terminal.jsonl \
+  --output docs/assessment.md \
+  --iam-acceptable --audit-acceptable --latency-acceptable --quota-acceptable
+```
+
+Use actual terminal outcomes rather than the example selections above. The H3 limitation normally
+makes the decision `reject_or_defer`; `--allow-deferred-failures` is an explicit operator defer,
+never a pass. Review the generated report with `tests/test_assessment.py` and the repository safety
+test before treating it as a handoff artifact. The assessment template explains the decision
+switches and redaction boundary in detail.
+
+### Cleanup
 
 Print the exact recorded resources first:
 
@@ -244,3 +342,12 @@ Deletion requires both the apply flag and the literal confirmation:
 ```bash
 .venv/bin/python scripts/provision_agentcore.py cleanup --apply --confirm agentcore-identity-poc
 ```
+
+The preview exits `0` and makes no AWS client or mutation call; it lists only valid resource IDs
+from local `.poc-state.json`. A missing or invalid state, an absent `--apply`, or a mismatched
+confirmation exits `2`. Before confirmed cleanup, revoke the Google OAuth grant for both test
+users and revoke the Entra grants created for the POC. Confirm that the final scoped IAM policy is
+installed, not the temporary broad policy. After cleanup, verify that the tagged AgentCore
+workloads and providers are absent and separately remove or verify absence of any POC Secrets
+Manager entry that the operator created outside this script. The script intentionally does not
+discover or delete unrecorded resources.
