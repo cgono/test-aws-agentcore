@@ -18,6 +18,12 @@
       ]
     },
     {
+      "Sid": "DenySecondWorkloadJwtBinding",
+      "Effect": "Deny",
+      "Action": "bedrock-agentcore:GetWorkloadAccessTokenForJWT",
+      "Resource": "${SECOND_WORKLOAD_ARN}"
+    },
+    {
       "Sid": "DenyUserIdWorkloadBinding",
       "Effect": "Deny",
       "Action": "bedrock-agentcore:GetWorkloadAccessTokenForUserId",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
@@ -35,6 +36,15 @@ from agentcore_identity_poc.downstream import (
 )
 from agentcore_identity_poc.entra import EntraAuthError, EntraDeviceAuth
 from agentcore_identity_poc.evidence import EvidenceWriter
+from agentcore_identity_poc.experiments import (
+    ExperimentConfigurationError,
+    ExperimentTimeout,
+    MatrixRow,
+    PolicyRestorationError,
+    WorkloadAttempt,
+    WorkloadPolicyManager,
+    run_workload_isolation,
+)
 from agentcore_identity_poc.jwt_validation import JwtPolicy, TokenRejected, make_http_jwks_loader
 from agentcore_identity_poc.models import JsonValue, Observation
 
@@ -45,6 +55,8 @@ _DOWNSTREAM_EXIT = 5
 _DEFAULT_EVIDENCE_PATH = Path("evidence/phase-1.jsonl")
 _DEFAULT_GOOGLE_EVIDENCE_PATH = Path("evidence/phase-2.jsonl")
 _GOOGLE_DRIVE_METADATA_SCOPE = "https://www.googleapis.com/auth/drive.metadata.readonly"
+_POLICY_NAME = "agentcore-identity-poc-scoped"
+_STATE_PATH = Path(".poc-state.json")
 
 
 class IdentityClient(Protocol):
@@ -331,6 +343,224 @@ def google_revoke_check(
         _emit_authorization_required()
 
     typer.echo(_json_line({"status": "pass", "operation": "google-revoke-check"}))
+
+
+@app.command("workload-isolation")
+def workload_isolation(
+    acknowledge_broad_policy: Annotated[
+        bool, typer.Option("--acknowledge-broad-policy")
+    ] = False,
+    evidence_path: Annotated[Path, typer.Option()] = _DEFAULT_GOOGLE_EVIDENCE_PATH,
+) -> None:
+    """Run the same-principal broad-versus-scoped IAM workload matrix."""
+    if not acknowledge_broad_policy:
+        _emit_blocked(
+            "configuration", _CONFIGURATION_EXIT, "acknowledge_broad_policy_required"
+        )
+
+    runtime = runtime_factory()
+    writer = runtime.evidence_writer(evidence_path)
+    try:
+        settings = runtime.load_settings()
+        rows = _run_workload_isolation(
+            runtime,
+            settings,
+            record_row=lambda row: _append(
+                writer, "H4b", "workload_isolation", row.outcome, row.as_details()
+            ),
+        )
+    except SettingsError as error:
+        _emit_configuration_failure(error, json_output=True)
+    except ExperimentConfigurationError as error:
+        _emit_blocked("configuration", _CONFIGURATION_EXIT, str(error))
+    except PolicyRestorationError as error:
+        _emit_blocked("identity_broker", _AGENTCORE_EXIT, str(error))
+    except ExperimentTimeout as error:
+        _emit_blocked("identity_broker", _AGENTCORE_EXIT, str(error))
+    typer.echo(
+        _json_line(
+            {
+                "status": "pass",
+                "operation": "workload-isolation",
+                "attempt_count": len(rows),
+            }
+        )
+    )
+
+
+class _AwsIamPolicyManager(WorkloadPolicyManager):
+    """Apply only the checked-in temporary and final inline IAM policies."""
+
+    def __init__(self, iam_client: object, sts_client: object, role_name: str) -> None:
+        self._iam_client = iam_client
+        self._sts_client = sts_client
+        self._role_name = role_name
+
+    def caller_identity(self) -> str:
+        response = cast(Mapping[str, object], self._sts_client.get_caller_identity())  # type: ignore[attr-defined]
+        arn = response.get("Arn")
+        if not isinstance(arn, str) or not arn:
+            raise ExperimentConfigurationError("AWS caller identity response omitted an ARN")
+        return f"aws-principal-{hashlib.sha256(arn.encode()).hexdigest()[:12]}"
+
+    def apply_broad_policy(self) -> None:
+        self._put_policy(_POLICY_NAME, _load_json_policy("broad-observation.json"))
+
+    def apply_scoped_policy(self) -> None:
+        state = _load_poc_state(_STATE_PATH)
+        self._put_policy(_POLICY_NAME, _render_scoped_policy(state))
+
+    def _put_policy(self, policy_name: str, policy: Mapping[str, object]) -> None:
+        self._iam_client.put_role_policy(  # type: ignore[attr-defined]
+            RoleName=self._role_name,
+            PolicyName=policy_name,
+            PolicyDocument=json.dumps(policy, separators=(",", ":"), sort_keys=True),
+        )
+
+
+def _run_workload_isolation(
+    runtime: Runtime,
+    settings: Settings,
+    *,
+    record_row: Callable[[MatrixRow], None] | None = None,
+) -> tuple[MatrixRow, ...]:
+    role_name = os.environ.get("AGENTCORE_POC_IAM_ROLE_NAME", "").strip()
+    user_alias = os.environ.get("AGENTCORE_POC_USER_ALIAS", "").strip()
+    if not role_name or not user_alias:
+        raise ExperimentConfigurationError(
+            "AGENTCORE_POC_IAM_ROLE_NAME and AGENTCORE_POC_USER_ALIAS must be set"
+        )
+
+    try:
+        inbound_token = runtime.acquire_token(settings, typer.echo)
+        runtime.validate_token(settings, inbound_token)
+    except (EntraAuthError, TokenRejected) as error:
+        raise ExperimentConfigurationError("could not validate the H4b Entra user") from error
+
+    identity = runtime.agentcore(settings)
+    policy_manager = _AwsIamPolicyManager(
+        boto3.client("iam", region_name=settings.aws_region),
+        boto3.client("sts", region_name=settings.aws_region),
+        role_name,
+    )
+
+    def attempt_provider(workload_name: str) -> WorkloadAttempt:
+        try:
+            workload_token = identity.workload_token(workload_name, inbound_token)
+            authorization = identity.google_token(
+                workload_token,
+                settings.agentcore_google_provider,
+                [_GOOGLE_DRIVE_METADATA_SCOPE],
+                settings.google_return_url,
+                runtime.random_urlsafe(),
+            )
+        except AgentCoreError as error:
+            return WorkloadAttempt(
+                "denied" if _is_access_denied(error) else "fail",
+                _aws_error_category(error),
+            )
+        if isinstance(authorization, AuthorizationRequired):
+            return WorkloadAttempt("authorization_required")
+        return WorkloadAttempt("pass")
+
+    return run_workload_isolation(
+        policy_manager=policy_manager,
+        workload_names=(settings.agentcore_workload_name, settings.agentcore_second_workload_name),
+        user_alias=user_alias,
+        provider=settings.agentcore_google_provider,
+        acknowledge_broad_policy=True,
+        attempt_provider=attempt_provider,
+        clock=runtime.clock,
+        record_row=record_row,
+    )
+
+
+def _load_json_policy(filename: str) -> Mapping[str, object]:
+    policy_path = Path(__file__).resolve().parents[2] / "infra" / "iam" / filename
+    try:
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ExperimentConfigurationError(
+            f"could not load IAM policy template: {filename}"
+        ) from error
+    if not isinstance(policy, Mapping):
+        raise ExperimentConfigurationError(f"IAM policy template must be an object: {filename}")
+    return cast(Mapping[str, object], policy)
+
+
+def _load_poc_state(path: Path) -> Mapping[str, object]:
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ExperimentConfigurationError(
+            "could not read .poc-state.json for scoped policy recovery"
+        ) from error
+    if not isinstance(state, Mapping):
+        raise ExperimentConfigurationError(".poc-state.json must contain an object")
+    return cast(Mapping[str, object], state)
+
+
+def _render_scoped_policy(state: Mapping[str, object]) -> Mapping[str, object]:
+    workloads = state.get("workloads")
+    provider = state.get("provider")
+    if (
+        not isinstance(workloads, list)
+        or len(workloads) != 2
+        or not all(isinstance(item, Mapping) for item in workloads)
+        or not isinstance(provider, Mapping)
+    ):
+        raise ExperimentConfigurationError(
+            ".poc-state.json does not contain the recorded scoped resources"
+        )
+    replacements = {
+        "DIRECTORY_ARN": _required_state_arn(state, "directory_arn"),
+        "WORKLOAD_ARN": _required_state_arn(cast(Mapping[str, object], workloads[0]), "arn"),
+        "SECOND_WORKLOAD_ARN": _required_state_arn(cast(Mapping[str, object], workloads[1]), "arn"),
+        "VAULT_ARN": _required_state_arn(state, "vault_arn"),
+        "PROVIDER_ARN": _required_state_arn(cast(Mapping[str, object], provider), "arn"),
+    }
+    rendered = json.loads(json.dumps(_load_json_policy("scoped.json")))
+    if not isinstance(rendered, dict):
+        raise ExperimentConfigurationError("scoped IAM policy must be an object")
+    _replace_policy_values(rendered, replacements)
+    serialized = json.dumps(rendered, separators=(",", ":"), sort_keys=True)
+    if "*" in serialized:
+        raise ExperimentConfigurationError("rendered scoped IAM policy is not safely constrained")
+    return cast(Mapping[str, object], rendered)
+
+
+def _required_state_arn(state: Mapping[str, object], field_name: str) -> str:
+    value = state.get(field_name)
+    if not isinstance(value, str) or not value:
+        raise ExperimentConfigurationError(f".poc-state.json omitted required ARN: {field_name}")
+    return value
+
+
+def _replace_policy_values(value: object, replacements: Mapping[str, str]) -> object:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            value[key] = _replace_policy_values(nested, replacements)
+        return value
+    if isinstance(value, list):
+        for index, nested in enumerate(value):
+            value[index] = _replace_policy_values(nested, replacements)
+        return value
+    if isinstance(value, str):
+        for name, replacement in replacements.items():
+            value = value.replace(f"${{{name}}}", replacement)
+    return value
+
+
+def _is_access_denied(error: AgentCoreError) -> bool:
+    return error.__class__.__name__ == "AgentCoreAccessDenied"
+
+
+def _aws_error_category(error: AgentCoreError) -> str:
+    return {
+        "AgentCoreAccessDenied": "access_denied",
+        "AgentCoreThrottled": "throttled",
+        "AgentCoreValidationError": "validation",
+    }.get(error.__class__.__name__, "internal")
 
 
 class _InteractiveStdinError(ValueError):
