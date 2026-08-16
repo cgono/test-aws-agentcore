@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+from base64 import urlsafe_b64encode
 from dataclasses import replace
 from pathlib import Path
 
@@ -10,13 +11,14 @@ import pytest
 from typer.testing import CliRunner
 
 from agentcore_identity_poc.agentcore import AgentCoreThrottled, AuthorizationRequired, OAuthToken
-from agentcore_identity_poc.cli import Runtime, app
+from agentcore_identity_poc.cli import Runtime, _expiry_run_salt, app
 from agentcore_identity_poc.config import Settings
 from agentcore_identity_poc.downstream import DownstreamUnauthorized, DriveMetadata
 from agentcore_identity_poc.experiments import (
     ExpiryObservation,
     MeasurementConfigurationError,
     RetryableMeasurementError,
+    compare_expiry_observations,
     load_expiry_resume_state,
     measure_bounded_concurrency,
     measure_latency,
@@ -96,6 +98,29 @@ class MeasurementDrive:
 
     def close(self) -> None:
         return None
+
+
+class ExpiringGoogleIdentity(MeasurementIdentity):
+    def __init__(self, expiry: int, suffix: str = "token") -> None:
+        super().__init__()
+        self.google_token_value = _jwt_with_expiry(expiry, suffix)
+
+    def google_token(
+        self,
+        workload_token: str,
+        provider: str,
+        scopes: list[str],
+        return_url: str,
+        state: str,
+        *,
+        force_authentication: bool = False,
+    ) -> OAuthToken:
+        return OAuthToken(self.google_token_value)
+
+
+def _jwt_with_expiry(expiry: int, signature: str) -> str:
+    payload = urlsafe_b64encode(json.dumps({"exp": expiry}).encode()).decode().rstrip("=")
+    return f"eyJhbGciOiJub25lIn0.{payload}.{signature}"
 
 
 def _measurement_runtime(
@@ -346,7 +371,7 @@ def test_measure_expiry_writes_private_resume_state_and_exits_immediately(
 
     assert result.exit_code == 0
     rendered = json.loads(result.stdout)
-    assert rendered["status"] == "resume_required"
+    assert rendered["status"] == "unknown"
     assert rendered["resume_at"] == 100.0
     assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
     assert "inbound-secret" not in state_path.read_text(encoding="utf-8")
@@ -379,9 +404,10 @@ def test_measure_expiry_does_not_call_identity_again_before_resume_time(
 
     assert result.exit_code == 0
     assert json.loads(result.stdout) == {
-        "status": "resume_required",
+        "status": "unknown",
         "operation": "measure_expiry",
-        "resume_at": 100.0,
+        "detail": "google_expiry_unknown",
+        "resume_at": None,
     }
     assert resumed_identity.workload_calls == 0
 
@@ -400,56 +426,46 @@ def test_measure_expiry_compares_old_and_new_fingerprints_after_known_expiry(
 
     resumed_evidence = RecordingEvidence()
     resumed_runtime = _measurement_runtime(
-        MeasurementIdentity(inbound_token="inbound-new", token_suffix="-new"),
-        resumed_evidence,
-        clock=lambda: 101.0,
-        inbound_expiry=200.0,
+        MeasurementIdentity(), resumed_evidence, clock=lambda: 101.0
     )
     monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: resumed_runtime)
     result = CliRunner().invoke(app, ["measure", "expiry", "--resume-state", str(state_path)])
 
     assert result.exit_code == 0
     assert json.loads(result.stdout)["status"] == "unknown"
-    observations = [item.as_dict() for item in resumed_evidence.observations]
-    inbound = next(item for item in observations if item["details"]["token_kind"] == "inbound_jwt")
-    google = next(item for item in observations if item["details"]["token_kind"] == "google_token")
-    assert (inbound["operation"], inbound["outcome"]) == ("post_expiry_refresh", "pass")
-    assert inbound["details"]["fingerprint_changed"] is True
-    assert (google["operation"], google["outcome"]) == ("refresh_unproven", "unknown")
-    assert google["details"]["prior_expiry_known"] is False
-    assert "inbound-new" not in repr(observations)
+    assert resumed_evidence.observations == []
 
 
 def test_measure_expiry_uses_persisted_issue_timestamp_for_resume_salt(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    tmp_path: Path,
 ) -> None:
     state_path = tmp_path / "expiry-state.json"
-    first_runtime = _measurement_runtime(
-        MeasurementIdentity(), RecordingEvidence(), clock=iter((10.0, 11.0)).__next__
+    original = (
+        ExpiryObservation("inbound_jwt", "same-inbound", 10.0, 100.0),
+        ExpiryObservation("workload_token", "same-workload", 10.0, None),
+        ExpiryObservation("obo_token", "same-obo", 10.0, None),
+        ExpiryObservation("google_token", "same-google", 10.0, 100.0),
     )
-    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: first_runtime)
-    assert (
-        CliRunner().invoke(app, ["measure", "expiry", "--resume-state", str(state_path)]).exit_code
-        == 0
+    record_expiry_state(
+        state_path,
+        project_id="project-a",
+        entries=original,
+        run_salt=_expiry_run_salt("project-a", 10.0),
     )
-
-    resumed_evidence = RecordingEvidence()
-    resumed_runtime = _measurement_runtime(
-        MeasurementIdentity(), resumed_evidence, clock=lambda: 101.0, inbound_expiry=200.0
+    comparisons = compare_expiry_observations(
+        load_expiry_resume_state(state_path, project_id="project-a"),
+        (
+            ExpiryObservation("inbound_jwt", "same-inbound", 11.0, 200.0),
+            ExpiryObservation("workload_token", "same-workload", 11.0, None),
+            ExpiryObservation("obo_token", "same-obo", 11.0, None),
+            ExpiryObservation("google_token", "same-google", 11.0, 200.0),
+        ),
+        prior_run_salt=_expiry_run_salt("project-a", 10.0),
     )
-    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: resumed_runtime)
-    result = CliRunner().invoke(app, ["measure", "expiry", "--resume-state", str(state_path)])
-
-    assert result.exit_code == 0
-    inbound = next(
-        item.as_dict()
-        for item in resumed_evidence.observations
-        if item.as_dict()["details"]["token_kind"] == "inbound_jwt"
-    )
-    assert inbound["details"]["fingerprint_changed"] is False
+    assert all(not comparison.fingerprint_changed for comparison in comparisons)
 
 
-def test_measure_expiry_requires_known_google_boundary_and_drive_success_for_h3(
+def test_measure_expiry_keeps_opaque_google_state_unknown_and_preserves_resume_file(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     state_path = tmp_path / "expiry-state.json"
@@ -458,23 +474,67 @@ def test_measure_expiry_requires_known_google_boundary_and_drive_success_for_h3(
     )
     monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: first_runtime)
     assert (
-        CliRunner().invoke(
-            app,
-            [
-                "measure",
-                "expiry",
-                "--resume-state",
-                str(state_path),
-                "--google-resume-at",
-                "100",
-            ],
-        ).exit_code
+        CliRunner().invoke(app, ["measure", "expiry", "--resume-state", str(state_path)]).exit_code
+        == 0
+    )
+    original_state = state_path.read_text(encoding="utf-8")
+
+    resumed_identity = MeasurementIdentity()
+    resumed_runtime = _measurement_runtime(
+        resumed_identity,
+        RecordingEvidence(),
+        clock=lambda: 101.0,
+        inbound_expiry=200.0,
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: resumed_runtime)
+    result = CliRunner().invoke(app, ["measure", "expiry", "--resume-state", str(state_path)])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["status"] == "unknown"
+    assert resumed_identity.workload_calls == 0
+    assert state_path.read_text(encoding="utf-8") == original_state
+
+
+def test_measure_expiry_rejects_operator_supplied_google_boundary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state_path = tmp_path / "expiry-state.json"
+    first_runtime = _measurement_runtime(
+        MeasurementIdentity(), RecordingEvidence(), clock=lambda: 10.0
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: first_runtime)
+    result = CliRunner().invoke(
+        app,
+        [
+            "measure",
+            "expiry",
+            "--resume-state",
+            str(state_path),
+            "--google-resume-at",
+            "100",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "No such option" in result.stderr
+
+
+def test_measure_expiry_uses_provider_derived_google_expiry_and_drive_success_for_h3(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state_path = tmp_path / "expiry-state.json"
+    first_runtime = _measurement_runtime(
+        ExpiringGoogleIdentity(100, "first"), RecordingEvidence(), clock=lambda: 10.0
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: first_runtime)
+    assert (
+        CliRunner().invoke(app, ["measure", "expiry", "--resume-state", str(state_path)]).exit_code
         == 0
     )
 
     evidence = RecordingEvidence()
     runtime = _measurement_runtime(
-        MeasurementIdentity(inbound_token="inbound-new", token_suffix="-new"),
+        ExpiringGoogleIdentity(200, "second"),
         evidence,
         clock=lambda: 101.0,
         inbound_expiry=200.0,

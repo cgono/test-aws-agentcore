@@ -358,7 +358,6 @@ def measure_concurrency_command(
 @measure_app.command("expiry")
 def measure_expiry_command(
     resume_state: Annotated[Path, typer.Option("--resume-state")] = _DEFAULT_EXPIRY_STATE_PATH,
-    google_resume_at: Annotated[float | None, typer.Option("--google-resume-at")] = None,
     evidence_path: Annotated[Path, typer.Option()] = _DEFAULT_GOOGLE_EVIDENCE_PATH,
 ) -> None:
     """Issue distinct token types, save opaque lifecycle state, and exit for later resume."""
@@ -369,19 +368,36 @@ def measure_expiry_command(
         project_id = _measurement_project_id(settings)
         resumed = resume_state.exists()
         prior_entries: tuple[StoredExpiryObservation, ...] = ()
+        resume_at: float | None = None
         if resumed:
             prior_entries = load_expiry_resume_state(resume_state, project_id=project_id)
-            known_expiries = [
-                entry.expires_at for entry in prior_entries if entry.expires_at is not None
-            ]
-            resume_at = min(known_expiries) if known_expiries else None
-            if resume_at is not None and runtime.clock() < resume_at:
+            prior_google = next(entry for entry in prior_entries if entry.kind == "google_token")
+            if not prior_google.expiry_known:
+                typer.echo(
+                    _json_line(
+                        {
+                            "status": "unknown",
+                            "operation": "measure_expiry",
+                            "detail": "google_expiry_unknown",
+                            "resume_at": None,
+                        }
+                    )
+                )
+                return
+            resume_at = cast(float, prior_google.expires_at)
+            if runtime.clock() < resume_at:
                 typer.echo(
                     _json_line(
                         {
                             "status": "resume_required",
                             "operation": "measure_expiry",
                             "resume_at": resume_at,
+                            "pending_token_kinds": [
+                                entry.kind
+                                for entry in prior_entries
+                                if entry.expires_at is not None
+                                and entry.expires_at > runtime.clock()
+                            ],
                         }
                     )
                 )
@@ -390,7 +406,6 @@ def measure_expiry_command(
             runtime,
             settings,
             writer,
-            google_resume_at=google_resume_at if not resumed else None,
             verify_google_drive=resumed,
         )
         now = runtime.clock()
@@ -471,16 +486,7 @@ def measure_expiry_command(
     typer.echo(
         _json_line(
             {
-                "status": (
-                    "pass"
-                    if comparisons_by_kind.get("google_token")
-                    and comparisons_by_kind["google_token"].prior_expiry_known
-                    and next(entry for entry in entries if entry.kind == "google_token")
-                    .drive_metadata_observed
-                    and now >= cast(float, comparisons_by_kind["google_token"].prior_expires_at)
-                    and comparisons_by_kind["google_token"].fingerprint_changed
-                    else "unknown" if comparisons else "resume_required"
-                ),
+                "status": _expiry_command_status(comparisons_by_kind, entries, now),
                 "operation": "measure_expiry",
                 "resume_at": resume_at,
                 "token_kinds": [entry.kind for entry in entries],
@@ -1426,7 +1432,6 @@ def _issue_expiry_observations(
     settings: Settings,
     writer: ObservationSink,
     *,
-    google_resume_at: float | None = None,
     verify_google_drive: bool = False,
 ) -> tuple[ExpiryObservation, ...]:
     inbound_token, identity = _measurement_identity(runtime, settings, writer)
@@ -1462,10 +1467,6 @@ def _issue_expiry_observations(
     if isinstance(google, AuthorizationRequired):
         _emit_authorization_required()
     google_expiry = _supported_token_expiry(google.access_token)
-    if google_resume_at is not None:
-        if google_resume_at < now:
-            raise MeasurementConfigurationError("google resume timestamp must not precede issuance")
-        google_expiry = google_resume_at
     drive_metadata_observed = False
     if verify_google_drive:
         drive = runtime.google_drive(settings)
@@ -1497,6 +1498,26 @@ def _measurement_project_id(settings: Settings) -> str:
         (settings.aws_region, settings.agentcore_workload_name, settings.agentcore_google_provider)
     )
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _expiry_command_status(
+    comparisons: Mapping[str, ExpiryComparison],
+    entries: tuple[ExpiryObservation, ...],
+    now: float,
+) -> str:
+    google = next(entry for entry in entries if entry.kind == "google_token")
+    comparison = comparisons.get("google_token")
+    if comparison is None:
+        return "resume_required" if google.expiry_known else "unknown"
+    if (
+        comparison.prior_expiry_known
+        and comparison.prior_expires_at is not None
+        and now >= comparison.prior_expires_at
+        and comparison.fingerprint_changed
+        and google.drive_metadata_observed
+    ):
+        return "pass"
+    return "unknown"
 
 
 def _expiry_run_salt(project_id: str, issued_at: float) -> str:
