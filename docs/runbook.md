@@ -26,11 +26,18 @@ Start the synthetic resource API with its app factory:
 .venv/bin/uvicorn agentcore_identity_poc.resource_api:create_app --factory --host 127.0.0.1 --port 8000
 ```
 
-Expose it through a public HTTPS tunnel, then set the exact callback/resource URL, for example:
+Expose it through an authenticated public HTTPS tunnel and copy the HTTPS URL printed by the
+command:
 
 ```bash
-PUBLIC_BASE_URL=https://poc-callback.example.test
-RESOURCE_API_URL=https://poc-resource.example.test/metadata
+cloudflared tunnel --url http://127.0.0.1:8000
+```
+
+Set the generated tunnel URL as the public callback base and resource endpoint, for example:
+
+```bash
+PUBLIC_BASE_URL=https://poc-resource.trycloudflare.com
+RESOURCE_API_URL=https://poc-resource.trycloudflare.com/metadata
 ```
 
 Validate local configuration first:
@@ -55,11 +62,15 @@ ENTRA_API_CLIENT_SECRET=... .venv/bin/python scripts/provision_agentcore.py --ap
 Run the live gate only after preflight and provisioning succeed:
 
 ```bash
-AGENTCORE_POC_LIVE=1 .venv/bin/python -m pytest tests/integration/test_entra_obo_live.py -m integration -v -s
+AGENTCORE_POC_LIVE=1 \
+AGENTCORE_POC_LIVE_RUNTIME=operator_live_runtime:create_runtime \
+.venv/bin/python -m pytest tests/integration/test_entra_obo_live.py -m integration -v -s
 ```
 
-The operator-provided `live_runtime` must run both aliases and record H1, H2, and H6. Stop
-before Google work when this gate fails.
+`operator_live_runtime:create_runtime` must return a configured object with
+`run_entra_obo(user_alias=...)`. The gate skips only when `AGENTCORE_POC_LIVE` is absent; a
+requested live run without this runtime fails clearly. It must run both aliases and record H1,
+H2, and H6. Stop before Google work when this gate fails.
 
 ## Cleanup
 

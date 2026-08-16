@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from importlib import import_module
 from typing import Protocol
 
 import pytest
@@ -21,7 +22,21 @@ class LiveRuntime(Protocol):
 def live_runtime() -> LiveRuntime:
     if os.environ.get("AGENTCORE_POC_LIVE") != "1":
         pytest.skip("set AGENTCORE_POC_LIVE=1 and configure live Entra/AWS credentials")
-    pytest.skip("provide a live runtime fixture in the operator environment")
+    target = os.environ.get("AGENTCORE_POC_LIVE_RUNTIME")
+    if not target or ":" not in target:
+        pytest.fail(
+            "AGENTCORE_POC_LIVE=1 requires AGENTCORE_POC_LIVE_RUNTIME=module:factory; "
+            "the factory must return a configured LiveRuntime"
+        )
+    module_name, factory_name = target.split(":", maxsplit=1)
+    try:
+        factory = getattr(import_module(module_name), factory_name)
+        runtime = factory()
+    except (AttributeError, ImportError, TypeError) as error:
+        pytest.fail(f"could not load AGENTCORE_POC_LIVE_RUNTIME: {error}")
+    if not callable(getattr(runtime, "run_entra_obo", None)):
+        pytest.fail("AGENTCORE_POC_LIVE_RUNTIME factory did not return a LiveRuntime")
+    return runtime
 
 
 @pytest.mark.integration

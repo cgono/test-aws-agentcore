@@ -14,6 +14,7 @@ from scripts.provision_agentcore import (
     ProvisioningError,
     apply_resources,
     cleanup_resources,
+    main,
     plan_resources,
     render_policy_template,
     verify_budget,
@@ -138,6 +139,14 @@ class RecordingControlClient:
         return {}
 
 
+class RecordingIamClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def put_role_policy(self, **kwargs: object) -> None:
+        self.calls.append(kwargs)
+
+
 def test_budget_preflight_includes_console_and_cli_remediation() -> None:
     with pytest.raises(BudgetMissingError) as raised:
         verify_budget(MissingBudgetClient(), "123456789012", SETTINGS.aws_budget_name)
@@ -211,6 +220,31 @@ def test_apply_creates_only_absent_named_resources_and_records_returned_values(
     assert "not-logged" not in state_path.read_text(encoding="utf-8")
 
 
+def test_apply_renders_and_installs_scoped_policy_from_recorded_arns(tmp_path: Path) -> None:
+    control = RecordingControlClient()
+    iam = RecordingIamClient()
+    state = apply_resources(
+        SETTINGS,
+        "123456789012",
+        budgets_client=PresentBudgetClient(),
+        control_client=control,
+        state_path=tmp_path / ".poc-state.json",
+        entra_client_secret="not-logged",
+        directory_arn="arn:directory:returned",
+        vault_arn="arn:vault:returned",
+        iam_client=iam,
+        iam_role_name="agentcore-poc-role",
+    )
+
+    assert state["directory_arn"] == "arn:directory:returned"
+    assert state["vault_arn"] == "arn:vault:returned"
+    assert iam.calls[0]["RoleName"] == "agentcore-poc-role"
+    assert iam.calls[0]["PolicyName"] == "agentcore-identity-poc-scoped"
+    policy = json.loads(str(iam.calls[0]["PolicyDocument"]))
+    assert "*" not in json.dumps(policy)
+    assert "bedrock-agentcore:GetWorkloadAccessTokenForUserId" in json.dumps(policy)
+
+
 def test_cleanup_deletes_only_recorded_resources_after_exact_confirmation(tmp_path: Path) -> None:
     control = RecordingControlClient()
     state_path = tmp_path / ".poc-state.json"
@@ -244,6 +278,34 @@ def test_cleanup_deletes_only_recorded_resources_after_exact_confirmation(tmp_pa
         "delete_workload_identity",
     ]
     assert not state_path.exists()
+
+
+def test_cleanup_dry_run_loads_state_and_prints_before_creating_aws_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state_path = tmp_path / ".poc-state.json"
+    write_state(
+        state_path,
+        {
+            "version": 1,
+            "workloads": [
+                {"name": "approved-workload", "arn": "arn:workload:approved"},
+                {"name": "unapproved-workload", "arn": "arn:workload:unapproved"},
+            ],
+            "provider": {
+                "name": "microsoft-provider",
+                "arn": "arn:provider:microsoft",
+                "callback_url": "https://callback.example.test/provider",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "scripts.provision_agentcore.boto3.client",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must stay local")),
+    )
+
+    assert main(["cleanup", "--state-path", str(state_path)]) == 0
+    assert "arn:provider:microsoft" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("contents", [None, "not-json", '{"workloads": []}'])

@@ -48,6 +48,10 @@ class ControlPlaneClient(Protocol):
     def delete_oauth2_credential_provider(self, *, name: str) -> Mapping[str, object]: ...
 
 
+class IamPolicyClient(Protocol):
+    def put_role_policy(self, **kwargs: object) -> None: ...
+
+
 def plan_resources(settings: Settings, account_id: str) -> dict[str, object]:
     """Return the exact named resources that an apply operation may create."""
     return {
@@ -116,6 +120,10 @@ def apply_resources(
     control_client: ControlPlaneClient,
     state_path: Path = _STATE_PATH,
     entra_client_secret: str | None = None,
+    directory_arn: str | None = None,
+    vault_arn: str | None = None,
+    iam_client: IamPolicyClient | None = None,
+    iam_role_name: str | None = None,
 ) -> dict[str, object]:
     """Create absent POC resources and persist only their returned identifiers."""
     verify_budget(budgets_client, account_id, settings.aws_budget_name)
@@ -136,15 +144,64 @@ def apply_resources(
     if provider is None:
         provider = _create_microsoft_provider(control_client, settings, cast(str, secret))
 
-    state = {
+    policy_inputs = (directory_arn, vault_arn, iam_client, iam_role_name)
+    if any(item is not None for item in policy_inputs) and not all(
+        item is not None for item in policy_inputs
+    ):
+        raise ProvisioningError(
+            "directory ARN, vault ARN, IAM client, and IAM role name are all required "
+            "for policy install"
+        )
+
+    state: dict[str, object] = {
         "version": 1,
         "account_id": account_id,
         "region": settings.aws_region,
         "workloads": workloads,
         "provider": provider,
     }
+    if directory_arn is not None and vault_arn is not None:
+        state["directory_arn"] = directory_arn
+        state["vault_arn"] = vault_arn
+        install_scoped_policy(cast(IamPolicyClient, iam_client), cast(str, iam_role_name), state)
     write_state(state_path, state)
     return state
+
+
+def install_scoped_policy(
+    client: IamPolicyClient, role_name: str, state: Mapping[str, object]
+) -> None:
+    """Render the checked-in final policy with recorded ARNs and install it on one IAM role."""
+    workloads = cast(list[Mapping[str, str]], state.get("workloads", []))
+    provider = cast(Mapping[str, str], state.get("provider", {}))
+    if len(workloads) != 2:
+        raise ProvisioningError(
+            "state must record exactly two workload ARNs for scoped policy install"
+        )
+    replacements = {
+        "DIRECTORY_ARN": _state_string(state, "directory_arn"),
+        "WORKLOAD_ARN": _state_string(workloads[0], "arn"),
+        "SECOND_WORKLOAD_ARN": _state_string(workloads[1], "arn"),
+        "VAULT_ARN": _state_string(state, "vault_arn"),
+        "PROVIDER_ARN": _state_string(provider, "arn"),
+    }
+    policy_path = Path(__file__).resolve().parents[1] / "infra" / "iam" / "scoped.json"
+    policy = load_policy_template(policy_path, replacements)
+    serialized = json.dumps(policy, separators=(",", ":"), sort_keys=True)
+    if "*" in serialized or "bedrock-agentcore:GetWorkloadAccessTokenForUserId" not in serialized:
+        raise ProvisioningError("rendered scoped policy is not safely constrained")
+    client.put_role_policy(
+        RoleName=role_name,
+        PolicyName="agentcore-identity-poc-scoped",
+        PolicyDocument=serialized,
+    )
+
+
+def _state_string(state: Mapping[str, object], field: str) -> str:
+    value = state.get(field)
+    if not isinstance(value, str) or not value:
+        raise ProvisioningError(f"state omitted required ARN: {field}")
+    return value
 
 
 def _ensure_workload(client: ControlPlaneClient, name: str) -> dict[str, object]:
@@ -258,11 +315,7 @@ def cleanup_resources(
     output: Callable[[str], None] = print,
 ) -> None:
     """Print, then optionally delete, exactly the resource identifiers in valid local state."""
-    state = _load_state(state_path)
-    identifiers = _cleanup_identifiers(state)
-    output("Cleanup targets:")
-    for identifier in identifiers:
-        output(identifier)
+    state = preview_cleanup(state_path, output)
 
     if not apply:
         return
@@ -280,6 +333,15 @@ def cleanup_resources(
     for workload in cast(list[dict[str, str]], state["workloads"]):
         control_client.delete_workload_identity(name=workload["name"])
     state_path.unlink()
+
+
+def preview_cleanup(path: Path, output: Callable[[str], None] = print) -> dict[str, object]:
+    """Load and print local cleanup targets without constructing an AWS client."""
+    state = _load_state(path)
+    output("Cleanup targets:")
+    for identifier in _cleanup_identifiers(state):
+        output(identifier)
+    return state
 
 
 def _load_state(path: Path) -> dict[str, object]:
@@ -335,14 +397,14 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     if args.command == "cleanup":
-        client = boto3.client("bedrock-agentcore-control")
         try:
-            cleanup_resources(
-                client,
-                state_path=args.state_path,
-                apply=args.apply,
-                confirm=args.confirm,
-            )
+            state = preview_cleanup(args.state_path)
+            if not args.apply:
+                return 0
+            if args.confirm != "agentcore-identity-poc":
+                raise ProvisioningError("cleanup requires --apply --confirm agentcore-identity-poc")
+            client = boto3.client("bedrock-agentcore-control")
+            _delete_recorded_resources(cast(ControlPlaneClient, client), state, args.state_path)
         except ProvisioningError as error:
             print(str(error))
             return 2
@@ -373,12 +435,28 @@ def main(argv: list[str] | None = None) -> int:
                 session.client("bedrock-agentcore-control", region_name=settings.aws_region),
             ),
             state_path=args.state_path,
+            directory_arn=os.environ.get("AGENTCORE_DIRECTORY_ARN"),
+            vault_arn=os.environ.get("AGENTCORE_TOKEN_VAULT_ARN"),
+            iam_client=cast(IamPolicyClient, session.client("iam"))
+            if os.environ.get("AGENTCORE_POC_IAM_ROLE_NAME")
+            else None,
+            iam_role_name=os.environ.get("AGENTCORE_POC_IAM_ROLE_NAME"),
         )
     except ProvisioningError as error:
         print(str(error))
         return 2
     print(json.dumps(state, separators=(",", ":"), sort_keys=True))
     return 0
+
+
+def _delete_recorded_resources(
+    client: ControlPlaneClient, state: Mapping[str, object], state_path: Path
+) -> None:
+    provider = cast(Mapping[str, str], state["provider"])
+    client.delete_oauth2_credential_provider(name=provider["name"])
+    for workload in cast(list[Mapping[str, str]], state["workloads"]):
+        client.delete_workload_identity(name=workload["name"])
+    state_path.unlink()
 
 
 if __name__ == "__main__":
