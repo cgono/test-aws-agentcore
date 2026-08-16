@@ -180,13 +180,7 @@ def create_google_provider(
     client_secret: str,
 ) -> dict[str, object]:
     """Create the Google provider and retain its returned callback for operator registration."""
-    client_id = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "").strip()
-    if not client_id:
-        raise ProvisioningError("GOOGLE_OAUTH_CLIENT_ID must be set before google-create --apply")
-    if not client_secret.strip():
-        raise ProvisioningError(
-            "a Google OAuth client secret is required from the environment or stdin"
-        )
+    client_id = validate_google_provider_inputs(client_secret)
     state = _load_state(state_path)
     prior_google = state.get("google_provider")
     provider = _find_provider(control_client, settings.agentcore_google_provider)
@@ -212,6 +206,18 @@ def create_google_provider(
     updated["google_provider"] = google_state
     write_state(state_path, updated)
     return updated
+
+
+def validate_google_provider_inputs(client_secret: str) -> str:
+    """Validate local Google credential inputs without exposing the secret value."""
+    client_id = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "").strip()
+    if not client_id:
+        raise ProvisioningError("GOOGLE_OAUTH_CLIENT_ID must be set before google-create --apply")
+    if not client_secret.strip():
+        raise ProvisioningError(
+            "a Google OAuth client secret is required from the environment or stdin"
+        )
+    return client_id
 
 
 def _google_provider_state(
@@ -284,6 +290,7 @@ def confirm_google_callback(
     updated_workloads: list[dict[str, object]] = []
     for workload in workloads:
         name = _state_string(workload, "name")
+        arn = _state_string(workload, "arn")
         existing_return_urls = _string_list(workload.get("callback_urls"))
         return_urls = list(dict.fromkeys([*existing_return_urls, settings.google_return_url]))
         try:
@@ -296,11 +303,12 @@ def confirm_google_callback(
                 "could not register the POC return URL on a workload identity"
             ) from error
         updated_workloads.append(
-            {
-                "name": _required_string(response, "name"),
-                "arn": _required_string(response, "workloadIdentityArn"),
-                "callback_urls": _string_list(response.get("allowedResourceOauth2ReturnUrls")),
-            }
+            _verified_workload_update(
+                response,
+                name=name,
+                arn=arn,
+                return_url=settings.google_return_url,
+            )
         )
 
     updated_provider = dict(provider)
@@ -310,6 +318,22 @@ def confirm_google_callback(
     updated["google_provider"] = updated_provider
     write_state(state_path, updated)
     return updated
+
+
+def _verified_workload_update(
+    response: Mapping[str, object], *, name: str, arn: str, return_url: str
+) -> dict[str, object]:
+    """Accept an update response only when it proves the intended workload retained the URL."""
+    returned_name = _required_string(response, "name")
+    if returned_name != name:
+        raise ProvisioningError("workload update response does not match the requested workload")
+    returned_arn = _required_string(response, "workloadIdentityArn")
+    if returned_arn != arn:
+        raise ProvisioningError("workload update response does not match the recorded workload ARN")
+    callback_urls = _string_list(response.get("allowedResourceOauth2ReturnUrls"))
+    if return_url not in callback_urls:
+        raise ProvisioningError("workload update response did not retain the POC return URL")
+    return {"name": returned_name, "arn": returned_arn, "callback_urls": callback_urls}
 
 
 def install_scoped_policy(
@@ -658,7 +682,14 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         try:
             secret = _read_google_client_secret(from_stdin=args.google_secret_stdin)
+            validate_google_provider_inputs(secret)
             session = boto3.session.Session(region_name=settings.aws_region)
+            account_id = args.account_id or session.client("sts").get_caller_identity()["Account"]
+            verify_budget(
+                cast(BudgetsClient, session.client("budgets", region_name="us-east-1")),
+                account_id,
+                settings.aws_budget_name,
+            )
             state = create_google_provider(
                 cast(
                     ControlPlaneClient,

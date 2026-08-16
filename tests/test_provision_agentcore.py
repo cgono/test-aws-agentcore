@@ -343,6 +343,90 @@ def test_google_callback_confirmation_unblocks_phase_two_and_sets_both_workload_
     )
 
 
+def test_google_callback_confirmation_rejects_missing_return_url_without_promoting_state(
+    tmp_path: Path,
+) -> None:
+    class MissingReturnUrlControlClient(RecordingControlClient):
+        def update_workload_identity(self, **kwargs: object) -> dict[str, object]:
+            response = super().update_workload_identity(**kwargs)
+            response["allowedResourceOauth2ReturnUrls"] = []
+            return response
+
+    control = MissingReturnUrlControlClient()
+    state_path = tmp_path / ".poc-state.json"
+    _seed_workloads(control)
+    original_state = _base_state(
+        google_provider={
+            "name": "google-provider",
+            "arn": "arn:provider:google-provider",
+            "callback_url": "https://callback.example.test/google-provider",
+            "console_status": "google_console_registration_required",
+        }
+    )
+    write_state(state_path, original_state)
+
+    with pytest.raises(ProvisioningError, match="did not retain the POC return URL"):
+        confirm_google_callback(control, SETTINGS, state_path=state_path)
+
+    assert json.loads(state_path.read_text(encoding="utf-8")) == original_state
+
+
+def test_google_callback_confirmation_rejects_a_response_for_a_different_workload(
+    tmp_path: Path,
+) -> None:
+    class MismatchedWorkloadControlClient(RecordingControlClient):
+        def update_workload_identity(self, **kwargs: object) -> dict[str, object]:
+            response = super().update_workload_identity(**kwargs)
+            response["name"] = "different-workload"
+            return response
+
+    control = MismatchedWorkloadControlClient()
+    state_path = tmp_path / ".poc-state.json"
+    _seed_workloads(control)
+    original_state = _base_state(
+        google_provider={
+            "name": "google-provider",
+            "arn": "arn:provider:google-provider",
+            "callback_url": "https://callback.example.test/google-provider",
+            "console_status": "google_console_registration_required",
+        }
+    )
+    write_state(state_path, original_state)
+
+    with pytest.raises(ProvisioningError, match="does not match the requested workload"):
+        confirm_google_callback(control, SETTINGS, state_path=state_path)
+
+    assert json.loads(state_path.read_text(encoding="utf-8")) == original_state
+
+
+def test_google_callback_confirmation_rejects_a_response_with_a_different_workload_arn(
+    tmp_path: Path,
+) -> None:
+    class MismatchedWorkloadArnControlClient(RecordingControlClient):
+        def update_workload_identity(self, **kwargs: object) -> dict[str, object]:
+            response = super().update_workload_identity(**kwargs)
+            response["workloadIdentityArn"] = "arn:workload:different-workload"
+            return response
+
+    control = MismatchedWorkloadArnControlClient()
+    state_path = tmp_path / ".poc-state.json"
+    _seed_workloads(control)
+    original_state = _base_state(
+        google_provider={
+            "name": "google-provider",
+            "arn": "arn:provider:google-provider",
+            "callback_url": "https://callback.example.test/google-provider",
+            "console_status": "google_console_registration_required",
+        }
+    )
+    write_state(state_path, original_state)
+
+    with pytest.raises(ProvisioningError, match="does not match the recorded workload ARN"):
+        confirm_google_callback(control, SETTINGS, state_path=state_path)
+
+    assert json.loads(state_path.read_text(encoding="utf-8")) == original_state
+
+
 def test_google_provider_recreation_requires_a_new_console_update(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -419,6 +503,44 @@ def test_google_create_requires_a_secret_source_before_constructing_an_aws_sessi
     )
 
     assert main(["google-create", "--apply"]) == 2
+
+
+def test_google_create_checks_the_named_budget_before_constructing_a_control_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class GoogleCreateSession:
+        def __init__(self) -> None:
+            self.services: list[str] = []
+
+        def client(self, service_name: str, **_: object) -> object:
+            self.services.append(service_name)
+            if service_name == "budgets":
+                return MissingBudgetClient()
+            raise AssertionError("control-plane client must not be constructed before the budget")
+
+    state_path = tmp_path / ".poc-state.json"
+    write_state(state_path, _base_state())
+    session = GoogleCreateSession()
+    monkeypatch.setattr(
+        "scripts.provision_agentcore.Settings.from_mapping", lambda _: SETTINGS
+    )
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "google-client-id")
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "not-logged")
+    monkeypatch.setattr(
+        "scripts.provision_agentcore.boto3.session.Session", lambda **_kwargs: session
+    )
+
+    assert main(
+        [
+            "google-create",
+            "--apply",
+            "--account-id",
+            "123456789012",
+            "--state-path",
+            str(state_path),
+        ]
+    ) == 2
+    assert session.services == ["budgets"]
 
 
 def test_google_callback_confirmation_rejects_missing_provider_before_aws_session(
