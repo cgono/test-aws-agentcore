@@ -107,6 +107,60 @@ class LatencyReport:
 
 
 @dataclass(frozen=True)
+class ColdWarmLatencyReport:
+    """Separate percentile summaries for the cold sample and warm samples."""
+
+    cold_p50_ms: int | None
+    cold_p95_ms: int | None
+    warm_p50_ms: int | None
+    warm_p95_ms: int | None
+
+    def as_details(self) -> dict[str, int | None]:
+        """Return scalar timing aggregates suitable for token-safe evidence."""
+        return {
+            "cold_p50_ms": self.cold_p50_ms,
+            "cold_p95_ms": self.cold_p95_ms,
+            "warm_p50_ms": self.warm_p50_ms,
+            "warm_p95_ms": self.warm_p95_ms,
+        }
+
+
+@dataclass(frozen=True)
+class SourceExpiryExperiment:
+    """Outcome from an in-process OBO request using the original workload token."""
+
+    source_expired: bool
+    obo_succeeded: bool
+
+    @property
+    def outcome(self) -> str:
+        """Pass only when the runner proved both the boundary and existing-token OBO call."""
+        return "pass" if self.source_expired and self.obo_succeeded else "unproven"
+
+
+@dataclass(frozen=True)
+class CloudTrailAttribution:
+    """Presence-only attribution summary derived in memory from CloudTrail events."""
+
+    event_count: int
+    aws_principal_present: bool
+    workload_identity_present: bool
+    user_correlation_present: bool
+
+    @property
+    def outcome(self) -> str:
+        """An attribution claim requires all privacy-preserving categories to be present."""
+        if (
+            self.event_count > 0
+            and self.aws_principal_present
+            and self.workload_identity_present
+            and self.user_correlation_present
+        ):
+            return "pass"
+        return "unknown"
+
+
+@dataclass(frozen=True)
 class ConcurrencyReport:
     """Outcome summary for a bounded concurrent operation."""
 
@@ -172,6 +226,20 @@ def measure_latency(
         samples=tuple(results),
         p50_ms=_nearest_rank(latencies, 0.50),
         p95_ms=_nearest_rank(latencies, 0.95),
+    )
+
+
+def cold_warm_latency_report(
+    samples: Sequence[tuple[bool, int]],
+) -> ColdWarmLatencyReport:
+    """Calculate separate nearest-rank percentiles without retaining sample payloads."""
+    cold = sorted(latency_ms for is_cold, latency_ms in samples if is_cold)
+    warm = sorted(latency_ms for is_cold, latency_ms in samples if not is_cold)
+    return ColdWarmLatencyReport(
+        cold_p50_ms=_nearest_rank(cold, 0.50) if cold else None,
+        cold_p95_ms=_nearest_rank(cold, 0.95) if cold else None,
+        warm_p50_ms=_nearest_rank(warm, 0.50) if warm else None,
+        warm_p95_ms=_nearest_rank(warm, 0.95) if warm else None,
     )
 
 

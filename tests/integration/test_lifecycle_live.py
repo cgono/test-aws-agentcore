@@ -12,6 +12,8 @@ class LiveLifecycleRuntime(Protocol):
 
     def run_lifecycle_measurements(self) -> dict[str, bool | str]: ...
 
+    def run_source_expiry_obo_experiment(self) -> bool | str: ...
+
 
 def _load_live_runtime() -> LiveLifecycleRuntime:
     if "AGENTCORE_POC_LIVE" not in os.environ:
@@ -30,6 +32,8 @@ def _load_live_runtime() -> LiveLifecycleRuntime:
         pytest.fail(f"could not load AGENTCORE_POC_LIVE_RUNTIME: {error}")
     if not callable(getattr(runtime, "run_lifecycle_measurements", None)):
         pytest.fail("AGENTCORE_POC_LIVE_RUNTIME factory did not return a LiveLifecycleRuntime")
+    if not callable(getattr(runtime, "run_source_expiry_obo_experiment", None)):
+        pytest.fail("AGENTCORE_POC_LIVE_RUNTIME lacks run_source_expiry_obo_experiment")
     return cast(LiveLifecycleRuntime, runtime)
 
 
@@ -43,10 +47,12 @@ def test_live_flag_requires_lifecycle_runtime(monkeypatch: pytest.MonkeyPatch) -
 
 @pytest.mark.integration
 def test_live_lifecycle_has_refresh_and_explicit_offboarding_evidence() -> None:
-    result = _load_live_runtime().run_lifecycle_measurements()
+    runtime = _load_live_runtime()
+    result = runtime.run_lifecycle_measurements()
 
     assert result["post_expiry_obo_refresh"] in {True, "unknown"}
     assert result["post_expiry_google_refresh"] in {"failed", "unproven"}
     assert result["latency_recorded"] is True
     assert result["cloudtrail_recorded"] is True
     assert result["offboarding_h8"] in {"pass", "failed"}
+    assert runtime.run_source_expiry_obo_experiment() in {True, "unproven", "failed"}

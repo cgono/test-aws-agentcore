@@ -43,6 +43,7 @@ from agentcore_identity_poc.downstream import (
 from agentcore_identity_poc.entra import EntraAuthError, EntraDeviceAuth
 from agentcore_identity_poc.evidence import EvidenceWriter
 from agentcore_identity_poc.experiments import (
+    CloudTrailAttribution,
     ExperimentConfigurationError,
     ExperimentTimeout,
     ExpiryComparison,
@@ -51,9 +52,11 @@ from agentcore_identity_poc.experiments import (
     MeasurementConfigurationError,
     PolicyRestorationError,
     RetryableMeasurementError,
+    SourceExpiryExperiment,
     StoredExpiryObservation,
     WorkloadAttempt,
     WorkloadPolicyManager,
+    cold_warm_latency_report,
     compare_expiry_observations,
     load_expiry_resume_state,
     measure_bounded_concurrency,
@@ -137,9 +140,12 @@ class Runtime:
     wall_clock: Callable[[], float] = time.time
     sleep: Callable[[float], None] = time.sleep
     random_unit: Callable[[], float] = secrets.SystemRandom().random
-    cloudtrail_events: Callable[[Settings, int], int] = (
-        lambda settings, lookback: _cloudtrail_event_count(settings, lookback)
+    cloudtrail_events: Callable[[Settings, int], CloudTrailAttribution] = (
+        lambda settings, lookback: _cloudtrail_attribution(settings, lookback)
     )
+    source_expiry_runner: Callable[
+        [Settings, IdentityClient, str, float, Callable[[], float]], SourceExpiryExperiment
+    ] | None = None
 
 
 class _RetryCounters:
@@ -166,6 +172,10 @@ class _GoogleDriveMeasurement:
     workload_fingerprint: str
     google_fingerprint: str
     drive_marker: str
+    cold: bool
+    workload_latency_ms: int
+    google_latency_ms: int
+    drive_latency_ms: int
 
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -225,12 +235,13 @@ def measure_latency_command(
         fingerprint_salt = runtime.random_urlsafe()
         report = measure_latency(
             samples=samples,
-            operation=lambda _: measurements.append(
+            operation=lambda cold: measurements.append(
                 _google_drive_measurement(
                     runtime,
                     settings,
                     identity,
                     inbound_token,
+                    cold=cold,
                     fingerprint_salt=fingerprint_salt,
                 )
             ),
@@ -254,6 +265,7 @@ def measure_latency_command(
     workload_cache_equivalent = len({item.workload_fingerprint for item in measurements}) == 1
     google_cache_equivalent = len({item.google_fingerprint for item in measurements}) == 1
     drive_result_equivalent = len({item.drive_marker for item in measurements}) == 1
+    stage_latency_ms = _stage_latency_details(measurements)
     _append(
         writer,
         "H7",
@@ -268,6 +280,7 @@ def measure_latency_command(
             "workload_cache_equivalent": workload_cache_equivalent,
             "google_cache_equivalent": google_cache_equivalent,
             "drive_result_equivalent": drive_result_equivalent,
+            "stage_latency_ms": stage_latency_ms,
         },
     )
     typer.echo(
@@ -283,6 +296,7 @@ def measure_latency_command(
                 "workload_cache_equivalent": workload_cache_equivalent,
                 "google_cache_equivalent": google_cache_equivalent,
                 "drive_result_equivalent": drive_result_equivalent,
+                "stage_latency_ms": stage_latency_ms,
             }
         )
     )
@@ -292,6 +306,8 @@ def measure_latency_command(
 def measure_concurrency_command(
     workers: Annotated[int, typer.Option("--workers")] = 5,
     requests: Annotated[int, typer.Option("--requests")] = 20,
+    documented_quota: Annotated[int | None, typer.Option("--documented-quota")] = None,
+    temporal_target: Annotated[int | None, typer.Option("--temporal-target")] = None,
     evidence_path: Annotated[Path, typer.Option()] = _DEFAULT_GOOGLE_EVIDENCE_PATH,
 ) -> None:
     """Measure end-to-end throttling while bounding concurrent Google Drive requests."""
@@ -305,13 +321,14 @@ def measure_concurrency_command(
         counters = _RetryCounters()
         fingerprint_salt = runtime.random_urlsafe()
 
-        def request(_: int) -> None:
+        def request(index: int) -> None:
             measurement = _google_drive_measurement(
                 runtime,
                 settings,
                 identity,
                 inbound_token,
                 counters=counters,
+                cold=index == 0,
                 fingerprint_salt=fingerprint_salt,
             )
             with marker_lock:
@@ -340,6 +357,13 @@ def measure_concurrency_command(
     workload_cache_equivalent = len({item.workload_fingerprint for item in measurements}) == 1
     google_cache_equivalent = len({item.google_fingerprint for item in measurements}) == 1
     drive_result_equivalent = len({item.drive_marker for item in measurements}) == 1
+    stage_latency_ms = _stage_latency_details(measurements)
+    readiness_details = _concurrency_readiness(
+        workers=workers,
+        requests=requests,
+        documented_quota=documented_quota,
+        temporal_target=temporal_target,
+    )
     _append(
         writer,
         "H7",
@@ -354,6 +378,8 @@ def measure_concurrency_command(
             "throttle_count": counters.throttle_count,
             "retry_attempts": counters.retry_attempts,
             "backoff_ms": counters.backoff_ms,
+            "stage_latency_ms": stage_latency_ms,
+            **readiness_details,
         },
     )
     typer.echo(
@@ -369,6 +395,8 @@ def measure_concurrency_command(
                 "throttle_count": counters.throttle_count,
                 "retry_attempts": counters.retry_attempts,
                 "backoff_ms": counters.backoff_ms,
+                "stage_latency_ms": stage_latency_ms,
+                **readiness_details,
             }
         )
     )
@@ -418,6 +446,22 @@ def measure_expiry_command(
                 return
         entries = _issue_expiry_observations(runtime, settings, writer)
         now = runtime.wall_clock()
+        source_expiry_result: SourceExpiryExperiment | None = None
+        if not prior_entries and runtime.source_expiry_runner is not None:
+            workload_token = next(
+                entry.token for entry in entries if entry.kind == "workload_token"
+            )
+            inbound_expiry = next(
+                entry.expires_at for entry in entries if entry.kind == "inbound_jwt"
+            )
+            if inbound_expiry is not None:
+                source_expiry_result = runtime.source_expiry_runner(
+                    settings,
+                    runtime.agentcore(settings),
+                    workload_token,
+                    inbound_expiry,
+                    runtime.wall_clock,
+                )
         run_salt = _expiry_run_salt(project_id, min(entry.issued_at for entry in entries))
         comparisons: tuple[ExpiryComparison, ...] = ()
         if prior_entries:
@@ -450,7 +494,10 @@ def measure_expiry_command(
         if entry.kind == "google_token":
             outcome = "fail"
             operation = "provider_expiry_unavailable"
-            details = {"token_kind": "google_token"}
+            details = {
+                "token_kind": "google_token",
+                "detail": "agentcore_response_lacks_provider_expiry_raw_token_not_retained",
+            }
         elif comparison is None:
             outcome = "resume_required"
             operation = "expiry_issue"
@@ -462,17 +509,8 @@ def measure_expiry_command(
                 "fingerprint": token_fingerprint(entry.token, run_salt=run_salt),
             }
         else:
-            post_expiry = (
-                comparison.prior_expiry_known
-                and comparison.prior_expires_at is not None
-                and now >= comparison.prior_expires_at
-            )
-            outcome = (
-                "pass"
-                if post_expiry and comparison.fingerprint_changed
-                else "unknown"
-            )
-            operation = "post_expiry_refresh" if outcome == "pass" else "refresh_unproven"
+            outcome = "unproven"
+            operation = "fresh_token_comparison"
             details = {
                 "token_kind": entry.kind,
                 "prior_expiry_known": comparison.prior_expiry_known,
@@ -488,6 +526,25 @@ def measure_expiry_command(
             operation,
             outcome,
             details,
+        )
+    if source_expiry_result is None:
+        _append(
+            writer,
+            "H7",
+            "obo_after_inbound_expiry",
+            "unproven",
+            {"detail": "continuous_runner_not_configured"},
+        )
+    else:
+        _append(
+            writer,
+            "H7",
+            "obo_after_inbound_expiry",
+            source_expiry_result.outcome,
+            {
+                "source_expired": source_expiry_result.source_expired,
+                "obo_succeeded": source_expiry_result.obo_succeeded,
+            },
         )
     typer.echo(
         _json_line(
@@ -506,14 +563,14 @@ def measure_cloudtrail_command(
     lookback_minutes: Annotated[int, typer.Option("--lookback-minutes")] = 30,
     evidence_path: Annotated[Path, typer.Option()] = _DEFAULT_GOOGLE_EVIDENCE_PATH,
 ) -> None:
-    """Record aggregate AgentCore CloudTrail activity without retaining event payloads."""
+    """Record presence-only AgentCore CloudTrail attribution without retaining event payloads."""
     if lookback_minutes < 1 or lookback_minutes > 1_440:
         _emit_blocked("configuration", _CONFIGURATION_EXIT, "lookback_minutes_must_be_1_to_1440")
     runtime = runtime_factory()
     try:
         settings = runtime.load_settings()
         writer = runtime.evidence_writer(evidence_path)
-        event_count = runtime.cloudtrail_events(settings, lookback_minutes)
+        attribution = runtime.cloudtrail_events(settings, lookback_minutes)
     except SettingsError as error:
         _emit_configuration_failure(error, json_output=True)
     except Exception:
@@ -522,16 +579,25 @@ def measure_cloudtrail_command(
         writer,
         "H7",
         "measure_cloudtrail",
-        "pass",
-        {"lookback_minutes": lookback_minutes, "event_count": event_count},
+        attribution.outcome,
+        {
+            "lookback_minutes": lookback_minutes,
+            "event_count": attribution.event_count,
+            "aws_principal_present": attribution.aws_principal_present,
+            "workload_identity_present": attribution.workload_identity_present,
+            "user_correlation_present": attribution.user_correlation_present,
+        },
     )
     typer.echo(
         _json_line(
             {
-                "status": "pass",
+                "status": attribution.outcome,
                 "operation": "measure_cloudtrail",
                 "lookback_minutes": lookback_minutes,
-                "event_count": event_count,
+                "event_count": attribution.event_count,
+                "aws_principal_present": attribution.aws_principal_present,
+                "workload_identity_present": attribution.workload_identity_present,
+                "user_correlation_present": attribution.user_correlation_present,
             }
         )
     )
@@ -1385,16 +1451,20 @@ def _google_drive_measurement(
     inbound_token: str,
     *,
     counters: _RetryCounters | None = None,
+    cold: bool,
     fingerprint_salt: str,
 ) -> _GoogleDriveMeasurement:
     """Run the workload, Google provider, and aggregate Drive operation as one measurement."""
 
     def operation() -> _GoogleDriveMeasurement:
+        workload_started_at = runtime.clock()
         workload_token = _retry_agentcore(
             lambda: identity.workload_token(settings.agentcore_workload_name, inbound_token),
             runtime,
             counters=counters,
         )
+        workload_latency_ms = _elapsed_milliseconds(runtime, workload_started_at)
+        google_started_at = runtime.clock()
         authorization = _retry_agentcore(
             lambda: identity.google_token(
                 workload_token,
@@ -1406,17 +1476,24 @@ def _google_drive_measurement(
             runtime,
             counters=counters,
         )
+        google_latency_ms = _elapsed_milliseconds(runtime, google_started_at)
         if isinstance(authorization, AuthorizationRequired):
             _emit_authorization_required()
         drive = runtime.google_drive(settings)
         try:
+            drive_started_at = runtime.clock()
+            metadata = drive.list(authorization.access_token)
             return _GoogleDriveMeasurement(
                 workload_fingerprint=token_fingerprint(workload_token, run_salt=fingerprint_salt),
                 google_fingerprint=token_fingerprint(
                     authorization.access_token,
                     run_salt=fingerprint_salt,
                 ),
-                drive_marker=drive_metadata_marker(drive.list(authorization.access_token)),
+                drive_marker=drive_metadata_marker(metadata),
+                cold=cold,
+                workload_latency_ms=workload_latency_ms,
+                google_latency_ms=google_latency_ms,
+                drive_latency_ms=_elapsed_milliseconds(runtime, drive_started_at),
             )
         except DownstreamThrottled as error:
             if counters is not None:
@@ -1431,6 +1508,66 @@ def _google_drive_measurement(
         random_unit=runtime.random_unit,
         on_retry=counters.record_retry if counters is not None else None,
     )
+
+
+def _stage_latency_details(
+    measurements: list[_GoogleDriveMeasurement],
+) -> dict[str, JsonValue]:
+    """Summarize each end-to-end stage without retaining tokens or response content."""
+    stages = {
+        "workload": [(item.cold, item.workload_latency_ms) for item in measurements],
+        "google": [(item.cold, item.google_latency_ms) for item in measurements],
+        "drive": [(item.cold, item.drive_latency_ms) for item in measurements],
+    }
+    details: dict[str, JsonValue] = {}
+    for name, samples in stages.items():
+        summary = cold_warm_latency_report(samples)
+        details[name] = {
+            "cold_p50_ms": summary.cold_p50_ms,
+            "cold_p95_ms": summary.cold_p95_ms,
+            "warm_p50_ms": summary.warm_p50_ms,
+            "warm_p95_ms": summary.warm_p95_ms,
+        }
+    return details
+
+
+def _concurrency_readiness(
+    *,
+    workers: int,
+    requests: int,
+    documented_quota: int | None,
+    temporal_target: int | None,
+) -> dict[str, JsonValue]:
+    """Compare operator-declared limits without inferring unverified AWS service quotas."""
+    quota_status = (
+        "unknown"
+        if documented_quota is None
+        else "within_documented_quota"
+        if workers <= documented_quota
+        else "exceeds_documented_quota"
+    )
+    temporal_status = (
+        "unknown"
+        if temporal_target is None
+        else "within_temporal_target"
+        if requests <= temporal_target
+        else "exceeds_temporal_target"
+    )
+    readiness = (
+        "unknown"
+        if "unknown" in {quota_status, temporal_status}
+        else "ready"
+        if quota_status == "within_documented_quota"
+        and temporal_status == "within_temporal_target"
+        else "not_ready"
+    )
+    return {
+        "documented_quota": documented_quota,
+        "temporal_target": temporal_target,
+        "quota_status": quota_status,
+        "temporal_status": temporal_status,
+        "readiness": readiness,
+    }
 
 
 def _issue_expiry_observations(
@@ -1524,12 +1661,12 @@ def _supported_token_expiry(token: str) -> float | None:
     return float(expiry) if isinstance(expiry, int | float) else None
 
 
-def _cloudtrail_event_count(settings: Settings, lookback_minutes: int) -> int:
-    """Return only an aggregate count from CloudTrail; individual event payloads are discarded."""
+def _cloudtrail_attribution(settings: Settings, lookback_minutes: int) -> CloudTrailAttribution:
+    """Inspect event structures in memory and retain only attribution-category presence."""
     client = boto3.client("cloudtrail", region_name=settings.aws_region)
     start_time = datetime.now(UTC) - timedelta(minutes=lookback_minutes)
     paginator = client.get_paginator("lookup_events")
-    count = 0
+    events: list[Mapping[str, object]] = []
     for page in paginator.paginate(
         LookupAttributes=[
             {
@@ -1539,10 +1676,70 @@ def _cloudtrail_event_count(settings: Settings, lookback_minutes: int) -> int:
         ],
         StartTime=start_time,
     ):
-        events = page.get("Events", [])
-        if isinstance(events, list):
-            count += len(events)
-    return count
+        page_events = page.get("Events", [])
+        if isinstance(page_events, list):
+            events.extend(event for event in page_events if isinstance(event, Mapping))
+    return _cloudtrail_attribution_from_events(events)
+
+
+def _cloudtrail_attribution_from_events(
+    events: list[Mapping[str, object]],
+) -> CloudTrailAttribution:
+    """Derive only required field-presence booleans from raw event payloads in memory."""
+    parsed_events = [_decode_cloudtrail_event(event) for event in events]
+    return CloudTrailAttribution(
+        event_count=len(events),
+        aws_principal_present=any(
+            _mapping_has_any_key(event, {"arn", "principalid", "accountid"}, under="useridentity")
+            for event in parsed_events
+        ),
+        workload_identity_present=any(
+            _mapping_has_any_key(
+                event,
+                {"workloadname", "workloadidentity", "workloadidentitytoken"},
+            )
+            for event in parsed_events
+        ),
+        user_correlation_present=any(
+            _mapping_has_any_key(
+                event,
+                {"useridentifier", "userid", "usertoken", "customstate"},
+            )
+            for event in parsed_events
+        ),
+    )
+
+
+def _decode_cloudtrail_event(event: Mapping[str, object]) -> Mapping[str, object]:
+    payload = event.get("CloudTrailEvent")
+    if not isinstance(payload, str):
+        return event
+    try:
+        decoded = json.loads(payload)
+    except json.JSONDecodeError:
+        return {}
+    return decoded if isinstance(decoded, Mapping) else {}
+
+
+def _mapping_has_any_key(
+    value: Mapping[str, object], keys: set[str], *, under: str | None = None
+) -> bool:
+    """Search key names only; values never leave this in-memory parser."""
+    for key, nested in value.items():
+        normalized = key.lower()
+        if under is None and normalized in keys:
+            return True
+        if under is not None and normalized == under and isinstance(nested, Mapping):
+            return any(child.lower() in keys for child in nested)
+        if isinstance(nested, Mapping) and _mapping_has_any_key(nested, keys, under=under):
+            return True
+        if isinstance(nested, list) and any(
+            _mapping_has_any_key(item, keys, under=under)
+            for item in nested
+            if isinstance(item, Mapping)
+        ):
+            return True
+    return False
 
 
 class _InteractiveStdinError(ValueError):

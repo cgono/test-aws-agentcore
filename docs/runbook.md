@@ -147,9 +147,12 @@ secret-command | \
 ```
 
 The command must report `"phase_2":{"status":"ready"}`. Complete the first Google consent
-within ten minutes, which is the authorization-session lifetime. For the H3 refresh observation,
-wait for natural Google access-token expiry; do not treat a second immediate retrieval as refresh
-evidence.
+within ten minutes, which is the authorization-session lifetime. H3 is currently an explicit
+feasibility blocker: AgentCore's token response exposes an opaque access token but no expiry
+metadata, and the POC deliberately does not retain raw tokens. It therefore cannot distinguish a
+post-expiry Google refresh safely. `measure expiry` records the sanitized
+`provider_expiry_unavailable` H3 failure rather than asking an operator to wait or treating a
+second retrieval as refresh evidence.
 
 ## Phase 2 Isolation
 
@@ -220,8 +223,9 @@ AGENTCORE_POC_LIVE_RUNTIME=operator_live_runtime:create_runtime \
 
 The operator runtime supplies `run_google_provider_gate()` for callback binding, completed
 consent, and durable-vault connection evidence, and `run_workload_isolation()` for H4b. Stop the
-POC if callback binding or durable vaulting fails. H3 remains pending until Task 13 records a
-post-expiry retrieval; H7 and H8 remain pending as well.
+POC if callback binding or durable vaulting fails. H3 remains a documented feasibility blocker
+until the AgentCore API exposes provider expiry metadata without requiring raw-token retention.
+H7 and H8 remain pending as well.
 
 `user-a` and `user-b` are opaque operator aliases, not email addresses or Entra identifiers. Each
 marker is the distinct SHA-256 fingerprint emitted by `google-list` for that alias's aggregate

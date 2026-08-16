@@ -10,7 +10,13 @@ import pytest
 from typer.testing import CliRunner
 
 from agentcore_identity_poc.agentcore import AgentCoreThrottled, AuthorizationRequired, OAuthToken
-from agentcore_identity_poc.cli import Runtime, _expiry_run_salt, _measurement_project_id, app
+from agentcore_identity_poc.cli import (
+    Runtime,
+    _cloudtrail_attribution_from_events,
+    _expiry_run_salt,
+    _measurement_project_id,
+    app,
+)
 from agentcore_identity_poc.config import Settings
 from agentcore_identity_poc.downstream import (
     DownstreamAccessDenied,
@@ -19,9 +25,12 @@ from agentcore_identity_poc.downstream import (
     DriveMetadata,
 )
 from agentcore_identity_poc.experiments import (
+    CloudTrailAttribution,
     ExpiryObservation,
     MeasurementConfigurationError,
     RetryableMeasurementError,
+    SourceExpiryExperiment,
+    cold_warm_latency_report,
     compare_expiry_observations,
     load_expiry_resume_state,
     measure_bounded_concurrency,
@@ -143,6 +152,21 @@ def test_latency_reports_distinct_cold_and_warm_samples_with_percentiles() -> No
     assert [sample.latency_ms for sample in report.samples] == [100, 20, 30]
     assert report.p50_ms == 30
     assert report.p95_ms == 100
+
+
+def test_cold_warm_latency_report_keeps_stage_percentiles_separate() -> None:
+    report = cold_warm_latency_report(
+        (
+            (True, 10),
+            (False, 20),
+            (False, 30),
+        )
+    )
+
+    assert report.cold_p50_ms == 10
+    assert report.cold_p95_ms == 10
+    assert report.warm_p50_ms == 20
+    assert report.warm_p95_ms == 30
 
 
 def test_token_fingerprints_are_salted_per_run_and_do_not_include_token() -> None:
@@ -322,19 +346,61 @@ def test_measure_latency_reports_cold_warm_percentiles_and_no_tokens(
     identity = MeasurementIdentity()
     evidence = RecordingEvidence()
     drive = MeasurementDrive([DriveMetadata(1, {"text/plain": 1}) for _ in range(3)])
-    clock = iter((0.0, 0.100, 0.100, 0.120, 0.120, 0.150))
+    clock = iter(
+        (
+            0.0,
+            0.0,
+            0.01,
+            0.01,
+            0.03,
+            0.03,
+            0.06,
+            0.06,
+            0.1,
+            0.1,
+            0.11,
+            0.11,
+            0.13,
+            0.13,
+            0.16,
+            0.16,
+            0.2,
+            0.2,
+            0.21,
+            0.21,
+            0.23,
+            0.23,
+            0.26,
+            0.26,
+        )
+    )
     runtime = _measurement_runtime(identity, evidence, clock=lambda: next(clock), drive=drive)
     monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
 
     result = CliRunner().invoke(app, ["measure", "latency", "--samples", "3"])
 
     assert result.exit_code == 0
-    assert result.stdout == (
-        '{"status":"pass","operation":"measure_latency","samples":3,'
-        '"cold_samples":1,"warm_samples":2,"p50_ms":30,"p95_ms":100,'
-        '"workload_cache_equivalent":true,"google_cache_equivalent":true,'
-        '"drive_result_equivalent":true}\n'
-    )
+    rendered = json.loads(result.stdout)
+    assert rendered["p50_ms"] == 60
+    assert rendered["p95_ms"] == 60
+    assert rendered["stage_latency_ms"]["workload"] == {
+        "cold_p50_ms": 10,
+        "cold_p95_ms": 10,
+        "warm_p50_ms": 10,
+        "warm_p95_ms": 10,
+    }
+    assert rendered["stage_latency_ms"]["google"] == {
+        "cold_p50_ms": 20,
+        "cold_p95_ms": 20,
+        "warm_p50_ms": 20,
+        "warm_p95_ms": 20,
+    }
+    assert rendered["stage_latency_ms"]["drive"] == {
+        "cold_p50_ms": 30,
+        "cold_p95_ms": 30,
+        "warm_p50_ms": 30,
+        "warm_p95_ms": 30,
+    }
     assert identity.workload_calls == 3
     assert drive.access_tokens == ["google-secret"] * 3
     assert "inbound-secret" not in result.output
@@ -551,7 +617,10 @@ def test_measure_expiry_reports_opaque_google_expiry_as_terminal_h3_infeasibilit
         if item.as_dict()["hypothesis"] == "H3"
     )
     assert (google["operation"], google["outcome"]) == ("provider_expiry_unavailable", "fail")
-    assert google["details"] == {"token_kind": "google_token"}
+    assert google["details"] == {
+        "token_kind": "google_token",
+        "detail": "agentcore_response_lacks_provider_expiry_raw_token_not_retained",
+    }
 
 
 def test_measure_expiry_uses_wall_clock_for_epoch_expiry_not_monotonic_clock(
@@ -572,6 +641,173 @@ def test_measure_expiry_uses_wall_clock_for_epoch_expiry_not_monotonic_clock(
 
     assert result.exit_code == 0
     assert json.loads(result.stdout)["resume_at"] == 1_700_000_100.0
+
+
+def test_measure_expiry_only_passes_h7_with_existing_workload_after_source_expiry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class ExistingWorkloadIdentity(MeasurementIdentity):
+        def __init__(self) -> None:
+            super().__init__()
+            self.obo_workloads: list[str] = []
+
+        def obo_token(self, workload_token: str, provider: str, scopes: list[str]) -> str:
+            self.obo_workloads.append(workload_token)
+            return "obo-secret"
+
+    identity = ExistingWorkloadIdentity()
+    evidence_writer = RecordingEvidence()
+    clock = iter((50.0, 101.0, 101.0))
+
+    def run_after_expiry(
+        settings: Settings,
+        runner_identity: MeasurementIdentity,
+        existing_workload_token: str,
+        inbound_expiry: float,
+        wall_clock: object,
+    ) -> SourceExpiryExperiment:
+        assert settings is SETTINGS
+        assert runner_identity is identity
+        assert existing_workload_token == "workload-secret"
+        assert callable(wall_clock)
+        assert wall_clock() >= inbound_expiry  # type: ignore[operator]
+        runner_identity.obo_token(
+            existing_workload_token,
+            SETTINGS.agentcore_microsoft_provider,
+            [SETTINGS.entra_downstream_scope],
+        )
+        return SourceExpiryExperiment(source_expired=True, obo_succeeded=True)
+
+    runtime = replace(
+        _measurement_runtime(
+            identity,
+            evidence_writer,
+            wall_clock=lambda: next(clock),
+            inbound_expiry=100.0,
+        ),
+        source_expiry_runner=run_after_expiry,  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(
+        app, ["measure", "expiry", "--resume-state", str(tmp_path / "state")]
+    )
+
+    assert result.exit_code == 0
+    observations = [item.as_dict() for item in evidence_writer.observations]
+    source_expiry = next(
+        item for item in observations if item["operation"] == "obo_after_inbound_expiry"
+    )
+    assert source_expiry["outcome"] == "pass"
+    assert identity.workload_calls == 1
+    assert identity.obo_workloads == ["workload-secret", "workload-secret"]
+    assert "workload-secret" not in result.output
+
+
+def test_measure_expiry_records_h7_unproven_without_continuous_runner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    evidence = RecordingEvidence()
+    runtime = _measurement_runtime(MeasurementIdentity(), evidence)
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(
+        app, ["measure", "expiry", "--resume-state", str(tmp_path / "state")]
+    )
+
+    assert result.exit_code == 0
+    observations = [item.as_dict() for item in evidence.observations]
+    source_expiry = next(
+        item for item in observations if item["operation"] == "obo_after_inbound_expiry"
+    )
+    assert source_expiry["outcome"] == "unproven"
+    assert source_expiry["details"] == {"detail": "continuous_runner_not_configured"}
+
+
+def test_cloudtrail_attribution_parses_only_field_presence() -> None:
+    attribution = _cloudtrail_attribution_from_events(
+        [
+            {
+                "CloudTrailEvent": json.dumps(
+                    {
+                        "userIdentity": {"principalId": "sensitive-principal"},
+                        "requestParameters": {
+                            "workloadName": "approved-workload",
+                            "userIdentifier": "sensitive-user",
+                        },
+                    }
+                )
+            }
+        ]
+    )
+
+    assert attribution == CloudTrailAttribution(
+        event_count=1,
+        aws_principal_present=True,
+        workload_identity_present=True,
+        user_correlation_present=True,
+    )
+
+
+def test_measure_cloudtrail_reports_unknown_when_attribution_fields_are_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence = RecordingEvidence()
+    runtime = replace(
+        _measurement_runtime(MeasurementIdentity(), evidence),
+        cloudtrail_events=lambda _, __: CloudTrailAttribution(
+            event_count=2,
+            aws_principal_present=True,
+            workload_identity_present=False,
+            user_correlation_present=False,
+        ),
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(app, ["measure", "cloudtrail"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == {
+        "status": "unknown",
+        "operation": "measure_cloudtrail",
+        "lookback_minutes": 30,
+        "event_count": 2,
+        "aws_principal_present": True,
+        "workload_identity_present": False,
+        "user_correlation_present": False,
+    }
+    assert "sensitive" not in repr(evidence.observations)
+
+
+@pytest.mark.parametrize(
+    ("quota", "target", "readiness"),
+    [(5, 20, "ready"), (1, 20, "not_ready"), (None, None, "unknown")],
+)
+def test_measure_concurrency_reports_documented_quota_and_temporal_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+    quota: int | None,
+    target: int | None,
+    readiness: str,
+) -> None:
+    runtime = _measurement_runtime(
+        MeasurementIdentity(),
+        RecordingEvidence(),
+        drive=MeasurementDrive([DriveMetadata(1, {"text/plain": 1}) for _ in range(10)]),
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+    arguments = ["measure", "concurrency", "--workers", "2", "--requests", "10"]
+    if quota is not None:
+        arguments.extend(("--documented-quota", str(quota)))
+    if target is not None:
+        arguments.extend(("--temporal-target", str(target)))
+
+    result = CliRunner().invoke(app, arguments)
+
+    assert result.exit_code == 0
+    rendered = json.loads(result.stdout)
+    assert rendered["readiness"] == readiness
+    assert rendered["documented_quota"] == quota
+    assert rendered["temporal_target"] == target
 
 
 def test_offboard_google_detects_drive_revocation_before_forcing_authentication(
@@ -680,6 +916,10 @@ def test_measure_concurrency_records_end_to_end_throttle_and_retry_counts(
     assert rendered["workload_cache_equivalent"] is True
     assert rendered["google_cache_equivalent"] is True
     assert rendered["drive_result_equivalent"] is True
+    assert set(rendered["stage_latency_ms"]) == {"workload", "google", "drive"}
+    assert rendered["stage_latency_ms"]["workload"]["cold_p50_ms"] == 0
+    assert rendered["stage_latency_ms"]["google"]["warm_p95_ms"] == 0
+    assert rendered["stage_latency_ms"]["drive"]["cold_p95_ms"] == 0
     assert drive.access_tokens == ["google-secret"] * 3
 
 
@@ -736,7 +976,7 @@ def test_measure_latency_does_not_infer_token_cache_from_matching_drive_metadata
     runtime = _measurement_runtime(
         RotatingIdentity(),
         RecordingEvidence(),
-        clock=iter((0.0, 0.1, 0.1, 0.2)).__next__,
+        clock=lambda: 0.0,
         drive=MeasurementDrive([DriveMetadata(1, {"text/plain": 1}) for _ in range(2)]),
     )
     monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
@@ -756,7 +996,7 @@ def test_measure_latency_maps_drive_unauthorized_without_a_traceback(
     runtime = _measurement_runtime(
         MeasurementIdentity(),
         RecordingEvidence(),
-        clock=iter((0.0, 0.1)).__next__,
+        clock=lambda: 0.0,
         drive=MeasurementDrive([DownstreamUnauthorized()]),
     )
     monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
@@ -807,7 +1047,7 @@ def test_measure_latency_maps_exhausted_agentcore_throttling_without_a_traceback
         _measurement_runtime(
             AlwaysThrottledIdentity(),
             RecordingEvidence(),
-            clock=iter((0.0,)).__next__,
+            clock=lambda: 0.0,
         ),
         sleep=lambda _: None,
         random_unit=lambda: 0.0,
