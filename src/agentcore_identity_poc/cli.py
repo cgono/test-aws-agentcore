@@ -31,7 +31,9 @@ from agentcore_identity_poc.agentcore import (
 )
 from agentcore_identity_poc.assessment import (
     AssessmentError,
+    atomic_write_text,
     decide,
+    finalize_terminal_evidence,
     load_terminal_results,
     render_markdown,
 )
@@ -196,6 +198,32 @@ def main() -> None:
     """Run AgentCore Identity POC commands."""
 
 
+@app.command("assessment-finalize")
+def assessment_finalize(
+    evidence: Annotated[Path, typer.Option("--evidence")],
+    output: Annotated[Path, typer.Option("--output")],
+    result: Annotated[list[str] | None, typer.Option("--result")] = None,
+    h5_compatibility_reviewed: Annotated[
+        bool, typer.Option("--h5-compatibility-reviewed")
+    ] = False,
+) -> None:
+    """Create minimal terminal evidence from sanitized POC observations."""
+    try:
+        finalize_terminal_evidence(
+            evidence,
+            result or [],
+            output,
+            h5_compatibility_reviewed=h5_compatibility_reviewed,
+        )
+    except AssessmentError:
+        typer.echo(_json_line({"status": "blocked", "category": "assessment_incomplete"}))
+        raise typer.Exit(code=_CONFIGURATION_EXIT) from None
+    except OSError:
+        typer.echo(_json_line({"status": "blocked", "category": "assessment_output_unavailable"}))
+        raise typer.Exit(code=_CONFIGURATION_EXIT) from None
+    typer.echo(_json_line({"status": "pass", "operation": "assessment_finalize"}))
+
+
 @app.command("report")
 def report(
     evidence: Annotated[Path, typer.Option("--evidence")],
@@ -226,17 +254,17 @@ def report(
             latency_acceptable=latency_acceptable,
             quota_acceptable=quota_acceptable,
         )
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(
-            render_markdown(
-                results,
-                decision,
-                custom_provider_plausible=custom_provider_path_plausible,
-            ),
-            encoding="utf-8",
+        rendered = render_markdown(
+            results,
+            decision,
+            custom_provider_plausible=custom_provider_path_plausible,
         )
+        atomic_write_text(output, rendered)
     except AssessmentError:
         typer.echo(_json_line({"status": "blocked", "category": "assessment_incomplete"}))
+        raise typer.Exit(code=_CONFIGURATION_EXIT) from None
+    except OSError:
+        typer.echo(_json_line({"status": "blocked", "category": "assessment_output_unavailable"}))
         raise typer.Exit(code=_CONFIGURATION_EXIT) from None
     typer.echo(_json_line({"status": "pass", "operation": "report", "decision": decision}))
 

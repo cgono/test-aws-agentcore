@@ -2,14 +2,30 @@
 
 ## Evidence Input
 
-Generate a draft only from sanitized JSONL. Each hypothesis needs exactly one explicit terminal
-observation with `operation` set to `assessment_terminal` and `details.terminal` set to `true`.
-The report generator rejects missing or duplicate terminal observations and invalid measurements;
-it never guesses a result from intermediate evidence.
+Generate a draft only from sanitized JSONL. First finalize actual emitted nonterminal observations
+into one minimal terminal artifact. The finalizer validates the JSONL, requires one canonical
+`pass` or `fail` selection for every H1-H8, requires same-hypothesis source evidence, and requires
+the explicit H5 compatibility-review acknowledgement because H5 is a documented paper decision.
+It writes exactly one `assessment_terminal` row with `details.terminal=true` for each hypothesis;
+it does not copy observation details or provider responses.
 
 ```sh
-.venv/bin/agentcore-identity-poc report \
+.venv/bin/agentcore-identity-poc assessment-finalize \
   --evidence evidence/sanitized.jsonl \
+  --output evidence/assessment-terminal.jsonl \
+  --h5-compatibility-reviewed \
+  --result H1=pass \
+  --result H2=pass \
+  --result H3=fail \
+  --result H4a=pass \
+  --result H4b=pass \
+  --result H5=fail \
+  --result H6=pass \
+  --result H7=fail \
+  --result H8=fail
+
+.venv/bin/agentcore-identity-poc report \
+  --evidence evidence/assessment-terminal.jsonl \
   --output docs/assessment.md \
   --iam-acceptable \
   --audit-acceptable \
@@ -17,10 +33,12 @@ it never guesses a result from intermediate evidence.
   --quota-acceptable
 ```
 
-`assessment.md` is deliberately not committed before a live run. The command emits status-only
-Markdown and excludes provider responses, credentials, tokens, authorization URLs, and evidence
-details. The four acceptance switches are explicit platform/security decisions after reviewing
-sanitized IAM, audit, latency, and quota observations.
+Select results only after reviewing their associated sanitized observations. The example records
+the current H3 API limitation and unresolved production-path/lifecycle items as failures; it is not
+a substitute for live evidence. `assessment.md` is deliberately not committed before a live run.
+The command emits status-only Markdown and excludes provider responses, credentials, tokens,
+authorization URLs, and evidence details. The four acceptance switches are explicit
+platform/security decisions after reviewing sanitized IAM, audit, latency, and quota observations.
 
 ## Hypothesis Results
 

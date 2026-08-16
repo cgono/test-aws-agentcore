@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
-from collections.abc import Mapping
+import tempfile
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Final, Never
 
@@ -12,6 +14,7 @@ from agentcore_identity_poc.redaction import UnsafeEvidenceError, assert_safe_ev
 
 REQUIRED_HYPOTHESES: Final = ("H1", "H2", "H3", "H4a", "H4b", "H5", "H6", "H7", "H8")
 MANDATORY_HYPOTHESES: Final = ("H1", "H2", "H3", "H4a", "H6", "H7", "H8")
+TERMINAL_OUTCOMES: Final = frozenset({"pass", "fail"})
 _TERMINAL_OPERATION: Final = "assessment_terminal"
 _MILLISECOND_FIELDS: Final = frozenset({"backoff_ms", "latency_ms", "p50_ms", "p95_ms"})
 _COUNT_FIELDS: Final = frozenset(
@@ -44,6 +47,29 @@ _STAGE_NAMES: Final = frozenset({"workload", "google", "drive"})
 _STAGE_TIMING_FIELDS: Final = frozenset(
     {"cold_p50_ms", "cold_p95_ms", "warm_p50_ms", "warm_p95_ms"}
 )
+_SOURCE_OPERATIONS: Final = {
+    "H1": frozenset({"acquire_inbound_token", "validate_inbound_token", "workload_token"}),
+    "H2": frozenset({"obo_token"}),
+    "H3": frozenset(
+        {"google_vault_token", "provider_expiry_unavailable", "fresh_token_comparison"}
+    ),
+    "H4a": frozenset({"user_isolation"}),
+    "H4b": frozenset({"workload_isolation"}),
+    "H6": frozenset(
+        {"synthetic_resource", "google_drive_metadata", "measure_latency", "measure_concurrency"}
+    ),
+    "H7": frozenset(
+        {
+            "measure_latency",
+            "measure_concurrency",
+            "expiry_issue",
+            "fresh_token_comparison",
+            "obo_after_inbound_expiry",
+            "audit_attribution",
+        }
+    ),
+    "H8": frozenset({"google_revocation_probe", "offboard_google"}),
+}
 
 
 class AssessmentError(ValueError):
@@ -53,26 +79,13 @@ class AssessmentError(ValueError):
 def load_terminal_results(evidence_path: Path) -> dict[str, str]:
     """Load exactly one explicit terminal observation for every hypothesis."""
 
-    try:
-        lines = Path(evidence_path).read_text(encoding="utf-8").splitlines()
-    except OSError as error:
-        raise AssessmentError("sanitized evidence is unavailable") from error
-
     terminal: dict[str, list[str]] = {hypothesis: [] for hypothesis in REQUIRED_HYPOTHESES}
-    for line_number, line in enumerate(lines, start=1):
-        if not line.strip():
-            raise AssessmentError(f"sanitized evidence has an empty row at line {line_number}")
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError as error:
-            raise AssessmentError(
-                f"sanitized evidence has invalid JSON at line {line_number}"
-            ) from error
-        _validate_row(row, line_number)
+    for row in load_sanitized_observations(evidence_path):
         if _is_terminal(row):
             hypothesis = row["hypothesis"]
-            if hypothesis in terminal:
-                terminal[hypothesis].append(row["outcome"])
+            outcome = row["outcome"]
+            if isinstance(hypothesis, str) and isinstance(outcome, str) and hypothesis in terminal:
+                terminal[hypothesis].append(outcome)
 
     missing = [hypothesis for hypothesis, outcomes in terminal.items() if not outcomes]
     ambiguous = [hypothesis for hypothesis, outcomes in terminal.items() if len(outcomes) != 1]
@@ -84,6 +97,95 @@ def load_terminal_results(evidence_path: Path) -> dict[str, str]:
             parts.append("expected exactly one terminal result for " + ", ".join(ambiguous))
         raise AssessmentError("; ".join(parts))
     return {hypothesis: outcomes[0] for hypothesis, outcomes in terminal.items()}
+
+
+def load_sanitized_observations(evidence_path: Path) -> tuple[dict[str, object], ...]:
+    """Load safe observations without retaining unvalidated provider responses."""
+
+    try:
+        lines = Path(evidence_path).read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise AssessmentError("sanitized evidence is unavailable") from error
+
+    observations: list[dict[str, object]] = []
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            raise AssessmentError(f"sanitized evidence has an empty row at line {line_number}")
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise AssessmentError(
+                f"sanitized evidence has invalid JSON at line {line_number}"
+            ) from error
+        _validate_row(row, line_number)
+        if not isinstance(row, dict):
+            raise AssessmentError(f"sanitized evidence row {line_number} is not an object")
+        observations.append(row)
+    return tuple(observations)
+
+
+def finalize_terminal_evidence(
+    evidence_path: Path,
+    result_selections: Sequence[str],
+    output_path: Path,
+    *,
+    h5_compatibility_reviewed: bool,
+) -> None:
+    """Write minimal terminal evidence selected against actual sanitized observations."""
+
+    selected_results = _parse_result_selections(result_selections)
+    observations = load_sanitized_observations(evidence_path)
+    if any(_is_terminal(row) for row in observations):
+        raise AssessmentError("terminal evidence must be finalized from nonterminal observations")
+    observed_operations = {
+        (hypothesis, operation)
+        for row in observations
+        for hypothesis, operation in [(row["hypothesis"], row["operation"])]
+        if isinstance(hypothesis, str) and isinstance(operation, str)
+    }
+    for hypothesis in REQUIRED_HYPOTHESES:
+        if hypothesis == "H5":
+            if not h5_compatibility_reviewed:
+                raise AssessmentError("H5 requires explicit compatibility review")
+        elif not any(
+            (hypothesis, operation) in observed_operations
+            for operation in _SOURCE_OPERATIONS[hypothesis]
+        ):
+            raise AssessmentError(f"missing source evidence for {hypothesis}")
+
+    rows = [
+        {
+            "hypothesis": hypothesis,
+            "operation": _TERMINAL_OPERATION,
+            "outcome": selected_results[hypothesis],
+            "details": {"terminal": True},
+        }
+        for hypothesis in REQUIRED_HYPOTHESES
+    ]
+    encoded = "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows)
+    atomic_write_text(output_path, encoded)
+
+
+def atomic_write_text(output_path: Path, content: str) -> None:
+    """Replace an assessment artifact atomically without weakening its file permissions."""
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output_path.name}.", suffix=".tmp", dir=output_path.parent
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as temporary_file:
+            temporary_file.write(content)
+        os.chmod(temporary_path, 0o600)
+        temporary_path.replace(output_path)
+    except OSError:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def decide(
@@ -160,10 +262,14 @@ def _validate_row(row: object, line_number: int) -> None:
         raise AssessmentError(
             f"sanitized evidence row {line_number} has an invalid observation shape"
         )
+    if _is_terminal(row) and outcome not in TERMINAL_OUTCOMES:
+        raise AssessmentError(
+            f"sanitized evidence row {line_number} has an invalid terminal outcome"
+        )
     _validate_measurements(details, line_number)
 
 
-def _is_terminal(row: Mapping[object, object]) -> bool:
+def _is_terminal(row: Mapping[str, object] | Mapping[object, object]) -> bool:
     details = row.get("details")
     return (
         row.get("operation") == _TERMINAL_OPERATION
@@ -216,6 +322,25 @@ def _normalize_field_name(key: str) -> str:
     snake_case = _ACRONYM_BOUNDARY.sub(r"\1_\2", key)
     snake_case = _CAMEL_CASE_BOUNDARY.sub(r"\1_\2", snake_case)
     return _FIELD_SEPARATOR.sub("_", snake_case).strip("_").casefold()
+
+
+def _parse_result_selections(result_selections: Sequence[str]) -> dict[str, str]:
+    selected: dict[str, str] = {}
+    for selection in result_selections:
+        hypothesis, separator, outcome = selection.partition("=")
+        if (
+            separator != "="
+            or hypothesis not in REQUIRED_HYPOTHESES
+            or outcome not in TERMINAL_OUTCOMES
+        ):
+            raise AssessmentError("results must use HYPOTHESIS=pass or HYPOTHESIS=fail")
+        if hypothesis in selected:
+            raise AssessmentError(f"duplicate terminal result for {hypothesis}")
+        selected[hypothesis] = outcome
+    missing = [hypothesis for hypothesis in REQUIRED_HYPOTHESES if hypothesis not in selected]
+    if missing:
+        raise AssessmentError("missing terminal results for " + ", ".join(missing))
+    return selected
 
 
 def _validate_stage_latency(value: object, line_number: int) -> None:

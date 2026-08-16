@@ -3,6 +3,7 @@ import json
 import pytest
 from typer.testing import CliRunner
 
+from agentcore_identity_poc import cli
 from agentcore_identity_poc.assessment import (
     AssessmentError,
     decide,
@@ -70,6 +71,21 @@ def test_rejects_ambiguous_terminal_results(tmp_path) -> None:
 
     with pytest.raises(AssessmentError, match="exactly one"):
         load_terminal_results(evidence)
+
+
+def test_rejects_markdown_terminal_outcome_before_report_rendering(tmp_path) -> None:
+    rows = [terminal_row(hypothesis) for hypothesis in passing_results()]
+    rows[0]["outcome"] = "pass | [injected](https://example.test)"
+    evidence = write_evidence(tmp_path, rows)
+    output = tmp_path / "assessment.md"
+
+    result = CliRunner().invoke(
+        app,
+        ["report", "--evidence", str(evidence), "--output", str(output)],
+    )
+
+    assert result.exit_code == 2
+    assert not output.exists()
 
 
 def test_rejects_unsafe_raw_evidence_before_assessing(tmp_path) -> None:
@@ -262,3 +278,161 @@ def test_report_rejects_only_the_custom_provider_path_when_h5_fails(tmp_path) ->
     rendered = output.read_text(encoding="utf-8")
     assert "**adopt_with_caveats**" in rendered
     assert "Custom-provider production path: **rejected**" in rendered
+
+
+def _nonterminal_rows() -> list[dict[str, object]]:
+    return [
+        {"hypothesis": "H1", "operation": "workload_token", "outcome": "pass", "details": {}},
+        {"hypothesis": "H2", "operation": "obo_token", "outcome": "pass", "details": {}},
+        {
+            "hypothesis": "H3",
+            "operation": "provider_expiry_unavailable",
+            "outcome": "fail",
+            "details": {},
+        },
+        {"hypothesis": "H4a", "operation": "user_isolation", "outcome": "pass", "details": {}},
+        {
+            "hypothesis": "H4b",
+            "operation": "workload_isolation",
+            "outcome": "pass",
+            "details": {},
+        },
+        {
+            "hypothesis": "H6",
+            "operation": "synthetic_resource",
+            "outcome": "pass",
+            "details": {},
+        },
+        {
+            "hypothesis": "H7",
+            "operation": "expiry_issue",
+            "outcome": "pass",
+            "details": {},
+        },
+        {"hypothesis": "H8", "operation": "offboard_google", "outcome": "pass", "details": {}},
+    ]
+
+
+def _result_arguments() -> list[str]:
+    arguments: list[str] = []
+    for hypothesis in passing_results():
+        arguments.extend(["--result", f"{hypothesis}=pass"])
+    return arguments
+
+
+def test_terminalization_creates_minimal_evidence_that_report_can_consume(tmp_path) -> None:
+    evidence = write_evidence(tmp_path, _nonterminal_rows())
+    terminal = tmp_path / "terminal.jsonl"
+    assessment = tmp_path / "assessment.md"
+
+    finalize = CliRunner().invoke(
+        app,
+        [
+            "assessment-finalize",
+            "--evidence",
+            str(evidence),
+            "--output",
+            str(terminal),
+            "--h5-compatibility-reviewed",
+            *_result_arguments(),
+        ],
+    )
+    report = CliRunner().invoke(
+        app,
+        [
+            "report",
+            "--evidence",
+            str(terminal),
+            "--output",
+            str(assessment),
+            "--iam-acceptable",
+            "--audit-acceptable",
+            "--latency-acceptable",
+            "--quota-acceptable",
+        ],
+    )
+
+    assert finalize.exit_code == 0
+    assert report.exit_code == 0
+    terminal_rows = [json.loads(line) for line in terminal.read_text(encoding="utf-8").splitlines()]
+    assert [row["hypothesis"] for row in terminal_rows] == list(passing_results())
+    assert all(row["operation"] == "assessment_terminal" for row in terminal_rows)
+    assert all(row["details"] == {"terminal": True} for row in terminal_rows)
+
+
+@pytest.mark.parametrize(
+    "result_arguments",
+    [
+        _result_arguments()[:-2],
+        _result_arguments() + ["--result", "H1=fail"],
+        [*(_result_arguments()[:-2]), "--result", "H8=unproven"],
+    ],
+)
+def test_terminalization_rejects_missing_duplicate_or_noncanonical_results(
+    tmp_path, result_arguments: list[str]
+) -> None:
+    evidence = write_evidence(tmp_path, _nonterminal_rows())
+    terminal = tmp_path / "terminal.jsonl"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "assessment-finalize",
+            "--evidence",
+            str(evidence),
+            "--output",
+            str(terminal),
+            "--h5-compatibility-reviewed",
+            *result_arguments,
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert not terminal.exists()
+
+
+def test_terminalization_rejects_evidence_from_the_wrong_hypothesis_operation(tmp_path) -> None:
+    rows = _nonterminal_rows()
+    rows[0]["operation"] = "synthetic_resource"
+    evidence = write_evidence(tmp_path, rows)
+    terminal = tmp_path / "terminal.jsonl"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "assessment-finalize",
+            "--evidence",
+            str(evidence),
+            "--output",
+            str(terminal),
+            "--h5-compatibility-reviewed",
+            *_result_arguments(),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert not terminal.exists()
+
+
+def test_report_failure_preserves_existing_output_and_redacts_filesystem_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    evidence = write_evidence(
+        tmp_path,
+        [terminal_row(hypothesis) for hypothesis in passing_results()],
+    )
+    output = tmp_path / "assessment.md"
+    output.write_text("known-good", encoding="utf-8")
+
+    def fail_write(*_args: object, **_kwargs: object) -> None:
+        raise OSError("do not disclose this path")
+
+    monkeypatch.setattr(cli, "atomic_write_text", fail_write)
+    result = CliRunner().invoke(
+        app,
+        ["report", "--evidence", str(evidence), "--output", str(output)],
+    )
+
+    assert result.exit_code == 2
+    assert output.read_text(encoding="utf-8") == "known-good"
+    assert result.stdout == '{"status":"blocked","category":"assessment_output_unavailable"}\n'
