@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
+import os
 import re
+import secrets
+import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal, Protocol
 
 PolicyMode = Literal["broad", "scoped"]
@@ -14,6 +22,9 @@ _RECOVERY_COMMAND = (
     ".venv/bin/python scripts/provision_agentcore.py --apply"
 )
 _DRIVE_MARKER_PATTERN = re.compile(r"[0-9a-f]{64}")
+_FINGERPRINT_PATTERN = re.compile(r"[0-9a-f]{64}")
+_JWT_SHAPED_PATTERN = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
+_EXPIRY_KINDS = frozenset({"inbound_jwt", "workload_token", "obo_token", "google_token"})
 
 
 class ExperimentConfigurationError(ValueError):
@@ -22,6 +33,14 @@ class ExperimentConfigurationError(ValueError):
 
 class ExperimentTimeout(RuntimeError):
     """IAM policy changes did not converge during the bounded observation window."""
+
+
+class MeasurementConfigurationError(ValueError):
+    """A measurement would create invalid or unsafe local evidence."""
+
+
+class RetryableMeasurementError(RuntimeError):
+    """An operation may be retried after a bounded backoff."""
 
 
 class PolicyRestorationError(RuntimeError):
@@ -68,6 +87,221 @@ class WorkloadAttempt:
     outcome: Outcome
     aws_error_category: str | None = None
     connection_marker: str | None = None
+
+
+@dataclass(frozen=True)
+class LatencySample:
+    """One sanitized timing result, labeled to expose cold versus warm behavior."""
+
+    cold: bool
+    latency_ms: int
+
+
+@dataclass(frozen=True)
+class LatencyReport:
+    """A bounded latency sample set and its nearest-rank percentiles."""
+
+    samples: tuple[LatencySample, ...]
+    p50_ms: int
+    p95_ms: int
+
+
+@dataclass(frozen=True)
+class ConcurrencyReport:
+    """Outcome summary for a bounded concurrent operation."""
+
+    completed: int
+    maximum_workers: int
+
+
+@dataclass(frozen=True)
+class ExpiryObservation:
+    """An in-memory token lifecycle observation; the token is never persisted."""
+
+    kind: str
+    token: str
+    issued_at: float
+    expires_at: float
+
+
+@dataclass(frozen=True)
+class StoredExpiryObservation:
+    """A token-safe persisted lifecycle observation."""
+
+    kind: str
+    issued_at: float
+    expires_at: float
+    fingerprint: str
+
+
+def measure_latency(
+    *,
+    samples: int,
+    operation: Callable[[bool], object],
+    clock: Callable[[], float] = time.monotonic,
+) -> LatencyReport:
+    """Measure one cold call then bounded warm calls without retaining operation results."""
+    if samples < 2 or samples > 100:
+        raise MeasurementConfigurationError("latency samples must be between 2 and 100")
+    results: list[LatencySample] = []
+    for index in range(samples):
+        started_at = clock()
+        operation(index == 0)
+        results.append(LatencySample(cold=index == 0, latency_ms=_elapsed_ms(clock() - started_at)))
+    latencies = sorted(sample.latency_ms for sample in results)
+    return LatencyReport(
+        samples=tuple(results),
+        p50_ms=_nearest_rank(latencies, 0.50),
+        p95_ms=_nearest_rank(latencies, 0.95),
+    )
+
+
+def measure_bounded_concurrency(
+    *, workers: int, requests: int, request: Callable[[int], object]
+) -> ConcurrencyReport:
+    """Execute a fixed number of requests while capping executor parallelism."""
+    if workers < 1 or workers > 20:
+        raise MeasurementConfigurationError("workers must be between 1 and 20")
+    if requests < 1 or requests > 200:
+        raise MeasurementConfigurationError("requests must be between 1 and 200")
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(request, index) for index in range(requests)]
+        for future in futures:
+            future.result()
+    return ConcurrencyReport(completed=requests, maximum_workers=min(workers, requests))
+
+
+def retry_with_backoff[T](
+    operation: Callable[[], T],
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    random_unit: Callable[[], float] | None = None,
+    max_attempts: int = 4,
+) -> T:
+    """Retry only explicit throttling failures using jittered exponential delays."""
+    if max_attempts < 1 or max_attempts > 5:
+        raise MeasurementConfigurationError("max attempts must be between 1 and 5")
+    random = random_unit or secrets.SystemRandom().random
+    for attempt in range(max_attempts):
+        try:
+            return operation()
+        except RetryableMeasurementError as error:
+            if attempt == max_attempts - 1:
+                raise
+            jitter = random()
+            if jitter < 0 or jitter > 1:
+                raise MeasurementConfigurationError(
+                    "retry jitter must be between zero and one"
+                ) from error
+            sleep(0.1 * (2**attempt) * (1 + jitter / 2))
+    raise AssertionError("retry loop must either return or raise")
+
+
+def token_fingerprint(token: str, *, run_salt: str) -> str:
+    """Return an opaque per-run SHA-256 fingerprint suitable for evidence."""
+    if not token or not run_salt:
+        raise MeasurementConfigurationError("tokens and run salt must be non-empty")
+    return hashlib.sha256(f"{run_salt}:{token}".encode()).hexdigest()
+
+
+def record_expiry_state(
+    path: Path,
+    *,
+    project_id: str,
+    entries: Sequence[ExpiryObservation],
+    run_salt: str | None = None,
+) -> float:
+    """Persist only token fingerprints and timestamps, then return the next resume time."""
+    if not project_id:
+        raise MeasurementConfigurationError("project ID must be non-empty")
+    if {entry.kind for entry in entries} != _EXPIRY_KINDS or len(entries) != len(_EXPIRY_KINDS):
+        raise MeasurementConfigurationError(
+            "expiry evidence requires one entry for each token kind"
+        )
+    if any(not entry.token or entry.expires_at < entry.issued_at for entry in entries):
+        raise MeasurementConfigurationError("expiry observations must have valid token timestamps")
+    salt = run_salt or secrets.token_urlsafe(32)
+    stored_entries = [
+        {
+            "kind": entry.kind,
+            "issued_at": entry.issued_at,
+            "expires_at": entry.expires_at,
+            "fingerprint": token_fingerprint(entry.token, run_salt=salt),
+        }
+        for entry in entries
+    ]
+    _write_private_json(path, {"project_id": project_id, "entries": stored_entries})
+    return min(entry.expires_at for entry in entries)
+
+
+def load_expiry_resume_state(path: Path, *, project_id: str) -> tuple[StoredExpiryObservation, ...]:
+    """Load an expiry resume state only when it is private and structurally token-safe."""
+    try:
+        if os.stat(path).st_mode & 0o777 != 0o600:
+            raise MeasurementConfigurationError("expiry resume state must use mode 0600")
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as error:
+        raise MeasurementConfigurationError("could not read expiry resume state") from error
+    except json.JSONDecodeError as error:
+        raise MeasurementConfigurationError("expiry resume state must be JSON") from error
+    if not isinstance(state, Mapping) or state.get("project_id") != project_id:
+        raise MeasurementConfigurationError(
+            "expiry resume state does not belong to current project"
+        )
+    entries = state.get("entries")
+    if not isinstance(entries, list) or len(entries) != len(_EXPIRY_KINDS):
+        raise MeasurementConfigurationError("expiry resume state entries are invalid")
+    results: list[StoredExpiryObservation] = []
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            raise MeasurementConfigurationError("expiry resume state entries are invalid")
+        kind = entry.get("kind")
+        issued_at = entry.get("issued_at")
+        expires_at = entry.get("expires_at")
+        fingerprint = entry.get("fingerprint")
+        if (
+            kind not in _EXPIRY_KINDS
+            or not isinstance(issued_at, int | float)
+            or not isinstance(expires_at, int | float)
+            or not isinstance(fingerprint, str)
+            or _JWT_SHAPED_PATTERN.fullmatch(fingerprint)
+            or not _FINGERPRINT_PATTERN.fullmatch(fingerprint)
+            or expires_at < issued_at
+        ):
+            raise MeasurementConfigurationError(
+                "expiry resume state contains JWT-shaped or invalid values"
+            )
+        results.append(
+            StoredExpiryObservation(kind, float(issued_at), float(expires_at), fingerprint)
+        )
+    if {entry.kind for entry in results} != _EXPIRY_KINDS:
+        raise MeasurementConfigurationError("expiry resume state token kinds are invalid")
+    return tuple(results)
+
+
+def _nearest_rank(values: Sequence[int], percentile: float) -> int:
+    if not values:
+        raise MeasurementConfigurationError("cannot calculate percentiles without samples")
+    return values[max(0, math.ceil(percentile * len(values)) - 1)]
+
+
+def _elapsed_ms(seconds: float) -> int:
+    return max(0, round(seconds * 1_000))
+
+
+def _write_private_json(path: Path, value: Mapping[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    temporary_path = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, separators=(",", ":"), sort_keys=True)
+            handle.write("\n")
+        temporary_path.replace(path)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
 
 
 class WorkloadPolicyManager(Protocol):

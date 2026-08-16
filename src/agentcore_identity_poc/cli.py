@@ -12,6 +12,7 @@ import time
 import webbrowser
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, NoReturn, Protocol, cast
 
@@ -23,6 +24,7 @@ from agentcore_identity_poc.agentcore import (
     AgentCoreError,
     AgentCoreIdentity,
     AgentCoreInternalError,
+    AgentCoreThrottled,
     AuthorizationRequired,
     OAuthToken,
 )
@@ -41,12 +43,21 @@ from agentcore_identity_poc.evidence import EvidenceWriter
 from agentcore_identity_poc.experiments import (
     ExperimentConfigurationError,
     ExperimentTimeout,
+    ExpiryObservation,
     MatrixRow,
+    MeasurementConfigurationError,
     PolicyRestorationError,
+    RetryableMeasurementError,
     WorkloadAttempt,
     WorkloadPolicyManager,
+    load_expiry_resume_state,
+    measure_bounded_concurrency,
+    measure_latency,
+    record_expiry_state,
+    retry_with_backoff,
     run_user_isolation,
     run_workload_isolation,
+    token_fingerprint,
 )
 from agentcore_identity_poc.jwt_validation import JwtPolicy, TokenRejected, make_http_jwks_loader
 from agentcore_identity_poc.models import JsonValue, Observation
@@ -60,6 +71,7 @@ _DEFAULT_GOOGLE_EVIDENCE_PATH = Path("evidence/phase-2.jsonl")
 _GOOGLE_DRIVE_METADATA_SCOPE = "https://www.googleapis.com/auth/drive.metadata.readonly"
 _POLICY_NAME = "agentcore-identity-poc-scoped"
 _STATE_PATH = Path(".poc-state.json")
+_DEFAULT_EXPIRY_STATE_PATH = Path(".poc-expiry-state.json")
 _SAFE_ALIAS_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 
 
@@ -117,9 +129,18 @@ class Runtime:
     google_drive: Callable[[Settings], GoogleDriveResourceClient] = lambda _: GoogleDriveClient()
     open_browser: Callable[[str], bool] = webbrowser.open
     random_urlsafe: Callable[[], str] = lambda: secrets.token_urlsafe(32)
+    sleep: Callable[[float], None] = time.sleep
+    random_unit: Callable[[], float] = secrets.SystemRandom().random
+    cloudtrail_events: Callable[[Settings, int], int] = (
+        lambda settings, lookback: _cloudtrail_event_count(settings, lookback)
+    )
 
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
+measure_app = typer.Typer(no_args_is_help=True)
+offboard_app = typer.Typer(no_args_is_help=True)
+app.add_typer(measure_app, name="measure")
+app.add_typer(offboard_app, name="offboard")
 
 
 @app.callback()
@@ -155,6 +176,315 @@ def preflight(json_output: Annotated[bool, typer.Option("--json")] = False) -> N
         )
     else:
         typer.echo("Local configuration is valid")
+
+
+@measure_app.command("latency")
+def measure_latency_command(
+    samples: Annotated[int, typer.Option("--samples")] = 10,
+    evidence_path: Annotated[Path, typer.Option()] = _DEFAULT_GOOGLE_EVIDENCE_PATH,
+) -> None:
+    """Record cold and warm workload-token latency without retaining tokens."""
+    runtime = runtime_factory()
+    try:
+        settings = runtime.load_settings()
+        writer = runtime.evidence_writer(evidence_path)
+        inbound_token, identity = _measurement_identity(runtime, settings, writer)
+        report = measure_latency(
+            samples=samples,
+            operation=lambda _: _retry_agentcore(
+                lambda: identity.workload_token(settings.agentcore_workload_name, inbound_token),
+                runtime,
+            ),
+            clock=runtime.clock,
+        )
+    except SettingsError as error:
+        _emit_configuration_failure(error, json_output=True)
+    except MeasurementConfigurationError as error:
+        _emit_blocked("configuration", _CONFIGURATION_EXIT, str(error))
+    except AgentCoreError:
+        _emit_blocked("identity_broker", _AGENTCORE_EXIT, "workload_token_unavailable")
+    _append(
+        writer,
+        "H7",
+        "measure_latency",
+        "pass",
+        {
+            "sample_count": len(report.samples),
+            "cold_sample_count": sum(sample.cold for sample in report.samples),
+            "warm_sample_count": sum(not sample.cold for sample in report.samples),
+            "p50_ms": report.p50_ms,
+            "p95_ms": report.p95_ms,
+        },
+    )
+    typer.echo(
+        _json_line(
+            {
+                "status": "pass",
+                "operation": "measure_latency",
+                "samples": len(report.samples),
+                "cold_samples": sum(sample.cold for sample in report.samples),
+                "warm_samples": sum(not sample.cold for sample in report.samples),
+                "p50_ms": report.p50_ms,
+                "p95_ms": report.p95_ms,
+            }
+        )
+    )
+
+
+@measure_app.command("concurrency")
+def measure_concurrency_command(
+    workers: Annotated[int, typer.Option("--workers")] = 5,
+    requests: Annotated[int, typer.Option("--requests")] = 20,
+    evidence_path: Annotated[Path, typer.Option()] = _DEFAULT_GOOGLE_EVIDENCE_PATH,
+) -> None:
+    """Measure workload-token throttling while bounding concurrent requests."""
+    runtime = runtime_factory()
+    try:
+        settings = runtime.load_settings()
+        writer = runtime.evidence_writer(evidence_path)
+        inbound_token, identity = _measurement_identity(runtime, settings, writer)
+        report = measure_bounded_concurrency(
+            workers=workers,
+            requests=requests,
+            request=lambda _: _retry_agentcore(
+                lambda: identity.workload_token(settings.agentcore_workload_name, inbound_token),
+                runtime,
+            ),
+        )
+    except SettingsError as error:
+        _emit_configuration_failure(error, json_output=True)
+    except MeasurementConfigurationError as error:
+        _emit_blocked("configuration", _CONFIGURATION_EXIT, str(error))
+    except AgentCoreError:
+        _emit_blocked("identity_broker", _AGENTCORE_EXIT, "workload_token_unavailable")
+    _append(
+        writer,
+        "H7",
+        "measure_concurrency",
+        "pass",
+        {"workers": report.maximum_workers, "requests": report.completed},
+    )
+    typer.echo(
+        _json_line(
+            {
+                "status": "pass",
+                "operation": "measure_concurrency",
+                "workers": report.maximum_workers,
+                "requests": report.completed,
+            }
+        )
+    )
+
+
+@measure_app.command("expiry")
+def measure_expiry_command(
+    resume_state: Annotated[Path, typer.Option("--resume-state")] = _DEFAULT_EXPIRY_STATE_PATH,
+    evidence_path: Annotated[Path, typer.Option()] = _DEFAULT_GOOGLE_EVIDENCE_PATH,
+) -> None:
+    """Issue distinct token types, save opaque lifecycle state, and exit for later resume."""
+    runtime = runtime_factory()
+    try:
+        settings = runtime.load_settings()
+        writer = runtime.evidence_writer(evidence_path)
+        project_id = _measurement_project_id(settings)
+        resumed = resume_state.exists()
+        if resumed:
+            prior_entries = load_expiry_resume_state(resume_state, project_id=project_id)
+            resume_at = min(entry.expires_at for entry in prior_entries)
+            if runtime.clock() < resume_at:
+                typer.echo(
+                    _json_line(
+                        {
+                            "status": "resume_required",
+                            "operation": "measure_expiry",
+                            "resume_at": resume_at,
+                        }
+                    )
+                )
+                return
+        entries = _issue_expiry_observations(runtime, settings, writer)
+        run_salt = runtime.random_urlsafe()
+        resume_at = record_expiry_state(
+            resume_state,
+            project_id=project_id,
+            entries=entries,
+            run_salt=run_salt,
+        )
+    except SettingsError as error:
+        _emit_configuration_failure(error, json_output=True)
+    except MeasurementConfigurationError as error:
+        _emit_blocked("configuration", _CONFIGURATION_EXIT, str(error))
+    except AgentCoreError:
+        _emit_blocked("identity_broker", _AGENTCORE_EXIT, "expiry_token_unavailable")
+    outcome = "pass" if resumed else "resume_required"
+    for entry in entries:
+        hypothesis = "H3" if entry.kind == "google_token" else "H7"
+        _append(
+            writer,
+            hypothesis,
+            "post_expiry_refresh" if resumed else "expiry_issue",
+            outcome,
+            {
+                "token_kind": entry.kind,
+                "issued_at": entry.issued_at,
+                "expires_at": entry.expires_at,
+                "fingerprint": token_fingerprint(entry.token, run_salt=run_salt),
+            },
+        )
+    typer.echo(
+        _json_line(
+            {
+                "status": outcome,
+                "operation": "measure_expiry",
+                "resume_at": resume_at,
+                "token_kinds": [entry.kind for entry in entries],
+            }
+        )
+    )
+
+
+@measure_app.command("cloudtrail")
+def measure_cloudtrail_command(
+    lookback_minutes: Annotated[int, typer.Option("--lookback-minutes")] = 30,
+    evidence_path: Annotated[Path, typer.Option()] = _DEFAULT_GOOGLE_EVIDENCE_PATH,
+) -> None:
+    """Record aggregate AgentCore CloudTrail activity without retaining event payloads."""
+    if lookback_minutes < 1 or lookback_minutes > 1_440:
+        _emit_blocked("configuration", _CONFIGURATION_EXIT, "lookback_minutes_must_be_1_to_1440")
+    runtime = runtime_factory()
+    try:
+        settings = runtime.load_settings()
+        writer = runtime.evidence_writer(evidence_path)
+        event_count = runtime.cloudtrail_events(settings, lookback_minutes)
+    except SettingsError as error:
+        _emit_configuration_failure(error, json_output=True)
+    except Exception:
+        _emit_blocked("identity_broker", _AGENTCORE_EXIT, "cloudtrail_lookup_unavailable")
+    _append(
+        writer,
+        "H7",
+        "measure_cloudtrail",
+        "pass",
+        {"lookback_minutes": lookback_minutes, "event_count": event_count},
+    )
+    typer.echo(
+        _json_line(
+            {
+                "status": "pass",
+                "operation": "measure_cloudtrail",
+                "lookback_minutes": lookback_minutes,
+                "event_count": event_count,
+            }
+        )
+    )
+
+
+@offboard_app.command("google")
+def offboard_google(
+    user_alias: Annotated[str, typer.Option("--user-alias")],
+    apply: Annotated[bool, typer.Option("--apply")] = False,
+    evidence_path: Annotated[Path, typer.Option()] = _DEFAULT_GOOGLE_EVIDENCE_PATH,
+) -> None:
+    """Test revocation and reauthentication; never delete a shared credential provider."""
+    if not apply:
+        _emit_blocked("configuration", _CONFIGURATION_EXIT, "offboard_google_requires_apply")
+    if not _SAFE_ALIAS_PATTERN.fullmatch(user_alias):
+        _emit_blocked("configuration", _CONFIGURATION_EXIT, "invalid_user_alias")
+    runtime = runtime_factory()
+    try:
+        settings = runtime.load_settings()
+        writer = runtime.evidence_writer(evidence_path)
+        inbound_token, identity = _measurement_identity(runtime, settings, writer)
+        workload_token = _retry_agentcore(
+            lambda: identity.workload_token(settings.agentcore_workload_name, inbound_token),
+            runtime,
+        )
+        _retry_agentcore(
+            lambda: identity.google_token(
+                workload_token,
+                settings.agentcore_google_provider,
+                [_GOOGLE_DRIVE_METADATA_SCOPE],
+                settings.google_return_url,
+                runtime.random_urlsafe(),
+                force_authentication=False,
+            ),
+            runtime,
+        )
+        _retry_agentcore(
+            lambda: identity.google_token(
+                workload_token,
+                settings.agentcore_google_provider,
+                [_GOOGLE_DRIVE_METADATA_SCOPE],
+                settings.google_return_url,
+                runtime.random_urlsafe(),
+                force_authentication=True,
+            ),
+            runtime,
+        )
+    except SettingsError as error:
+        _emit_configuration_failure(error, json_output=True)
+    except AgentCoreError:
+        _emit_blocked("identity_broker", _AGENTCORE_EXIT, "google_revocation_check_unavailable")
+
+    purge = getattr(identity, "purge_google_user_connection", None)
+    if callable(purge):
+        try:
+            purge(user_alias)
+        except Exception:
+            _append(
+                writer,
+                "H8",
+                "offboard_google",
+                "fail",
+                {"user_alias": user_alias, "detail": "per_user_purge_failed"},
+            )
+            typer.echo(
+                _json_line(
+                    {
+                        "status": "failed",
+                        "operation": "offboard_google",
+                        "hypothesis": "H8",
+                        "detail": "per_user_purge_failed",
+                    }
+                )
+            )
+            return
+        _append(
+            writer,
+            "H8",
+            "offboard_google",
+            "pass",
+            {"user_alias": user_alias, "detail": "per_user_purge_completed"},
+        )
+        typer.echo(
+            _json_line(
+                {
+                    "status": "pass",
+                    "operation": "offboard_google",
+                    "hypothesis": "H8",
+                    "detail": "per_user_purge_completed",
+                }
+            )
+        )
+        return
+
+    _append(
+        writer,
+        "H8",
+        "offboard_google",
+        "fail",
+        {"user_alias": user_alias, "detail": "per_user_purge_unavailable"},
+    )
+    typer.echo(
+        _json_line(
+            {
+                "status": "failed",
+                "operation": "offboard_google",
+                "hypothesis": "H8",
+                "detail": "per_user_purge_unavailable",
+            }
+        )
+    )
 
 
 @app.command("entra-obo")
@@ -812,6 +1142,104 @@ def _aws_error_category(error: AgentCoreError) -> str:
         "AgentCoreThrottled": "throttled",
         "AgentCoreValidationError": "validation",
     }.get(error.__class__.__name__, "internal")
+
+
+def _measurement_identity(
+    runtime: Runtime, settings: Settings, writer: ObservationSink
+) -> tuple[str, IdentityClient]:
+    try:
+        inbound_token = runtime.acquire_token(settings, typer.echo)
+        runtime.validate_token(settings, inbound_token)
+    except (EntraAuthError, TokenRejected):
+        _append(writer, "H1", "validate_inbound_token", "fail", {"category": "authentication"})
+        _emit_blocked("authentication", _AUTHENTICATION_EXIT, "inbound_token_rejected")
+    return inbound_token, runtime.agentcore(settings)
+
+
+def _retry_agentcore[R](operation: Callable[[], R], runtime: Runtime) -> R:
+    def retryable_operation() -> R:
+        try:
+            return operation()
+        except AgentCoreThrottled as error:
+            raise RetryableMeasurementError("agentcore_throttled") from error
+
+    return retry_with_backoff(
+        retryable_operation,
+        sleep=runtime.sleep,
+        random_unit=runtime.random_unit,
+    )
+
+
+def _issue_expiry_observations(
+    runtime: Runtime, settings: Settings, writer: ObservationSink
+) -> tuple[ExpiryObservation, ...]:
+    inbound_token, identity = _measurement_identity(runtime, settings, writer)
+    now = runtime.clock()
+    try:
+        claims = runtime.validate_token(settings, inbound_token)
+    except (EntraAuthError, TokenRejected):
+        _emit_blocked("authentication", _AUTHENTICATION_EXIT, "inbound_token_rejected")
+    inbound_expiry = claims.get("exp")
+    if not isinstance(inbound_expiry, int | float) or inbound_expiry < now:
+        raise MeasurementConfigurationError("inbound token must contain a future expiry timestamp")
+    workload_token = _retry_agentcore(
+        lambda: identity.workload_token(settings.agentcore_workload_name, inbound_token), runtime
+    )
+    obo_token = _retry_agentcore(
+        lambda: identity.obo_token(
+            workload_token,
+            settings.agentcore_microsoft_provider,
+            [settings.entra_downstream_scope],
+        ),
+        runtime,
+    )
+    google = _retry_agentcore(
+        lambda: identity.google_token(
+            workload_token,
+            settings.agentcore_google_provider,
+            [_GOOGLE_DRIVE_METADATA_SCOPE],
+            settings.google_return_url,
+            runtime.random_urlsafe(),
+        ),
+        runtime,
+    )
+    if isinstance(google, AuthorizationRequired):
+        _emit_authorization_required()
+    assumed_opaque_expiry = now + 3_600
+    return (
+        ExpiryObservation("inbound_jwt", inbound_token, now, float(inbound_expiry)),
+        ExpiryObservation("workload_token", workload_token, now, assumed_opaque_expiry),
+        ExpiryObservation("obo_token", obo_token, now, assumed_opaque_expiry),
+        ExpiryObservation("google_token", google.access_token, now, assumed_opaque_expiry),
+    )
+
+
+def _measurement_project_id(settings: Settings) -> str:
+    identity = ":".join(
+        (settings.aws_region, settings.agentcore_workload_name, settings.agentcore_google_provider)
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _cloudtrail_event_count(settings: Settings, lookback_minutes: int) -> int:
+    """Return only an aggregate count from CloudTrail; individual event payloads are discarded."""
+    client = boto3.client("cloudtrail", region_name=settings.aws_region)
+    start_time = datetime.now(UTC) - timedelta(minutes=lookback_minutes)
+    paginator = client.get_paginator("lookup_events")
+    count = 0
+    for page in paginator.paginate(
+        LookupAttributes=[
+            {
+                "AttributeKey": "EventSource",
+                "AttributeValue": "bedrock-agentcore.amazonaws.com",
+            }
+        ],
+        StartTime=start_time,
+    ):
+        events = page.get("Events", [])
+        if isinstance(events, list):
+            count += len(events)
+    return count
 
 
 class _InteractiveStdinError(ValueError):
