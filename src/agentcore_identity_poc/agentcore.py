@@ -91,7 +91,12 @@ _THROTTLING_CODES = frozenset(
     {"LimitExceededException", "Throttling", "ThrottlingException", "TooManyRequestsException"}
 )
 _VALIDATION_CODES = frozenset(
-    {"InvalidParameterException", "InvalidRequestException", "ValidationException"}
+    {
+        "InvalidParameterException",
+        "InvalidRequestException",
+        "ResourceNotFoundException",
+        "ValidationException",
+    }
 )
 _INTERNAL_CODES = frozenset(
     {
