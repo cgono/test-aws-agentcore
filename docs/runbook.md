@@ -96,10 +96,11 @@ redirect URI in Entra before beginning the browser callback test.
 
 Authorize the Google provider once for each of two test users through the callback service. Use
 opaque aliases, not email addresses or Entra object IDs; the aliases are the only user values
-written to evidence. The concrete H4a command acquires and validates two separate Entra JWTs,
-then requests an approved-workload token and aggregate-only Drive metadata for each user. By
-default it starts two device-code sign-ins. For noninteractive automation, pass exactly two JWTs
-on standard input in the same order as the aliases:
+written to evidence. The concrete H4a command acquires and validates two separate Entra JWTs and
+requires their verified `sub` claims to differ in memory before it requests an approved-workload
+token or Drive metadata. It never writes subjects to output or evidence. By default it starts two
+device-code sign-ins. For noninteractive automation, pass exactly two JWTs on standard input in
+the same order as the aliases:
 
 ```bash
 printf '%s\n%s\n' "$USER_A_JWT" "$USER_B_JWT" | \

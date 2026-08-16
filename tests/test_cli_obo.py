@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
 from typer.testing import CliRunner
@@ -73,7 +73,7 @@ def _runtime(
     *,
     settings: Callable[[], Settings] = lambda: SETTINGS,
     acquire_token: Callable[[Settings, Callable[[str], None]], str] | None = None,
-    validate_token: Callable[[Settings, str], None] | None = None,
+    validate_token: Callable[[Settings, str], Mapping[str, object]] | None = None,
     identity: FakeIdentity | None = None,
     resource: FakeResource | None = None,
     evidence: RecordingEvidence | None = None,
@@ -89,8 +89,9 @@ def _runtime(
         events.append("acquire")
         return "inbound-secret"
 
-    def default_validate(_: Settings, token: str) -> None:
+    def default_validate(_: Settings, token: str) -> Mapping[str, object]:
         events.append(f"validate:{token}")
+        return {"sub": "test-subject"}
 
     def default_check_reachability(settings: Settings) -> None:
         events.append(f"reachability:{settings.agentcore_workload_name}")

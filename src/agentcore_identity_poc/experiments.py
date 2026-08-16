@@ -79,17 +79,26 @@ def run_user_isolation(
     workload_name: str,
     provider: str,
     users: Sequence[tuple[str, str]],
-    validate_user: Callable[[str, str], None],
+    validate_user: Callable[[str, str], str],
     get_workload_token: Callable[[str, str], str],
     observe_connection: Callable[[str, str], WorkloadAttempt],
+    on_verified_subject_count: Callable[[int], None] | None = None,
 ) -> tuple[MatrixRow, ...]:
     """Validate two distinct users and record their independent vault observations."""
     if len(users) != 2 or len({alias for alias, _ in users}) != 2:
         raise ExperimentConfigurationError("H4a requires exactly two distinct validated users")
 
+    validated_users = tuple(
+        (user_alias, inbound_token, validate_user(user_alias, inbound_token))
+        for user_alias, inbound_token in users
+    )
+    if len({subject for _, _, subject in validated_users}) != 2:
+        raise ExperimentConfigurationError("H4a requires two distinct verified Entra subjects")
+    if on_verified_subject_count is not None:
+        on_verified_subject_count(2)
+
     rows: list[MatrixRow] = []
-    for user_alias, inbound_token in users:
-        validate_user(user_alias, inbound_token)
+    for user_alias, inbound_token, _ in validated_users:
         workload_token = get_workload_token(user_alias, inbound_token)
         attempt = observe_connection(user_alias, workload_token)
         rows.append(

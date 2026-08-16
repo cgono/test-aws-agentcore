@@ -106,7 +106,7 @@ class Runtime:
     load_settings: Callable[[], Settings]
     check_reachability: Callable[[Settings], None]
     acquire_token: Callable[[Settings, Callable[[str], None]], str]
-    validate_token: Callable[[Settings, str], None]
+    validate_token: Callable[[Settings, str], Mapping[str, object]]
     agentcore: Callable[[Settings], IdentityClient]
     downstream: Callable[[Settings], ResourceClient]
     clock: Callable[[], float]
@@ -384,6 +384,10 @@ def user_isolation(
         rows = _run_user_isolation(runtime, settings, users, writer)
     except (EntraAuthError, TokenRejected):
         _emit_blocked("authentication", _AUTHENTICATION_EXIT, "inbound_token_rejected")
+    except ExperimentConfigurationError:
+        _emit_blocked(
+            "authentication", _AUTHENTICATION_EXIT, "distinct_verified_subjects_required"
+        )
     except AgentCoreError:
         _emit_blocked("identity_broker", _AGENTCORE_EXIT, "google_token_unavailable")
 
@@ -559,6 +563,8 @@ def _run_user_isolation(
     settings: Settings,
     users: tuple[tuple[str, str], tuple[str, str]],
     writer: ObservationSink,
+    *,
+    on_verified_subject_count: Callable[[int], None] | None = None,
 ) -> tuple[MatrixRow, ...]:
     identity = runtime.agentcore(settings)
 
@@ -621,15 +627,18 @@ def _run_user_isolation(
         workload_name=settings.agentcore_workload_name,
         provider=settings.agentcore_google_provider,
         users=users,
-        validate_user=lambda _, token: runtime.validate_token(settings, token),
+        validate_user=lambda _, token: _validated_subject(runtime.validate_token(settings, token)),
         get_workload_token=lambda _, token: identity.workload_token(
             settings.agentcore_workload_name, token
         ),
         observe_connection=observe_connection,
+        on_verified_subject_count=on_verified_subject_count,
     )
 
 
-def run_live_user_isolation() -> tuple[MatrixRow, ...]:
+def run_live_user_isolation(
+    *, on_verified_subject_count: Callable[[int], None] | None = None
+) -> tuple[MatrixRow, ...]:
     """Run the opt-in H4a live path with two device-code authenticated users."""
     runtime = _default_runtime()
     settings = runtime.load_settings()
@@ -641,7 +650,13 @@ def run_live_user_isolation() -> tuple[MatrixRow, ...]:
         tokens_stdin=False,
     )
     writer = runtime.evidence_writer(_DEFAULT_GOOGLE_EVIDENCE_PATH)
-    rows = _run_user_isolation(runtime, settings, users, writer)
+    rows = _run_user_isolation(
+        runtime,
+        settings,
+        users,
+        writer,
+        on_verified_subject_count=on_verified_subject_count,
+    )
     for row in rows:
         _append(writer, "H4a", "user_isolation", row.outcome, row.as_details())
     return rows
@@ -917,9 +932,16 @@ def _acquire_device_code_token(settings: Settings, display: Callable[[str], None
     ).acquire(display)
 
 
-def _validate_inbound_token(settings: Settings, token: str) -> None:
+def _validated_subject(claims: Mapping[str, object]) -> str:
+    subject = claims.get("sub")
+    if not isinstance(subject, str) or not subject:
+        raise TokenRejected("Token rejected")
+    return subject
+
+
+def _validate_inbound_token(settings: Settings, token: str) -> Mapping[str, object]:
     jwks_url = f"https://login.microsoftonline.com/{settings.entra_tenant_id}/discovery/v2.0/keys"
-    JwtPolicy(
+    return JwtPolicy(
         issuer=settings.entra_issuer,
         audience=f"api://{settings.entra_api_client_id}",
         jwks_loader=make_http_jwks_loader(jwks_url),

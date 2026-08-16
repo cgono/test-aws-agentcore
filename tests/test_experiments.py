@@ -125,7 +125,7 @@ def test_user_isolation_records_each_distinct_validated_user() -> None:
         workload_name="approved-workload",
         provider="google-provider",
         users=(("user-a", "inbound-a"), ("user-b", "inbound-b")),
-        validate_user=lambda alias, _: validated.append(alias),
+        validate_user=lambda alias, _: validated.append(alias) or f"subject-{alias}",
         get_workload_token=lambda alias, token: workload_bindings.append((alias, token))
         or f"workload-for-{alias}",
         observe_connection=lambda alias, _: WorkloadAttempt(
@@ -139,6 +139,29 @@ def test_user_isolation_records_each_distinct_validated_user() -> None:
         ("user-a", "pass"),
         ("user-b", "pass"),
     ]
+
+
+def test_user_isolation_rejects_different_aliases_with_the_same_verified_subject() -> None:
+    validated: list[tuple[str, str]] = []
+    workload_bindings: list[tuple[str, str]] = []
+
+    with pytest.raises(
+        ExperimentConfigurationError, match="distinct verified Entra subjects"
+    ) as error:
+        run_user_isolation(
+            principal_alias="development-role",
+            workload_name="approved-workload",
+            provider="google-provider",
+            users=(("user-a", "first-jwt"), ("user-b", "refreshed-jwt")),
+            validate_user=lambda alias, token: validated.append((alias, token)) or "same-subject",
+            get_workload_token=lambda alias, token: workload_bindings.append((alias, token))
+            or "workload-token",
+            observe_connection=lambda _, __: WorkloadAttempt("pass"),
+        )
+
+    assert validated == [("user-a", "first-jwt"), ("user-b", "refreshed-jwt")]
+    assert workload_bindings == []
+    assert "same-subject" not in str(error.value)
 
 
 def test_h4b_rejects_rows_collected_under_different_aws_principals() -> None:

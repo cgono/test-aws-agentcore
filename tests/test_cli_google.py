@@ -101,7 +101,7 @@ def _runtime(
             load_settings=lambda: SETTINGS,
             check_reachability=lambda _: None,
             acquire_token=lambda _, __: "inbound-secret",
-            validate_token=lambda _, __: None,
+            validate_token=lambda _, __: {"sub": "test-subject"},
             agentcore=lambda _: fake_identity,
             downstream=lambda _: fake_drive,
             google_drive=lambda _: fake_drive,
@@ -212,7 +212,11 @@ def test_user_isolation_uses_two_validated_stdin_tokens_and_records_sanitized_h4
     )
     runtime, evidence = _runtime(identity=identity, drive=drive)
     validated_tokens: list[str] = []
-    runtime = replace(runtime, validate_token=lambda _, token: validated_tokens.append(token))
+    runtime = replace(
+        runtime,
+        validate_token=lambda _, token: validated_tokens.append(token)
+        or {"sub": f"subject-for-{token}"},
+    )
     monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)  # type: ignore[attr-defined]
 
     result = CliRunner().invoke(
@@ -254,6 +258,40 @@ def test_user_isolation_uses_two_validated_stdin_tokens_and_records_sanitized_h4
     assert "inbound-b" not in repr(rendered_evidence)
     assert "google-access-a" not in repr(rendered_evidence)
     assert "google-access-b" not in repr(rendered_evidence)
+
+
+def test_user_isolation_rejects_distinct_tokens_for_the_same_verified_subject(
+    monkeypatch: object,
+) -> None:
+    identity = FakeIdentity([OAuthToken("unused-google-access-token")])
+    drive = FakeDrive([DriveMetadata(1, {"application/pdf": 1})])
+    runtime, evidence = _runtime(identity=identity, drive=drive)
+    runtime = replace(runtime, validate_token=lambda _, __: {"sub": "same-entra-subject"})
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)  # type: ignore[attr-defined]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "user-isolation",
+            "--user-a-alias",
+            "user-a",
+            "--user-b-alias",
+            "user-b",
+            "--tokens-stdin",
+        ],
+        input="first-jwt\nrefreshed-jwt\n",
+    )
+
+    assert result.exit_code == 3
+    assert result.stdout == (
+        '{"status":"blocked","category":"authentication",'
+        '"detail":"distinct_verified_subjects_required"}\n'
+    )
+    assert identity.workload_tokens == []
+    assert evidence.observations == []
+    assert "same-entra-subject" not in result.output
+    assert "first-jwt" not in result.output
+    assert "refreshed-jwt" not in result.output
 
 
 def test_google_revoke_check_forces_one_new_authorization_after_drive_401(

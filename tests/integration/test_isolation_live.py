@@ -57,11 +57,13 @@ def test_live_flag_presence_requires_runtime(monkeypatch: pytest.MonkeyPatch) ->
 @pytest.mark.integration
 def test_live_user_isolation_records_two_distinct_validated_users() -> None:
     _require_live()
+    verified_subject_counts: list[int] = []
     try:
-        rows = run_live_user_isolation()
+        rows = run_live_user_isolation(on_verified_subject_count=verified_subject_counts.append)
     except ExperimentConfigurationError as error:
         pytest.fail(f"could not configure concrete H4a runner: {error}")
 
+    assert verified_subject_counts == [2]
     assert len(rows) == 2
     assert len({row.user_alias for row in rows}) == 2
     assert all(row.policy_mode == "scoped" for row in rows)
