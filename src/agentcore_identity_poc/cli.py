@@ -134,6 +134,7 @@ class Runtime:
     google_drive: Callable[[Settings], GoogleDriveResourceClient] = lambda _: GoogleDriveClient()
     open_browser: Callable[[str], bool] = webbrowser.open
     random_urlsafe: Callable[[], str] = lambda: secrets.token_urlsafe(32)
+    wall_clock: Callable[[], float] = time.time
     sleep: Callable[[float], None] = time.sleep
     random_unit: Callable[[], float] = secrets.SystemRandom().random
     cloudtrail_events: Callable[[Settings, int], int] = (
@@ -241,6 +242,15 @@ def measure_latency_command(
         _emit_blocked("configuration", _CONFIGURATION_EXIT, str(error))
     except AgentCoreError:
         _emit_blocked("identity_broker", _AGENTCORE_EXIT, "workload_token_unavailable")
+    except RetryableMeasurementError:
+        _append(writer, "H7", "measure_latency", "fail", {"category": "throttled"})
+        _emit_blocked("identity_broker", _AGENTCORE_EXIT, "measurement_throttled")
+    except DownstreamUnauthorized:
+        _append(writer, "H6", "measure_latency", "fail", {"category": "unauthorized"})
+        _emit_blocked("downstream_denied", _DOWNSTREAM_EXIT, "google_drive_unauthorized")
+    except DownstreamError:
+        _append(writer, "H6", "measure_latency", "fail", {"category": "denied"})
+        _emit_blocked("downstream_denied", _DOWNSTREAM_EXIT, "google_drive_denied")
     workload_cache_equivalent = len({item.workload_fingerprint for item in measurements}) == 1
     google_cache_equivalent = len({item.google_fingerprint for item in measurements}) == 1
     drive_result_equivalent = len({item.drive_marker for item in measurements}) == 1
@@ -318,6 +328,15 @@ def measure_concurrency_command(
         _emit_blocked("configuration", _CONFIGURATION_EXIT, str(error))
     except AgentCoreError:
         _emit_blocked("identity_broker", _AGENTCORE_EXIT, "workload_token_unavailable")
+    except RetryableMeasurementError:
+        _append(writer, "H7", "measure_concurrency", "fail", {"category": "throttled"})
+        _emit_blocked("identity_broker", _AGENTCORE_EXIT, "measurement_throttled")
+    except DownstreamUnauthorized:
+        _append(writer, "H6", "measure_concurrency", "fail", {"category": "unauthorized"})
+        _emit_blocked("downstream_denied", _DOWNSTREAM_EXIT, "google_drive_unauthorized")
+    except DownstreamError:
+        _append(writer, "H6", "measure_concurrency", "fail", {"category": "denied"})
+        _emit_blocked("downstream_denied", _DOWNSTREAM_EXIT, "google_drive_denied")
     workload_cache_equivalent = len({item.workload_fingerprint for item in measurements}) == 1
     google_cache_equivalent = len({item.google_fingerprint for item in measurements}) == 1
     drive_result_equivalent = len({item.drive_marker for item in measurements}) == 1
@@ -371,21 +390,16 @@ def measure_expiry_command(
         resume_at: float | None = None
         if resumed:
             prior_entries = load_expiry_resume_state(resume_state, project_id=project_id)
-            prior_google = next(entry for entry in prior_entries if entry.kind == "google_token")
-            if not prior_google.expiry_known:
-                typer.echo(
-                    _json_line(
-                        {
-                            "status": "unknown",
-                            "operation": "measure_expiry",
-                            "detail": "google_expiry_unknown",
-                            "resume_at": None,
-                        }
-                    )
-                )
-                return
-            resume_at = cast(float, prior_google.expires_at)
-            if runtime.clock() < resume_at:
+            now = runtime.wall_clock()
+            pending = [
+                entry.expires_at
+                for entry in prior_entries
+                if entry.kind != "google_token"
+                and entry.expires_at is not None
+                and entry.expires_at > now
+            ]
+            if pending:
+                resume_at = min(pending)
                 typer.echo(
                     _json_line(
                         {
@@ -396,19 +410,14 @@ def measure_expiry_command(
                                 entry.kind
                                 for entry in prior_entries
                                 if entry.expires_at is not None
-                                and entry.expires_at > runtime.clock()
+                                and entry.expires_at > now
                             ],
                         }
                     )
                 )
                 return
-        entries = _issue_expiry_observations(
-            runtime,
-            settings,
-            writer,
-            verify_google_drive=resumed,
-        )
-        now = runtime.clock()
+        entries = _issue_expiry_observations(runtime, settings, writer)
+        now = runtime.wall_clock()
         run_salt = _expiry_run_salt(project_id, min(entry.issued_at for entry in entries))
         comparisons: tuple[ExpiryComparison, ...] = ()
         if prior_entries:
@@ -437,10 +446,15 @@ def measure_expiry_command(
     for entry in entries:
         hypothesis = "H3" if entry.kind == "google_token" else "H7"
         comparison = comparisons_by_kind.get(entry.kind)
-        if comparison is None:
+        details: dict[str, JsonValue]
+        if entry.kind == "google_token":
+            outcome = "fail"
+            operation = "provider_expiry_unavailable"
+            details = {"token_kind": "google_token"}
+        elif comparison is None:
             outcome = "resume_required"
             operation = "expiry_issue"
-            details: dict[str, JsonValue] = {
+            details = {
                 "token_kind": entry.kind,
                 "issued_at": entry.issued_at,
                 "expires_at": entry.expires_at,
@@ -453,17 +467,9 @@ def measure_expiry_command(
                 and comparison.prior_expires_at is not None
                 and now >= comparison.prior_expires_at
             )
-            google_proven = (
-                entry.kind != "google_token"
-                or (
-                    entry.drive_metadata_observed
-                    and post_expiry
-                    and comparison.fingerprint_changed
-                )
-            )
             outcome = (
                 "pass"
-                if post_expiry and comparison.fingerprint_changed and google_proven
+                if post_expiry and comparison.fingerprint_changed
                 else "unknown"
             )
             operation = "post_expiry_refresh" if outcome == "pass" else "refresh_unproven"
@@ -1431,11 +1437,9 @@ def _issue_expiry_observations(
     runtime: Runtime,
     settings: Settings,
     writer: ObservationSink,
-    *,
-    verify_google_drive: bool = False,
 ) -> tuple[ExpiryObservation, ...]:
     inbound_token, identity = _measurement_identity(runtime, settings, writer)
-    now = runtime.clock()
+    now = runtime.wall_clock()
     try:
         claims = runtime.validate_token(settings, inbound_token)
     except (EntraAuthError, TokenRejected):
@@ -1466,17 +1470,7 @@ def _issue_expiry_observations(
     )
     if isinstance(google, AuthorizationRequired):
         _emit_authorization_required()
-    google_expiry = _supported_token_expiry(google.access_token)
-    drive_metadata_observed = False
-    if verify_google_drive:
-        drive = runtime.google_drive(settings)
-        try:
-            drive.list(google.access_token)
-            drive_metadata_observed = True
-        except DownstreamError:
-            drive_metadata_observed = False
-        finally:
-            _close_resource_client(drive)
+    google_expiry = None
     return (
         ExpiryObservation("inbound_jwt", inbound_token, now, float(inbound_expiry)),
         ExpiryObservation(
@@ -1488,7 +1482,7 @@ def _issue_expiry_observations(
             google.access_token,
             now,
             google_expiry,
-            drive_metadata_observed,
+            False,
         ),
     )
 
@@ -1505,19 +1499,8 @@ def _expiry_command_status(
     entries: tuple[ExpiryObservation, ...],
     now: float,
 ) -> str:
-    google = next(entry for entry in entries if entry.kind == "google_token")
-    comparison = comparisons.get("google_token")
-    if comparison is None:
-        return "resume_required" if google.expiry_known else "unknown"
-    if (
-        comparison.prior_expiry_known
-        and comparison.prior_expires_at is not None
-        and now >= comparison.prior_expires_at
-        and comparison.fingerprint_changed
-        and google.drive_metadata_observed
-    ):
-        return "pass"
-    return "unknown"
+    del comparisons, entries, now
+    return "unproven"
 
 
 def _expiry_run_salt(project_id: str, issued_at: float) -> str:
