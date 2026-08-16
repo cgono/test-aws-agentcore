@@ -6,6 +6,7 @@ from collections.abc import Mapping
 import pytest
 from fastapi.testclient import TestClient
 
+import agentcore_identity_poc.web as web
 from agentcore_identity_poc.agentcore import AuthorizationRequired
 from agentcore_identity_poc.config import Settings
 from agentcore_identity_poc.web import (
@@ -217,6 +218,52 @@ def test_consumed_nonces_are_pruned_after_cookie_expiry() -> None:
     clock[0] = 1_600.0
     assert cookies.consume({"nonce": "two", "expires_at": 2_200.0})
     assert cookies.consumed_nonces == {"two": 2_200.0}
+
+
+def test_consumed_nonces_fail_closed_at_capacity_without_evicting_live_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web, "_MAX_CONSUMED_NONCES", 2)
+    cookies = _SessionCookies(clock=lambda: 1_000.0, signing_key=b"x" * 32)
+
+    assert cookies.consume({"nonce": "first", "expires_at": 1_600.0})
+    assert cookies.consume({"nonce": "second", "expires_at": 1_600.0})
+    assert not cookies.consume({"nonce": "third", "expires_at": 1_600.0})
+    assert cookies.consumed_nonces == {"first": 1_600.0, "second": 1_600.0}
+    assert not cookies.consume({"nonce": "first", "expires_at": 1_600.0})
+
+
+def test_entra_callback_fails_closed_when_replay_store_is_full(
+    monkeypatch: pytest.MonkeyPatch, settings: Settings, fake_identity: FakeIdentity
+) -> None:
+    monkeypatch.setattr(web, "_MAX_CONSUMED_NONCES", 1)
+    nonces = iter(["first-nonce", "second-nonce"])
+    fake_msal = FakeMsal()
+    runtime = WebRuntime(
+        settings=settings,
+        msal=lambda _: fake_msal,
+        validate_token=lambda _: {},
+        identity=lambda _: fake_identity,
+        clock=lambda: 1_000.0,
+        random_urlsafe=lambda: next(nonces),
+    )
+    callback_client = TestClient(
+        create_app(runtime), base_url="https://callback.example.test"
+    )
+
+    callback_client.get("/connect", follow_redirects=False)
+    first_callback = callback_client.get(
+        "/auth/entra/callback?code=first-code&state=entra-state"
+    )
+    callback_client.get("/connect", follow_redirects=False)
+    exhausted_callback = callback_client.get(
+        "/auth/entra/callback?code=second-code&state=entra-state"
+    )
+
+    assert first_callback.status_code == 200
+    assert exhausted_callback.status_code == 400
+    assert "Max-Age=0" in exhausted_callback.headers["set-cookie"]
+    assert len(fake_msal.completed_flows) == 1
 
 
 def test_google_return_does_not_complete_without_live_browser_token(

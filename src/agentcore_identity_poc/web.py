@@ -12,6 +12,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from importlib.resources import files
+from threading import Lock
 from typing import Protocol, cast
 
 import boto3  # type: ignore[import-untyped]
@@ -29,6 +30,7 @@ from agentcore_identity_poc.config import Settings
 from agentcore_identity_poc.jwt_validation import JwtPolicy, make_http_jwks_loader
 
 _COOKIE_MAX_AGE_SECONDS = 600
+_MAX_CONSUMED_NONCES = 2_048
 _ENTRA_FLOW_COOKIE = "agentcore_entra_flow"
 _GOOGLE_STATE_COOKIE = "agentcore_google_state"
 _SESSION_STORAGE_KEY = "agentcore_entra_access_token"
@@ -83,6 +85,7 @@ class _SessionCookies:
     clock: Callable[[], float]
     signing_key: bytes = field(default_factory=lambda: secrets.token_bytes(32))
     consumed_nonces: dict[str, float] = field(default_factory=dict)
+    _lock: Lock = field(default_factory=Lock, init=False, repr=False)
 
     def encode(self, payload: Mapping[str, object]) -> str:
         body = _encode_json(dict(payload))
@@ -90,53 +93,56 @@ class _SessionCookies:
         return f"{_urlsafe(body)}.{_urlsafe(signature)}"
 
     def decode(self, value: str | None) -> dict[str, object] | None:
-        self._prune_consumed_nonces()
-        if not value or "." not in value:
-            return None
-        body_part, signature_part = value.split(".", 1)
-        try:
-            body = _urlsafe_decode(body_part)
-            actual_signature = _urlsafe_decode(signature_part)
-        except ValueError:
-            return None
-        expected_signature = hmac.new(self.signing_key, body, hashlib.sha256).digest()
-        if not hmac.compare_digest(actual_signature, expected_signature):
-            return None
-        try:
-            payload = json.loads(body)
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return None
-        if not isinstance(payload, dict):
-            return None
-        expires_at = payload.get("expires_at")
-        nonce = payload.get("nonce")
-        if (
-            not isinstance(expires_at, int | float)
-            or isinstance(expires_at, bool)
-            or expires_at <= self.clock()
-            or not isinstance(nonce, str)
-            or not nonce
-            or nonce in self.consumed_nonces
-        ):
-            return None
-        return payload
+        with self._lock:
+            self._prune_consumed_nonces()
+            if not value or "." not in value:
+                return None
+            body_part, signature_part = value.split(".", 1)
+            try:
+                body = _urlsafe_decode(body_part)
+                actual_signature = _urlsafe_decode(signature_part)
+            except ValueError:
+                return None
+            expected_signature = hmac.new(self.signing_key, body, hashlib.sha256).digest()
+            if not hmac.compare_digest(actual_signature, expected_signature):
+                return None
+            try:
+                payload = json.loads(body)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return None
+            if not isinstance(payload, dict):
+                return None
+            expires_at = payload.get("expires_at")
+            nonce = payload.get("nonce")
+            if (
+                not isinstance(expires_at, int | float)
+                or isinstance(expires_at, bool)
+                or expires_at <= self.clock()
+                or not isinstance(nonce, str)
+                or not nonce
+                or nonce in self.consumed_nonces
+            ):
+                return None
+            return payload
 
     def consume(self, payload: Mapping[str, object]) -> bool:
-        self._prune_consumed_nonces()
-        nonce = payload.get("nonce")
-        expires_at = payload.get("expires_at")
-        if (
-            not isinstance(nonce, str)
-            or not nonce
-            or nonce in self.consumed_nonces
-            or not isinstance(expires_at, int | float)
-            or isinstance(expires_at, bool)
-        ):
-            return False
-        self.consumed_nonces[nonce] = min(
-            float(expires_at), self.clock() + _COOKIE_MAX_AGE_SECONDS
-        )
-        return True
+        with self._lock:
+            self._prune_consumed_nonces()
+            nonce = payload.get("nonce")
+            expires_at = payload.get("expires_at")
+            if (
+                not isinstance(nonce, str)
+                or not nonce
+                or nonce in self.consumed_nonces
+                or len(self.consumed_nonces) >= _MAX_CONSUMED_NONCES
+                or not isinstance(expires_at, int | float)
+                or isinstance(expires_at, bool)
+            ):
+                return False
+            self.consumed_nonces[nonce] = min(
+                float(expires_at), self.clock() + _COOKIE_MAX_AGE_SECONDS
+            )
+            return True
 
     def _prune_consumed_nonces(self) -> None:
         now = self.clock()
