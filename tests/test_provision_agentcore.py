@@ -85,6 +85,11 @@ class PresentBudgetClient:
         return {"Budget": {"BudgetName": SETTINGS.aws_budget_name}}
 
 
+class NoBudgetCallsClient:
+    def describe_budget(self, **_: object) -> object:
+        raise AssertionError("budget API must not be called before local validation")
+
+
 class RecordingControlClient:
     def __init__(self) -> None:
         self.workloads: dict[str, dict[str, object]] = {}
@@ -305,6 +310,40 @@ def test_apply_rejects_missing_scoped_policy_prerequisites_before_creation(tmp_p
     assert control.calls == []
 
 
+def test_apply_rejects_missing_policy_prerequisites_before_budget_api(tmp_path: Path) -> None:
+    with pytest.raises(ProvisioningError, match="all required for policy install"):
+        apply_resources(
+            SETTINGS,
+            "123456789012",
+            budgets_client=NoBudgetCallsClient(),
+            control_client=NoControlCallsClient(),
+            state_path=tmp_path / ".poc-state.json",
+            entra_client_secret="not-logged",
+            vault_arn="arn:vault:returned",
+            iam_client=RecordingIamClient(),
+            iam_role_name="agentcore-poc-role",
+        )
+
+
+def test_apply_cli_rejects_invalid_policy_environment_before_aws_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "scripts.provision_agentcore.Settings.from_mapping", lambda _: SETTINGS
+    )
+    monkeypatch.delenv("AGENTCORE_DIRECTORY_ARN", raising=False)
+    monkeypatch.setenv("AGENTCORE_TOKEN_VAULT_ARN", "arn:vault:returned")
+    monkeypatch.setenv("AGENTCORE_POC_IAM_ROLE_NAME", "agentcore-poc-role")
+    monkeypatch.setattr(
+        "scripts.provision_agentcore.boto3.session.Session",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("AWS session must not be created before local validation")
+        ),
+    )
+
+    assert main(["--apply"]) == 2
+
+
 @pytest.mark.parametrize(
     ("directory_arn", "vault_arn", "iam_role_name"),
     [
@@ -313,7 +352,7 @@ def test_apply_rejects_missing_scoped_policy_prerequisites_before_creation(tmp_p
         ("arn:directory:returned", "arn:vault:returned", ""),
     ],
 )
-def test_apply_rejects_blank_policy_prerequisites_before_control_plane_calls(
+def test_apply_rejects_blank_policy_prerequisites_before_aws_calls(
     tmp_path: Path,
     directory_arn: str,
     vault_arn: str,
@@ -325,7 +364,7 @@ def test_apply_rejects_blank_policy_prerequisites_before_control_plane_calls(
         apply_resources(
             SETTINGS,
             "123456789012",
-            budgets_client=PresentBudgetClient(),
+            budgets_client=NoBudgetCallsClient(),
             control_client=NoControlCallsClient(),
             state_path=state_path,
             entra_client_secret="not-logged",

@@ -126,18 +126,13 @@ def apply_resources(
     iam_role_name: str | None = None,
 ) -> dict[str, object]:
     """Create absent POC resources and persist only their returned identifiers."""
-    verify_budget(budgets_client, account_id, settings.aws_budget_name)
-
-    if (
-        not _is_nonempty_string(directory_arn)
-        or not _is_nonempty_string(vault_arn)
-        or iam_client is None
-        or not _is_nonempty_string(iam_role_name)
-    ):
+    validate_policy_prerequisites(directory_arn, vault_arn, iam_role_name)
+    if iam_client is None:
         raise ProvisioningError(
             "directory ARN, vault ARN, IAM client, and IAM role name are all required "
             "for policy install"
         )
+    verify_budget(budgets_client, account_id, settings.aws_budget_name)
 
     provider = _find_provider(control_client, settings.agentcore_microsoft_provider)
     secret = entra_client_secret if entra_client_secret is not None else os.environ.get(
@@ -207,6 +202,21 @@ def _state_string(state: Mapping[str, object], field: str) -> str:
 
 def _is_nonempty_string(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip())
+
+
+def validate_policy_prerequisites(
+    directory_arn: str | None, vault_arn: str | None, iam_role_name: str | None
+) -> None:
+    """Reject incomplete local provisioning inputs before any AWS API is contacted."""
+    if not (
+        _is_nonempty_string(directory_arn)
+        and _is_nonempty_string(vault_arn)
+        and _is_nonempty_string(iam_role_name)
+    ):
+        raise ProvisioningError(
+            "directory ARN, vault ARN, IAM client, and IAM role name are all required "
+            "for policy install"
+        )
 
 
 def _ensure_workload(client: ControlPlaneClient, name: str) -> dict[str, object]:
@@ -424,6 +434,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    directory_arn = os.environ.get("AGENTCORE_DIRECTORY_ARN")
+    vault_arn = os.environ.get("AGENTCORE_TOKEN_VAULT_ARN")
+    iam_role_name = os.environ.get("AGENTCORE_POC_IAM_ROLE_NAME")
+    try:
+        validate_policy_prerequisites(directory_arn, vault_arn, iam_role_name)
+    except ProvisioningError as error:
+        print(str(error))
+        return 2
+
     session = boto3.session.Session(region_name=settings.aws_region)
     account_id = args.account_id or session.client("sts").get_caller_identity()["Account"]
     try:
@@ -436,12 +455,10 @@ def main(argv: list[str] | None = None) -> int:
                 session.client("bedrock-agentcore-control", region_name=settings.aws_region),
             ),
             state_path=args.state_path,
-            directory_arn=os.environ.get("AGENTCORE_DIRECTORY_ARN"),
-            vault_arn=os.environ.get("AGENTCORE_TOKEN_VAULT_ARN"),
-            iam_client=cast(IamPolicyClient, session.client("iam"))
-            if os.environ.get("AGENTCORE_POC_IAM_ROLE_NAME")
-            else None,
-            iam_role_name=os.environ.get("AGENTCORE_POC_IAM_ROLE_NAME"),
+            directory_arn=directory_arn,
+            vault_arn=vault_arn,
+            iam_client=cast(IamPolicyClient, session.client("iam")),
+            iam_role_name=iam_role_name,
         )
     except ProvisioningError as error:
         print(str(error))
