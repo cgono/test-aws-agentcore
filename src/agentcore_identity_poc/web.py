@@ -292,7 +292,9 @@ def create_production_app() -> FastAPI:
     jwks_url = f"https://login.microsoftonline.com/{settings.entra_tenant_id}/discovery/v2.0/keys"
     policy = JwtPolicy(
         issuer=settings.entra_issuer,
-        audience=f"api://{settings.entra_api_client_id}",
+        # Entra v2.0 tokens carry the bare client-ID GUID as `aud`, not the
+        # `api://<client-id>` URI form; accept both per Microsoft's own guidance.
+        audience=(settings.entra_api_client_id, f"api://{settings.entra_api_client_id}"),
         jwks_loader=make_http_jwks_loader(jwks_url),
     )
     return create_app(
@@ -328,9 +330,15 @@ def _validated_claims(claims: Mapping[str, object], settings: Settings) -> dict[
     issuer = claims.get("iss")
     audience = claims.get("aud")
     subject = claims.get("sub")
-    expected_audience = f"api://{settings.entra_api_client_id}"
-    audience_matches = audience == expected_audience or (
-        isinstance(audience, list) and expected_audience in audience
+    # Entra v2.0 tokens carry the bare client-ID GUID as `aud`, not the
+    # `api://<client-id>` URI form; accept both per Microsoft's own guidance.
+    expected_audiences = {
+        settings.entra_api_client_id,
+        f"api://{settings.entra_api_client_id}",
+    }
+    audience_matches = audience in expected_audiences or (
+        isinstance(audience, list)
+        and any(value in expected_audiences for value in audience)
     )
     if (
         issuer != settings.entra_issuer

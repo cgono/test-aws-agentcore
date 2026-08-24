@@ -65,6 +65,26 @@ def test_rejects_wrong_audience(policy: JwtPolicy, token_factory: Callable[..., 
         policy.validate(token_factory(aud="api://other-resource"))
 
 
+def test_accepts_any_of_multiple_configured_audiences(
+    jwk: dict[str, Any], token_factory: Callable[..., str]
+) -> None:
+    # Entra v2.0 tokens carry the bare client-ID GUID as `aud`, not the
+    # `api://<client-id>` URI form; a policy configured for both must accept either.
+    policy = JwtPolicy(
+        issuer=ISSUER,
+        audience=("agentcore-resource", AUDIENCE),
+        jwks_loader=lambda: {"keys": [jwk]},
+    )
+
+    claims = policy.validate(token_factory(aud="agentcore-resource"))
+
+    assert claims["sub"] == "subject-123"
+    assert policy.validate(token_factory(aud=AUDIENCE))["sub"] == "subject-123"
+
+    with pytest.raises(TokenRejected):
+        policy.validate(token_factory(aud="api://unrelated"))
+
+
 def test_rejects_expired_token(policy: JwtPolicy, token_factory: Callable[..., str]) -> None:
     with pytest.raises(TokenRejected):
         policy.validate(token_factory(exp=datetime.now(UTC) - timedelta(minutes=1)))

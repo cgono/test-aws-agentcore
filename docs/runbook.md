@@ -14,8 +14,10 @@ Create three Entra registrations:
 3. A downstream resource API with the delegated `access_as_user` scope used by
    `ENTRA_DOWNSTREAM_SCOPE` and `RESOURCE_API_AUDIENCE`.
 
-Before a live run, inspect the inbound access token: its `aud` must equal
-`api://<ENTRA_API_CLIENT_ID>`, and the public CLI client must already be pre-authorized. A
+Before a live run, inspect the inbound access token: its `aud` will be the bare
+`ENTRA_API_CLIENT_ID` GUID (Entra v2.0 access tokens never carry the `api://<client-id>`
+Application ID URI form as `aud`, regardless of how "Expose an API" is configured — the
+validator accepts either form), and the public CLI client must already be pre-authorized. A
 consent prompt is a failed Phase 1 condition.
 
 ## Phase 0: Local Verification

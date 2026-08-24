@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
@@ -69,10 +69,19 @@ def _is_public_rsa_jwk(value: object) -> bool:
 
 @dataclass(frozen=True)
 class JwtPolicy:
-    """Validate bearer JWTs against exactly one Entra issuer and audience."""
+    """Validate bearer JWTs against exactly one Entra issuer and one of the accepted
+    audience values.
+
+    Entra v2.0 access tokens carry the bare application (client) ID GUID as ``aud``,
+    never the ``api://<client-id>`` Application ID URI form, regardless of how the API
+    app's "Expose an API" identifier URI is configured. Microsoft's own guidance is that
+    resource APIs should accept both forms
+    (https://learn.microsoft.com/entra/identity-platform/access-token-claims-reference),
+    so ``audience`` accepts either a single value or a set of acceptable values.
+    """
 
     issuer: str
-    audience: str
+    audience: str | Sequence[str]
     jwks_loader: JwksLoader
     clock: Callable[[], float] = time.monotonic
     _cached_jwks: Jwks | None = field(default=None, init=False, compare=False, repr=False)

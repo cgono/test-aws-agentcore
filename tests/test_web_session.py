@@ -138,7 +138,9 @@ def test_production_factory_wires_settings_msal_jwks_and_agentcore(
     captured: dict[str, object] = {}
 
     class FakePolicy:
-        def __init__(self, *, issuer: str, audience: str, jwks_loader: object) -> None:
+        def __init__(
+            self, *, issuer: str, audience: str | tuple[str, ...], jwks_loader: object
+        ) -> None:
             captured["issuer"] = issuer
             captured["audience"] = audience
             captured["jwks_loader"] = jwks_loader
@@ -191,7 +193,9 @@ def test_production_factory_wires_settings_msal_jwks_and_agentcore(
     assert isinstance(runtime, WebRuntime)
     assert runtime.settings is settings
     assert captured["issuer"] == settings.entra_issuer
-    assert captured["audience"] == "api://middle-tier-client"
+    # Entra v2.0 tokens carry the bare client-ID GUID as `aud`, not the `api://`
+    # URI form; the production factory must accept either.
+    assert captured["audience"] == ("middle-tier-client", "api://middle-tier-client")
     assert captured["jwks_url"] == (
         "https://login.microsoftonline.com/tenant-id/discovery/v2.0/keys"
     )
@@ -205,6 +209,38 @@ def test_production_factory_wires_settings_msal_jwks_and_agentcore(
     assert captured["service_name"] == "bedrock-agentcore"
     assert captured["region_name"] == "us-west-2"
     assert identity.__class__.__name__ == "AgentCoreIdentity"
+
+
+def test_validated_claims_accepts_bare_client_id_audience(settings: Settings) -> None:
+    # Entra v2.0 tokens carry the bare client-ID GUID as `aud`, never the
+    # `api://<client-id>` URI form; this is the real-world shape.
+    claims = web._validated_claims(
+        {"iss": settings.entra_issuer, "aud": settings.entra_api_client_id, "sub": "user-a"},
+        settings,
+    )
+
+    assert claims == {"sub": "user-a"}
+
+
+def test_validated_claims_accepts_uri_form_audience(settings: Settings) -> None:
+    claims = web._validated_claims(
+        {
+            "iss": settings.entra_issuer,
+            "aud": f"api://{settings.entra_api_client_id}",
+            "sub": "user-a",
+        },
+        settings,
+    )
+
+    assert claims == {"sub": "user-a"}
+
+
+def test_validated_claims_rejects_unrelated_audience(settings: Settings) -> None:
+    with pytest.raises(ValueError, match="token claims rejected"):
+        web._validated_claims(
+            {"iss": settings.entra_issuer, "aud": "some-other-client", "sub": "user-a"},
+            settings,
+        )
 
 
 def test_consumed_nonces_are_pruned_after_cookie_expiry() -> None:

@@ -2053,7 +2053,9 @@ def _validate_inbound_token(settings: Settings, token: str) -> Mapping[str, obje
     jwks_url = f"https://login.microsoftonline.com/{settings.entra_tenant_id}/discovery/v2.0/keys"
     return JwtPolicy(
         issuer=settings.entra_issuer,
-        audience=f"api://{settings.entra_api_client_id}",
+        # Entra v2.0 tokens carry the bare client-ID GUID as `aud`, not the
+        # `api://<client-id>` URI form; accept both per Microsoft's own guidance.
+        audience=(settings.entra_api_client_id, f"api://{settings.entra_api_client_id}"),
         jwks_loader=make_http_jwks_loader(jwks_url),
     ).validate(token)
 
