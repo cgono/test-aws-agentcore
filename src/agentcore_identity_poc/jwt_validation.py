@@ -22,6 +22,20 @@ class TokenRejected(ValueError):
     """A bearer token could not be accepted under the configured policy."""
 
 
+def audience_variants(value: str) -> tuple[str, ...]:
+    """Return both the bare client-ID and ``api://<client-id>`` forms of an audience.
+
+    Entra v2.0 access tokens always carry the bare application (client) ID GUID as
+    ``aud``, never the ``api://<client-id>`` Application ID URI form, regardless of
+    how the API app's "Expose an API" identifier is configured. Accept whichever form
+    a caller already has configured and return both, deduplicated, so a ``JwtPolicy``
+    built from either convention validates real tokens.
+    """
+    bare = value.removeprefix("api://")
+    uri = value if value.startswith("api://") else f"api://{value}"
+    return (bare, uri) if bare != uri else (bare,)
+
+
 def make_http_jwks_loader(jwks_url: str, client: httpx.Client | None = None) -> JwksLoader:
     """Return a loader that obtains only public RSA signing JWKs over HTTPS."""
     _require_absolute_https_url(jwks_url)

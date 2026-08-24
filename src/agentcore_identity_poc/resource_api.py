@@ -9,7 +9,12 @@ from typing import Annotated
 from fastapi import FastAPI, Header, HTTPException, status
 
 from agentcore_identity_poc.config import Settings
-from agentcore_identity_poc.jwt_validation import JwtPolicy, TokenRejected, make_http_jwks_loader
+from agentcore_identity_poc.jwt_validation import (
+    JwtPolicy,
+    TokenRejected,
+    audience_variants,
+    make_http_jwks_loader,
+)
 
 
 def create_resource_app(
@@ -53,10 +58,15 @@ def create_app() -> FastAPI:
     jwks_url = f"https://login.microsoftonline.com/{settings.entra_tenant_id}/discovery/v2.0/keys"
     policy = JwtPolicy(
         issuer=settings.entra_issuer,
-        audience=settings.resource_api_audience,
+        audience=audience_variants(settings.resource_api_audience),
         jwks_loader=make_http_jwks_loader(jwks_url),
     )
-    return create_resource_app(policy, settings.entra_downstream_scope)
+    # Entra puts only the short scope name (e.g. "access_as_user") in the `scp`
+    # claim, never the full `api://<client-id>/access_as_user` URI used to request
+    # or configure the scope. See:
+    # https://learn.microsoft.com/entra/identity-platform/access-token-claims-reference
+    delegated_scope = settings.entra_downstream_scope.rsplit("/", 1)[-1]
+    return create_resource_app(policy, delegated_scope)
 
 
 def _extract_bearer_token(authorization: str | None) -> str:

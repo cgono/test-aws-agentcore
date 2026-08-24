@@ -10,7 +10,12 @@ import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from agentcore_identity_poc.jwt_validation import JwtPolicy, TokenRejected, make_http_jwks_loader
+from agentcore_identity_poc.jwt_validation import (
+    JwtPolicy,
+    TokenRejected,
+    audience_variants,
+    make_http_jwks_loader,
+)
 
 ISSUER = "https://login.microsoftonline.com/example-tenant/v2.0"
 AUDIENCE = "api://agentcore-resource"
@@ -214,6 +219,20 @@ def test_http_jwks_loader_rejects_malformed_responses(body: object) -> None:
 
         with pytest.raises(ValueError):
             loader()
+
+
+def test_audience_variants_adds_the_uri_form_to_a_bare_client_id() -> None:
+    assert audience_variants("agentcore-resource") == (
+        "agentcore-resource",
+        "api://agentcore-resource",
+    )
+
+
+def test_audience_variants_adds_the_bare_form_to_a_uri() -> None:
+    assert audience_variants("api://agentcore-resource") == (
+        "agentcore-resource",
+        "api://agentcore-resource",
+    )
 
 
 def test_http_jwks_loader_propagates_http_errors() -> None:

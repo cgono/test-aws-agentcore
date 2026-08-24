@@ -9,8 +9,9 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 
+from agentcore_identity_poc.config import Settings
 from agentcore_identity_poc.jwt_validation import JwtPolicy
-from agentcore_identity_poc.resource_api import create_resource_app
+from agentcore_identity_poc.resource_api import create_app, create_resource_app
 
 ISSUER = "https://login.microsoftonline.com/example-tenant/v2.0"
 AUDIENCE = "api://agentcore-resource"
@@ -98,3 +99,61 @@ def test_metadata_requires_bearer_authentication(
 
     assert response.status_code == 401
     assert "authorization" not in response.text.lower()
+
+
+def test_production_factory_derives_audience_variants_and_short_scope_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        aws_region="us-west-2",
+        aws_budget_name="poc-budget",
+        entra_tenant_id="tenant-id",
+        entra_public_client_id="public-client",
+        entra_api_client_id="middle-tier-client",
+        entra_downstream_scope="api://resource-app-id/access_as_user",
+        agentcore_workload_name="approved-workload",
+        agentcore_second_workload_name="unapproved-workload",
+        agentcore_microsoft_provider="microsoft-provider",
+        agentcore_google_provider="google-provider",
+        resource_api_audience="api://resource-app-id",
+        resource_api_url="https://resource.example.test/metadata",
+        public_base_url="https://callback.example.test",
+    )
+    captured: dict[str, object] = {}
+
+    class FakePolicy:
+        def __init__(self, *, issuer: str, audience: object, jwks_loader: object) -> None:
+            captured["issuer"] = issuer
+            captured["audience"] = audience
+            captured["jwks_loader"] = jwks_loader
+
+    def fake_create_resource_app(policy: object, delegated_scope: str) -> str:
+        captured["policy"] = policy
+        captured["delegated_scope"] = delegated_scope
+        return "the-app"
+
+    monkeypatch.setattr(
+        "agentcore_identity_poc.resource_api.Settings.from_mapping", lambda _: settings
+    )
+    monkeypatch.setattr("agentcore_identity_poc.resource_api.JwtPolicy", FakePolicy)
+    monkeypatch.setattr(
+        "agentcore_identity_poc.resource_api.make_http_jwks_loader",
+        lambda url: captured.setdefault("jwks_url", url),
+    )
+    monkeypatch.setattr(
+        "agentcore_identity_poc.resource_api.create_resource_app", fake_create_resource_app
+    )
+
+    app = create_app()
+
+    assert app == "the-app"
+    assert captured["issuer"] == settings.entra_issuer
+    # Entra puts the bare client-ID GUID in `aud`, not the `api://` URI form
+    # configured for RESOURCE_API_AUDIENCE; both must be accepted.
+    assert captured["audience"] == ("resource-app-id", "api://resource-app-id")
+    assert captured["jwks_url"] == (
+        "https://login.microsoftonline.com/tenant-id/discovery/v2.0/keys"
+    )
+    # Entra puts only the short scope name in `scp`, never the full
+    # api://<client-id>/access_as_user URI used to request the scope.
+    assert captured["delegated_scope"] == "access_as_user"
