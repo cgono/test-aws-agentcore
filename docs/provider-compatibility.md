@@ -17,6 +17,23 @@ and its [client-authentication reference](https://docs.aws.amazon.com/bedrock-ag
 | Custom parameters | **Unknown.** PingOne documents token exchange inputs but tenant policy determines optional audience and actor behavior ([source](https://docs.pingidentity.com/pingone/use_cases/p1_oauth_2_token_exchange.html)). **Consequence:** use a smallest mock only for an unresolved concrete parameter behavior; do not infer it. | **Unknown.** AD FS requires OBO `assertion`, `requested_token_use`, and `resource` inputs ([source](https://learn.microsoft.com/en-us/windows-server/identity/ad-fs/overview/ad-fs-openid-connect-oauth-flows-scenarios)), but no direct AgentCore Identity request/control-plane source proves arbitrary parameter forwarding. **Consequence:** this is a blocking proof item; do not infer support from AgentCore Gateway documentation. |
 | Outbound web identity federation | **Unknown.** AgentCore's AWS IAM JWT mode requires account-level outbound web identity federation and `sts:GetWebIdentityToken` ([source](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/client-auth-methods.html)). **Consequence:** cloud-team enablement is necessary, and PingOne acceptance of the AWS JWT remains unproven. | **Unknown.** AD FS documents its own certificate client assertion, not trust of an AWS IAM ID-token JWT ([source](https://learn.microsoft.com/en-us/windows-server/identity/ad-fs/overview/ad-fs-openid-connect-oauth-flows-scenarios)). **Consequence:** do not select AgentCore AWS IAM JWT client auth without an AD FS trust proof; use a documented secret mode or reject this path. |
 
+## AWS-side IAM prerequisite (proven in the POC, applies to both providers)
+
+Independent of which vendor is used, AgentCore Identity stores every OAuth2 credential provider's
+client secret in an AWS-managed Secrets Manager secret and authorizes `GetResourceOauth2Token`
+against `secretsmanager:GetSecretValue` on that exact secret, evaluated on the calling IAM
+principal itself -- not against `bedrock-agentcore:*` alone. This was undocumented in AWS's public
+reference and was proven empirically in this POC's H4b gate (see `docs/runbook.md`'s Phase 2
+Isolation section for the full finding). It applies identically whether the provider is Microsoft,
+Google, a custom PingOne provider, or a custom AD FS provider: **any execution role that calls
+AgentCore Identity for a given provider needs an explicit `secretsmanager:GetSecretValue` grant on
+that provider's AWS-managed secret ARN**, obtainable with no wildcard from
+`GetOAuth2CredentialProvider`'s `clientSecretArn.secretArn` field. Omitting it produces a generic
+`AccessDeniedException` that is easy to misattribute to `bedrock-agentcore` scoping or IAM
+propagation delay rather than to this separate, provider-scoped grant. Include this grant in the
+IAM design for any PingOne or AD FS custom-provider rollout, alongside whichever `bedrock-agentcore`
+actions that rollout's execution roles require.
+
 ## Gate
 
 For either provider, record the exact discovery document, grant, client-authentication mode,

@@ -17,6 +17,7 @@ from scripts.provision_agentcore import (
     confirm_google_callback,
     create_google_provider,
     google_phase_two_plan,
+    install_scoped_policy,
     main,
     plan_resources,
     render_policy_template,
@@ -68,6 +69,10 @@ def test_final_scoped_policy_has_no_wildcard_and_denies_user_id_token_operation(
             "PROVIDER_ARN": (
                 "arn:aws:bedrock-agentcore:us-west-2:123456789012:credential-provider/microsoft"
             ),
+            "SECRET_ARN": (
+                "arn:aws:secretsmanager:us-west-2:123456789012:secret:"
+                "bedrock-agentcore-identity!default/oauth2/microsoft-abc123"
+            ),
         },
     )
 
@@ -76,6 +81,60 @@ def test_final_scoped_policy_has_no_wildcard_and_denies_user_id_token_operation(
         "Effect": "Deny",
         "Action": "bedrock-agentcore:GetWorkloadAccessTokenForUserId",
     }.items() <= rendered["Statement"][-1].items()
+
+
+def test_install_scoped_policy_grants_the_google_provider_when_it_exists_in_state() -> None:
+    """A Google provider created after the initial --apply must not be silently ungranted.
+
+    `.poc-state.json` can record `google_provider` alongside `provider` once Phase 2's
+    `google-create --apply` has run. The installed policy must reflect both providers, or
+    every scoped-policy call the second provider needs (H4b, google-list, ...) fails with
+    an unrelated-looking AccessDenied under the true least-privilege principal, even though
+    it works fine under an over-privileged operator profile.
+    """
+    state: dict[str, object] = {
+        "directory_arn": "arn:directory",
+        "vault_arn": "arn:vault",
+        "workloads": [{"arn": "arn:workload:approved"}, {"arn": "arn:workload:unapproved"}],
+        "provider": {"arn": "arn:provider:microsoft", "secret_arn": "arn:secret:microsoft"},
+        "google_provider": {"arn": "arn:provider:google", "secret_arn": "arn:secret:google"},
+    }
+    iam = RecordingIamClient()
+
+    install_scoped_policy(iam, "agentcore-poc-role", state)
+
+    (call,) = iam.calls
+    policy = json.loads(call["PolicyDocument"])
+    named_resources = next(
+        statement["Resource"]
+        for statement in policy["Statement"]
+        if statement.get("Sid") == "UseOnlyNamedPocResources"
+    )
+    assert "arn:provider:microsoft" in named_resources
+    assert "arn:provider:google" in named_resources
+    secret_resources = next(
+        statement["Resource"]
+        for statement in policy["Statement"]
+        if statement.get("Sid") == "AllowOauth2ProviderSecretAccess"
+    )
+    assert "arn:secret:microsoft" in secret_resources
+    assert "arn:secret:google" in secret_resources
+
+
+def test_install_scoped_policy_omits_the_google_provider_when_absent_from_state() -> None:
+    state: dict[str, object] = {
+        "directory_arn": "arn:directory",
+        "vault_arn": "arn:vault",
+        "workloads": [{"arn": "arn:workload:approved"}, {"arn": "arn:workload:unapproved"}],
+        "provider": {"arn": "arn:provider:microsoft", "secret_arn": "arn:secret:microsoft"},
+    }
+    iam = RecordingIamClient()
+
+    install_scoped_policy(iam, "agentcore-poc-role", state)
+
+    (call,) = iam.calls
+    assert "arn:provider:google" not in call["PolicyDocument"]
+    assert "arn:secret:google" not in call["PolicyDocument"]
 
 
 class MissingBudgetClient:
@@ -132,6 +191,7 @@ class RecordingControlClient:
             "name": name,
             "credentialProviderArn": f"arn:provider:{name}",
             "callbackUrl": f"https://callback.example.test/{name}",
+            "clientSecretArn": {"secretArn": f"arn:secret:{name}"},
         }
         self.providers[name] = response
         return response
@@ -274,6 +334,7 @@ def test_apply_creates_only_absent_named_resources_and_records_returned_values(
         "name": "microsoft-provider",
         "arn": "arn:provider:microsoft-provider",
         "callback_url": "https://callback.example.test/microsoft-provider",
+        "secret_arn": "arn:secret:microsoft-provider",
     }
     assert again == state
     assert "not-logged" not in state_path.read_text(encoding="utf-8")
@@ -299,6 +360,7 @@ def test_google_provider_creation_records_returned_callback_and_blocks_phase_two
         "arn": "arn:provider:google-provider",
         "callback_url": "https://callback.example.test/google-provider",
         "console_status": "google_console_registration_required",
+        "secret_arn": "arn:secret:google-provider",
     }
     assert google_phase_two_plan(state)["status"] == "blocked"
     persisted = state_path.read_text(encoding="utf-8")
@@ -457,6 +519,7 @@ def test_google_provider_recreation_requires_a_new_console_update(
         "arn": "arn:provider:google-provider",
         "callback_url": "https://callback.example.test/google-provider",
         "console_status": "google_console_update_required",
+        "secret_arn": "arn:secret:google-provider",
     }
     assert google_phase_two_plan(state)["status"] == "blocked"
 
@@ -470,6 +533,7 @@ def test_core_apply_preserves_confirmed_google_provider_state(tmp_path: Path) ->
         "arn": "arn:provider:google-provider",
         "callback_url": "https://callback.example.test/google-provider",
         "console_status": "google_console_registered",
+        "secret_arn": "arn:secret:google-provider",
     }
     write_state(state_path, _base_state(google_provider=google_provider))
 
@@ -604,6 +668,7 @@ def _base_state(*, google_provider: dict[str, str] | None = None) -> dict[str, o
             "name": "microsoft-provider",
             "arn": "arn:provider:microsoft-provider",
             "callback_url": "https://callback.example.test/microsoft-provider",
+            "secret_arn": "arn:secret:microsoft-provider",
         },
     }
     if google_provider is not None:

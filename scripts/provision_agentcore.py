@@ -19,7 +19,14 @@ from agentcore_identity_poc.config import Settings, SettingsError
 _PROJECT_TAG = {"Project": "agentcore-identity-poc"}
 _STATE_PATH = Path(".poc-state.json")
 _POLICY_PLACEHOLDERS = frozenset(
-    {"DIRECTORY_ARN", "WORKLOAD_ARN", "SECOND_WORKLOAD_ARN", "VAULT_ARN", "PROVIDER_ARN"}
+    {
+        "DIRECTORY_ARN",
+        "WORKLOAD_ARN",
+        "SECOND_WORKLOAD_ARN",
+        "VAULT_ARN",
+        "PROVIDER_ARN",
+        "SECRET_ARN",
+    }
 )
 
 
@@ -244,6 +251,7 @@ def _google_provider_state(
         "arn": _state_string(provider, "arn"),
         "callback_url": callback_url,
         "console_status": status,
+        "secret_arn": _state_string(provider, "secret_arn"),
     }
 
 
@@ -352,9 +360,20 @@ def install_scoped_policy(
         "SECOND_WORKLOAD_ARN": _state_string(workloads[1], "arn"),
         "VAULT_ARN": _state_string(state, "vault_arn"),
         "PROVIDER_ARN": _state_string(provider, "arn"),
+        "SECRET_ARN": _state_string(provider, "secret_arn"),
     }
     policy_path = Path(__file__).resolve().parents[1] / "infra" / "iam" / "scoped.json"
     policy = load_policy_template(policy_path, replacements)
+    google_provider = state.get("google_provider")
+    if isinstance(google_provider, Mapping):
+        _add_resource_to_named_statement(
+            policy, "UseOnlyNamedPocResources", _state_string(google_provider, "arn")
+        )
+        _add_resource_to_named_statement(
+            policy,
+            "AllowOauth2ProviderSecretAccess",
+            _state_string(google_provider, "secret_arn"),
+        )
     serialized = json.dumps(policy, separators=(",", ":"), sort_keys=True)
     if "*" in serialized or "bedrock-agentcore:GetWorkloadAccessTokenForUserId" not in serialized:
         raise ProvisioningError("rendered scoped policy is not safely constrained")
@@ -363,6 +382,28 @@ def install_scoped_policy(
         PolicyName="agentcore-identity-poc-scoped",
         PolicyDocument=serialized,
     )
+
+
+def _add_resource_to_named_statement(
+    policy: Mapping[str, object], sid: str, resource_arn: str
+) -> None:
+    """Append one more concrete resource ARN to an existing named statement.
+
+    Used to fold the Google provider ARN into the scoped policy's grant when it exists,
+    without requiring a second static placeholder for a provider that may not exist yet
+    (e.g. before Phase 2's Google provider is created).
+    """
+    statements = policy.get("Statement")
+    if not isinstance(statements, list):
+        raise ProvisioningError("scoped policy template is missing its Statement list")
+    for statement in statements:
+        if isinstance(statement, dict) and statement.get("Sid") == sid:
+            resources = statement.get("Resource")
+            if not isinstance(resources, list):
+                raise ProvisioningError(f"scoped policy statement {sid!r} has no Resource list")
+            resources.append(resource_arn)
+            return
+    raise ProvisioningError(f"scoped policy template is missing statement {sid!r}")
 
 
 def _state_string(state: Mapping[str, object], field: str) -> str:
@@ -429,6 +470,7 @@ def _provider_state(response: Mapping[str, object]) -> dict[str, object]:
         "name": _required_string(response, "name"),
         "arn": _required_string(response, "credentialProviderArn"),
         "callback_url": _required_string(response, "callbackUrl"),
+        "secret_arn": _required_nested_string(response, "clientSecretArn", "secretArn"),
     }
 
 
@@ -466,6 +508,13 @@ def _required_string(value: Mapping[str, object], field: str) -> str:
     if not isinstance(result, str) or not result:
         raise ProvisioningError(f"AWS response omitted required field: {field}")
     return result
+
+
+def _required_nested_string(value: Mapping[str, object], field: str, nested_field: str) -> str:
+    nested = value.get(field)
+    if not isinstance(nested, Mapping):
+        raise ProvisioningError(f"AWS response omitted required field: {field}")
+    return _required_string(nested, nested_field)
 
 
 def _string_list(value: object) -> list[str]:

@@ -6,6 +6,12 @@
       "Effect": "Allow",
       "Action": "bedrock-agentcore:*",
       "Resource": "*"
+    },
+    {
+      "Sid": "BroadObservationOauth2ProviderSecretAccess",
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "*"
     }
   ]
 }

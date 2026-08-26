@@ -245,6 +245,29 @@ test's outcome-set assertions fail even though no error was raised, this is a tr
 propagation delay, not a real IAM isolation failure -- wait a few seconds and rerun the same
 live test rather than treating it as a hypothesis failure.
 
+**Finding: a scoped policy needs a Secrets Manager grant, not just `bedrock-agentcore:*`.**
+AgentCore Identity stores each OAuth2 credential provider's client secret in an AWS-managed
+Secrets Manager secret (name pattern
+`bedrock-agentcore-identity!default/oauth2/<provider-name>-<random-suffix>`). When a workload
+calls `GetResourceOauth2Token`, IAM authorizes that call against `secretsmanager:GetSecretValue`
+on that specific secret ARN, evaluated on the *calling principal itself* -- not against
+`bedrock-agentcore:*` alone, and not against a service-linked role AgentCore assumes internally.
+This is undocumented in AWS's public reference and is provider-agnostic: it was confirmed for
+both the Microsoft and Google providers in this POC. Because it surfaced as a generic
+`AccessDeniedException`, it is easy to misdiagnose as an IAM propagation delay or a
+`bedrock-agentcore` scoping gap. It does not weaken per-workload isolation -- the secret is
+per-*provider*, shared by every workload using that provider, so granting it does not bypass
+`DenySecondWorkloadJwtBinding`, which still gates the unapproved workload before it ever reaches
+this call. The exact secret ARN is available with no wildcard needed from
+`GetOAuth2CredentialProvider`'s `clientSecretArn.secretArn` field; `scripts/provision_agentcore.py`
+now captures it into `.poc-state.json` (`provider.secret_arn`, `google_provider.secret_arn`) and
+`infra/iam/scoped.json` grants it via the `AllowOauth2ProviderSecretAccess` statement. **This
+generalizes beyond this POC**: any production IAM role whose workload calls an AgentCore Identity
+OAuth2 credential provider -- Microsoft, Google, or a custom PingOne/AD FS provider -- needs this
+same additional grant on that provider's AWS-managed secret; `bedrock-agentcore:*`-only policies
+will fail with an access-denied error that has nothing to do with the `bedrock-agentcore`
+namespace.
+
 If the command reports a scoped-policy restoration failure, stop immediately. Restore the checked
 in final policy before any further live test, then rerun the scoped observation:
 

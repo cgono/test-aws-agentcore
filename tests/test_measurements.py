@@ -23,6 +23,7 @@ from agentcore_identity_poc.cli import (
     _cloudtrail_attribution_from_events,
     _expiry_run_salt,
     _measurement_project_id,
+    _render_scoped_policy,
     _run_workload_isolation,
     _supported_token_expiry,
     app,
@@ -484,6 +485,47 @@ def test_live_user_isolation_executes_two_distinct_validated_users_locally(
     assert [item["hypothesis"] for item in observations].count("H6") == 2
 
 
+def test_render_scoped_policy_grants_the_google_provider_when_it_exists_in_state() -> None:
+    state = {
+        "directory_arn": "arn:directory",
+        "vault_arn": "arn:vault",
+        "workloads": [{"arn": "arn:workload:approved"}, {"arn": "arn:workload:unapproved"}],
+        "provider": {"arn": "arn:provider:microsoft", "secret_arn": "arn:secret:microsoft"},
+        "google_provider": {"arn": "arn:provider:google", "secret_arn": "arn:secret:google"},
+    }
+
+    policy = _render_scoped_policy(state)
+
+    named_resources = next(
+        statement["Resource"]
+        for statement in policy["Statement"]
+        if statement.get("Sid") == "UseOnlyNamedPocResources"
+    )
+    assert "arn:provider:microsoft" in named_resources
+    assert "arn:provider:google" in named_resources
+    secret_resources = next(
+        statement["Resource"]
+        for statement in policy["Statement"]
+        if statement.get("Sid") == "AllowOauth2ProviderSecretAccess"
+    )
+    assert "arn:secret:microsoft" in secret_resources
+    assert "arn:secret:google" in secret_resources
+
+
+def test_render_scoped_policy_omits_the_google_provider_when_absent_from_state() -> None:
+    state = {
+        "directory_arn": "arn:directory",
+        "vault_arn": "arn:vault",
+        "workloads": [{"arn": "arn:workload:approved"}, {"arn": "arn:workload:unapproved"}],
+        "provider": {"arn": "arn:provider:microsoft", "secret_arn": "arn:secret:microsoft"},
+    }
+
+    policy = _render_scoped_policy(state)
+
+    assert "arn:provider:google" not in json.dumps(policy)
+    assert "arn:secret:google" not in json.dumps(policy)
+
+
 def test_workload_isolation_uses_mocked_iam_policy_transitions_locally(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -526,7 +568,7 @@ def test_workload_isolation_uses_mocked_iam_policy_transitions_locally(
                 "directory_arn": "arn:directory",
                 "vault_arn": "arn:vault",
                 "workloads": [{"arn": "arn:approved"}, {"arn": "arn:unapproved"}],
-                "provider": {"arn": "arn:provider"},
+                "provider": {"arn": "arn:provider", "secret_arn": "arn:secret"},
             }
         ),
         encoding="utf-8",
@@ -549,6 +591,96 @@ def test_workload_isolation_uses_mocked_iam_policy_transitions_locally(
     assert [row.outcome for row in rows] == ["pass", "pass", "pass", "denied"]
     assert len(recorded) == 4
     assert iam.scoped is True
+
+
+def test_workload_isolation_measures_as_the_role_when_agentcore_as_role_is_provided(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """H4b must call AgentCore Identity as the policy-bearing role, not ambient creds.
+
+    Ambient operator credentials (e.g. an admin SSO session) are typically far more
+    permissive than the named role, so measuring as ambient creds would make every
+    policy transition look like it converges instantly regardless of policy content.
+    `Runtime.agentcore_as_role`, when provided, must be used instead of `agentcore`.
+    """
+
+    class FakeIam:
+        scoped = False
+
+        def put_role_policy(self, *, PolicyDocument: str, **_kwargs: object) -> None:
+            self.scoped = "BroadObservationOnly" not in PolicyDocument
+
+    class FakeSts:
+        def get_caller_identity(self) -> dict[str, str]:
+            return {"Arn": "arn:aws:iam::123456789012:role/poc", "Account": "123456789012"}
+
+    class IsolationIdentity(MeasurementIdentity):
+        def __init__(self, iam: FakeIam) -> None:
+            super().__init__()
+            self.iam = iam
+
+        def workload_token(self, workload_name: str, user_token: str) -> str:
+            return f"workload-{workload_name}"
+
+        def google_token(
+            self,
+            workload_token: str,
+            provider: str,
+            scopes: list[str],
+            return_url: str,
+            state: str,
+            *,
+            force_authentication: bool = False,
+        ) -> OAuthToken:
+            if self.iam.scoped and workload_token.endswith(SETTINGS.agentcore_second_workload_name):
+                raise AgentCoreAccessDenied()
+            return OAuthToken("google-access")
+
+    class UnusedIdentity(MeasurementIdentity):
+        """Stands in for `runtime.agentcore`, which must not be called at all."""
+
+        def workload_token(self, workload_name: str, user_token: str) -> str:
+            raise AssertionError("runtime.agentcore must not be used when agentcore_as_role is set")
+
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "directory_arn": "arn:directory",
+                "vault_arn": "arn:vault",
+                "workloads": [{"arn": "arn:approved"}, {"arn": "arn:unapproved"}],
+                "provider": {"arn": "arn:provider", "secret_arn": "arn:secret"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    iam = FakeIam()
+    identity = IsolationIdentity(iam)
+    role_arns_used: list[str] = []
+
+    def fake_agentcore_as_role(_settings: Settings, role_arn: str) -> IsolationIdentity:
+        role_arns_used.append(role_arn)
+        return identity
+
+    runtime = replace(
+        _measurement_runtime(UnusedIdentity(), RecordingEvidence()),
+        clock=lambda: 0.0,
+        agentcore_as_role=fake_agentcore_as_role,
+    )
+    monkeypatch.setenv("AGENTCORE_POC_IAM_ROLE_NAME", "poc-role")
+    monkeypatch.setenv("AGENTCORE_POC_USER_ALIAS", "user-a")
+    monkeypatch.setattr("agentcore_identity_poc.cli._STATE_PATH", state_path)
+    monkeypatch.setattr(
+        "agentcore_identity_poc.cli.boto3.client",
+        lambda service, **_kwargs: iam if service == "iam" else FakeSts(),
+    )
+    recorded = []
+
+    rows = _run_workload_isolation(runtime, SETTINGS, record_row=recorded.append)
+
+    assert [row.policy_mode for row in rows] == ["broad", "broad", "scoped", "scoped"]
+    assert [row.outcome for row in rows] == ["pass", "pass", "pass", "denied"]
+    assert role_arns_used == ["arn:aws:iam::123456789012:role/poc-role"]
 
 
 def test_run_live_workload_isolation_writes_h4b_evidence_locally(
@@ -593,7 +725,7 @@ def test_run_live_workload_isolation_writes_h4b_evidence_locally(
                 "directory_arn": "arn:directory",
                 "vault_arn": "arn:vault",
                 "workloads": [{"arn": "arn:approved"}, {"arn": "arn:unapproved"}],
-                "provider": {"arn": "arn:provider"},
+                "provider": {"arn": "arn:provider", "secret_arn": "arn:secret"},
             }
         ),
         encoding="utf-8",

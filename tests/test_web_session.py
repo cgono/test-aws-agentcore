@@ -66,6 +66,7 @@ class FakeIdentity:
     def __init__(self) -> None:
         self.complete_calls: list[tuple[str, str]] = []
         self.google_calls: list[tuple[str, str, list[str], str, str]] = []
+        self.google_force_authentication: list[bool] = []
 
     def workload_token(self, workload_name: str, user_token: str) -> str:
         assert workload_name == "approved-workload"
@@ -79,8 +80,11 @@ class FakeIdentity:
         scopes: list[str],
         return_url: str,
         state: str,
+        *,
+        force_authentication: bool = False,
     ) -> AuthorizationRequired:
         self.google_calls.append((workload_token, provider, scopes, return_url, state))
+        self.google_force_authentication.append(force_authentication)
         return AuthorizationRequired(
             authorization_url="https://accounts.example.test/authorize?opaque=value",
             session_uri="urn:test",
@@ -130,6 +134,22 @@ def _start_google(client: TestClient) -> dict[str, object]:
     assert isinstance(body, dict)
     assert all(isinstance(key, str) for key in body)
     return {key: value for key, value in body.items()}
+
+
+def test_google_start_always_forces_reauthentication(
+    client: TestClient, fake_identity: FakeIdentity
+) -> None:
+    """Google issues a refresh token only on a forced first-ever consent for a given
+
+    (OAuth client, user) pair. This endpoint is the sole consent-establishment entry
+    point, so it must always force re-authentication -- otherwise a second workload
+    identity sharing the same Google OAuth client can silently receive an
+    access-token-only grant for an already-consented user, with no way to refresh it
+    once that token expires.
+    """
+    _start_google(client)
+
+    assert fake_identity.google_force_authentication == [True]
 
 
 def test_production_factory_wires_settings_msal_jwks_and_agentcore(

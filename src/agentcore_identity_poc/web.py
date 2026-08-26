@@ -65,6 +65,8 @@ class GoogleIdentityClient(Protocol):
         scopes: list[str],
         return_url: str,
         state: str,
+        *,
+        force_authentication: bool = False,
     ) -> OAuthToken | AuthorizationRequired: ...
 
     def complete_google(self, session_uri: str, user_token: str) -> None: ...
@@ -229,6 +231,14 @@ def create_app(runtime: WebRuntime) -> FastAPI:
                 [_GOOGLE_SCOPE],
                 runtime.settings.google_return_url,
                 state,
+                # Google issues a refresh token only on the first-ever consent for a
+                # given (OAuth client, user) pair unless re-consent is forced. This POC's
+                # two workload identities share one Google OAuth client, so an unforced
+                # second-workload consent for an already-consented user silently returns
+                # an access-token-only grant that dies once that token expires, with no
+                # way to refresh it. Always forcing re-consent here keeps every
+                # connection this endpoint establishes durable.
+                force_authentication=True,
             )
         except Exception:
             return _error_response("authentication_failed", 401)

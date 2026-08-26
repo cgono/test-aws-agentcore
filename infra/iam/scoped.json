@@ -24,6 +24,14 @@
       "Resource": "${SECOND_WORKLOAD_ARN}"
     },
     {
+      "Sid": "AllowOauth2ProviderSecretAccess",
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": [
+        "${SECRET_ARN}"
+      ]
+    },
+    {
       "Sid": "DenyUserIdWorkloadBinding",
       "Effect": "Deny",
       "Action": "bedrock-agentcore:GetWorkloadAccessTokenForUserId",

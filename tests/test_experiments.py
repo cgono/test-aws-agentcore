@@ -46,12 +46,17 @@ def test_matrix_row_is_immutable_and_contains_the_required_evidence_fields() -> 
 
 def test_final_scoped_policy_explicitly_denies_the_second_workload_jwt_binding() -> None:
     policy = json.loads(Path("infra/iam/scoped.json").read_text(encoding="utf-8"))
+    deny_statement = next(
+        statement
+        for statement in policy["Statement"]
+        if statement.get("Sid") == "DenySecondWorkloadJwtBinding"
+    )
 
     assert {
         "Effect": "Deny",
         "Action": "bedrock-agentcore:GetWorkloadAccessTokenForJWT",
         "Resource": "${SECOND_WORKLOAD_ARN}",
-    }.items() <= policy["Statement"][-2].items()
+    }.items() <= deny_statement.items()
 
 
 class RecordingIamClient:
@@ -76,7 +81,7 @@ def test_iam_policy_manager_replaces_the_same_inline_policy_for_broad_and_scoped
                 "directory_arn": "arn:directory",
                 "vault_arn": "arn:vault",
                 "workloads": [{"arn": "arn:approved"}, {"arn": "arn:unapproved"}],
-                "provider": {"arn": "arn:provider"},
+                "provider": {"arn": "arn:provider", "secret_arn": "arn:secret"},
             }
         ),
         encoding="utf-8",

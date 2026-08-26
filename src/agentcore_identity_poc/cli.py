@@ -159,6 +159,7 @@ class Runtime:
     source_expiry_runner: Callable[
         [Settings, IdentityClient, str, float, Callable[[], float]], SourceExpiryExperiment
     ] | None = None
+    agentcore_as_role: Callable[[Settings, str], IdentityClient] | None = None
 
 
 class _RetryCounters:
@@ -1217,12 +1218,24 @@ def _run_workload_isolation(
     except (EntraAuthError, TokenRejected) as error:
         raise ExperimentConfigurationError("could not validate the H4b Entra user") from error
 
-    identity = runtime.agentcore(settings)
     policy_manager = _AwsIamPolicyManager(
         boto3.client("iam", region_name=settings.aws_region),
         boto3.client("sts", region_name=settings.aws_region),
         role_name,
     )
+
+    if runtime.agentcore_as_role is not None:
+        # Measure as the role the policy is actually installed on. Ambient operator
+        # credentials (e.g. an admin SSO session) are typically far more permissive
+        # than `role_name` and would make every policy transition look like it
+        # converges instantly, regardless of what the policy actually says.
+        account_id = boto3.client("sts", region_name=settings.aws_region).get_caller_identity()[
+            "Account"
+        ]
+        role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
+        identity = runtime.agentcore_as_role(settings, role_arn)
+    else:
+        identity = runtime.agentcore(settings)
 
     def attempt_provider(workload_name: str) -> WorkloadAttempt:
         try:
@@ -1469,15 +1482,50 @@ def _render_scoped_policy(state: Mapping[str, object]) -> Mapping[str, object]:
         "SECOND_WORKLOAD_ARN": _required_state_arn(cast(Mapping[str, object], workloads[1]), "arn"),
         "VAULT_ARN": _required_state_arn(state, "vault_arn"),
         "PROVIDER_ARN": _required_state_arn(cast(Mapping[str, object], provider), "arn"),
+        "SECRET_ARN": _required_state_arn(cast(Mapping[str, object], provider), "secret_arn"),
     }
     rendered = json.loads(json.dumps(_load_json_policy("scoped.json")))
     if not isinstance(rendered, dict):
         raise ExperimentConfigurationError("scoped IAM policy must be an object")
     _replace_policy_values(rendered, replacements)
+    google_provider = state.get("google_provider")
+    if isinstance(google_provider, Mapping):
+        _add_resource_to_statement(
+            rendered,
+            "UseOnlyNamedPocResources",
+            _required_state_arn(cast(Mapping[str, object], google_provider), "arn"),
+        )
+        _add_resource_to_statement(
+            rendered,
+            "AllowOauth2ProviderSecretAccess",
+            _required_state_arn(cast(Mapping[str, object], google_provider), "secret_arn"),
+        )
     serialized = json.dumps(rendered, separators=(",", ":"), sort_keys=True)
     if "*" in serialized:
         raise ExperimentConfigurationError("rendered scoped IAM policy is not safely constrained")
     return cast(Mapping[str, object], rendered)
+
+
+def _add_resource_to_statement(policy: Mapping[str, object], sid: str, resource_arn: str) -> None:
+    """Append one more concrete resource ARN to an existing named statement.
+
+    Used to fold the Google provider ARN into the scoped policy's grant when it exists,
+    without requiring a second static placeholder for a provider that may not exist yet
+    (e.g. before Phase 2's Google provider is created).
+    """
+    statements = policy.get("Statement")
+    if not isinstance(statements, list):
+        raise ExperimentConfigurationError("scoped IAM policy is missing its Statement list")
+    for statement in statements:
+        if isinstance(statement, dict) and statement.get("Sid") == sid:
+            resources = statement.get("Resource")
+            if not isinstance(resources, list):
+                raise ExperimentConfigurationError(
+                    f"scoped IAM policy statement {sid!r} has no Resource list"
+                )
+            resources.append(resource_arn)
+            return
+    raise ExperimentConfigurationError(f"scoped IAM policy is missing statement {sid!r}")
 
 
 def _required_state_arn(state: Mapping[str, object], field_name: str) -> str:
@@ -2035,6 +2083,7 @@ def _default_runtime() -> Runtime:
         clock=time.monotonic,
         evidence_writer=EvidenceWriter,
         stdin_isatty=lambda: sys.stdin.isatty(),
+        agentcore_as_role=_agentcore_identity_for_role,
     )
 
 
@@ -2065,6 +2114,28 @@ def _validate_inbound_token(settings: Settings, token: str) -> Mapping[str, obje
 
 def _agentcore_identity(settings: Settings) -> AgentCoreIdentity:
     client = boto3.client("bedrock-agentcore", region_name=settings.aws_region)
+    return AgentCoreIdentity(cast(AgentCoreDataPlane, client))
+
+
+def _agentcore_identity_for_role(settings: Settings, role_arn: str) -> AgentCoreIdentity:
+    """Build an AgentCore Identity client that actually calls as `role_arn`.
+
+    H4b measures whether IAM policy on a role gates AgentCore Identity access. That is
+    only a real measurement if the calls are made as that role -- not as whatever
+    operator credentials happen to be ambient, which are typically far more permissive
+    and would make every policy transition look like it converges instantly.
+    """
+    sts_client = boto3.client("sts", region_name=settings.aws_region)
+    credentials = sts_client.assume_role(
+        RoleArn=role_arn, RoleSessionName="agentcore-poc-h4b"
+    )["Credentials"]
+    client = boto3.client(
+        "bedrock-agentcore",
+        region_name=settings.aws_region,
+        aws_access_key_id=credentials["AccessKeyId"],
+        aws_secret_access_key=credentials["SecretAccessKey"],
+        aws_session_token=credentials["SessionToken"],
+    )
     return AgentCoreIdentity(cast(AgentCoreDataPlane, client))
 
 
