@@ -34,6 +34,26 @@ propagation delay rather than to this separate, provider-scoped grant. Include t
 IAM design for any PingOne or AD FS custom-provider rollout, alongside whichever `bedrock-agentcore`
 actions that rollout's execution roles require.
 
+## `customParameters` must be minimal and exact (proven in the POC for Google; treat as a risk for both vendors)
+
+This directly bears on the "Custom parameters" row above, marked `Unknown` for both vendors. In
+this POC's Google integration, `GetResourceOauth2Token`'s `customParameters` only tolerates the
+keys AgentCore recognizes for that provider (`access_type`, documented). Adding one it does not
+recognize -- for example `prompt`, attempting to force the IdP's own re-consent screen -- produces
+**no error anywhere in the flow**: the authorization URL is still issued, the browser consent
+screen still completes normally, `CompleteResourceTokenAuth` still reports success, but nothing is
+actually vaulted, and every later retrieval reports "authorization required" indefinitely with
+nothing pointing at the real cause. Confirmed with a controlled A/B test: two otherwise-identical
+authorization requests differing only in the presence of a `prompt` key, one vaulted a durable,
+immediately retrievable token and the other vaulted nothing.
+
+**Consequence for PingOne/AD FS:** do not assume an unrecognized or vendor-specific custom
+parameter is silently ignored -- confirm the exact set of parameter keys the target provider's
+grant type accepts, keep that set identical between the establishing call and every later
+retrieval call, and verify durability with an explicit retrieval-after-establishment check rather
+than trusting a success response from the completion call. A 200/204 completion is not proof of a
+durable, retrievable grant.
+
 ## Gate
 
 For either provider, record the exact discovery document, grant, client-authentication mode,

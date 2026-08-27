@@ -243,7 +243,42 @@ IAM policy propagation on real AWS can occasionally take more than one internal 
 (bounded at 60 seconds). If `run_workload_isolation()` returns extra rows that make the live
 test's outcome-set assertions fail even though no error was raised, this is a transient
 propagation delay, not a real IAM isolation failure -- wait a few seconds and rerun the same
-live test rather than treating it as a hypothesis failure.
+live test rather than treating it as a hypothesis failure. In practice, a fresh `apply_broad_policy()`
+write on this account consistently took several seconds (observed repeatedly, not a rare fluke) to
+propagate before the unapproved workload's `GetWorkloadAccessTokenForJWT` call stopped seeing the
+role's *previous* (scoped) policy; the scoped-policy transition at the end of the run converged
+immediately by comparison. `test_live_workload_isolation_records_broad_and_scoped_same_principal`'s
+assertions check every accumulated row, including this pre-convergence window, so a live rerun can
+fail this specific assertion on essentially every attempt even though the underlying broad/scoped
+convergence itself is correct every time -- confirm this by inspecting the evidence file for the
+run: if the *last* row for each workload/policy-mode pair matches the expected outcome, treat the
+mechanism as proven and the test failure as the propagation-latency mismatch described above, not
+a new defect.
+
+**Finding: `customParameters` passed to `GetResourceOauth2Token` must be minimal and exact --
+unrecognized keys silently break vaulting.** AgentCore's Google integration only tolerates the
+`customParameters` keys it recognizes (`access_type` for Google); adding an unrecognized key (for
+example `prompt`, an attempt to force Google's own re-consent screen) does not raise an error
+anywhere in the flow -- `GetResourceOauth2Token` still returns an `authorizationUrl`, the browser
+consent screen still appears and completes normally, and `CompleteResourceTokenAuth` still returns
+success -- but nothing is actually vaulted. Every later retrieval call reports "authorization
+required" indefinitely, with no error to point at the real cause. This was confirmed with a
+controlled test: two authorization requests differing *only* in the presence of a `prompt` key,
+against the same workload and provider, one vaulted a durable, immediately retrievable token and
+the other vaulted nothing. Do not add IdP-specific query parameters to `customParameters` beyond
+what AgentCore documents as supported for that provider, and keep the parameter set identical
+between the call that establishes a grant and any call that later retrieves it. **This generalizes
+beyond Google**: the same silent-failure shape should be expected from any AgentCore Identity
+OAuth2 credential provider, including a custom PingOne/AD FS provider, if `customParameters`
+carries a key the provider integration does not recognize -- verify durability with an explicit
+retrieval-after-establishment check rather than trusting a 200/204 completion response.
+
+The actual, durable fix for the "second workload's consent is access-token-only and cannot be
+refreshed" problem (both workloads share one Google OAuth client, so a second workload's first
+authorization can complete without Google issuing a refresh token, per Google's own consent-history
+rules) is **revoking the app's access at Google's account permissions page and reconnecting**, not
+a request parameter -- a revoked-then-fresh authorization is unconditionally treated as first-ever
+by Google and always includes a refresh token.
 
 **Finding: a scoped policy needs a Secrets Manager grant, not just `bedrock-agentcore:*`.**
 AgentCore Identity stores each OAuth2 credential provider's client secret in an AWS-managed

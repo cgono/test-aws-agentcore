@@ -145,6 +145,20 @@ class AgentCoreIdentity:
         force_authentication: bool = False,
     ) -> OAuthToken | AuthorizationRequired:
         if force_authentication:
+            # forceAuthentication=True forces AgentCore to run a fresh
+            # authorization dance instead of reusing a cached one. Note:
+            # customParameters is passed straight through to AgentCore's
+            # provider-specific token exchange, and it only tolerates the keys
+            # it recognizes for that provider ("access_type" for Google) --
+            # adding an unrecognized key (e.g. "prompt") does not error, but
+            # silently breaks the exchange: AgentCore still reports completion
+            # (CompleteResourceTokenAuth 200s, the browser sees success) while
+            # nothing is actually vaulted, and every later retrieval reports
+            # "authorization required" with no token, forever. Confirmed via a
+            # controlled manual test: identical calls differing only by the
+            # presence of "prompt" vault a retrievable token without it and
+            # nothing with it. Keep this branch's customParameters minimal and
+            # identical to the non-forced branch below.
             response = self._request(
                 lambda: self._client.get_resource_oauth2_token(
                     workloadIdentityToken=workload_token,

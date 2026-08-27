@@ -231,13 +231,20 @@ def create_app(runtime: WebRuntime) -> FastAPI:
                 [_GOOGLE_SCOPE],
                 runtime.settings.google_return_url,
                 state,
-                # Google issues a refresh token only on the first-ever consent for a
-                # given (OAuth client, user) pair unless re-consent is forced. This POC's
-                # two workload identities share one Google OAuth client, so an unforced
-                # second-workload consent for an already-consented user silently returns
-                # an access-token-only grant that dies once that token expires, with no
-                # way to refresh it. Always forcing re-consent here keeps every
-                # connection this endpoint establishes durable.
+                # forceAuthentication=True makes AgentCore always run a fresh
+                # authorization dance here instead of silently reusing (or
+                # reporting) an existing vaulted grant -- appropriate since this
+                # endpoint's whole purpose is explicit (re)connection.
+                #
+                # Note this does NOT by itself guarantee a refreshable grant:
+                # Google issues a refresh token only on the first-ever consent
+                # for a given (OAuth client, user) pair. This POC's two workload
+                # identities share one Google OAuth client, so a second
+                # workload's first consent while the first workload already
+                # holds a grant can return an access-token-only grant that dies
+                # once it expires, with no way to refresh it -- the durable fix
+                # is revoking access at myaccount.google.com/permissions and
+                # reconnecting (see docs/runbook.md), not a request parameter.
                 force_authentication=True,
             )
         except Exception:
