@@ -1,5 +1,20 @@
 # AgentCore Identity POC Runbook
 
+## Current Status (updated 2026-08-28)
+
+Phase 1 and Phase 2 are both complete with current, live, passing evidence: H1, H2, H6 (Entra
+OBO, both test users), the Google callback/consent/durable-vault gate, H4a, and H4b are all
+proven post-fix (see the `customParameters` and Secrets Manager findings under Phase 2 Isolation
+below, plus the stale-`.env`-process and dying-quick-tunnel findings under Phase 1). H3 remains a
+documented feasibility blocker (AgentCore exposes no provider-token expiry metadata), and H5 is
+out of scope (no PingOne/AD FS environment available).
+
+**Remaining work:** Phase 3 lifecycle (H7/H8, `test_lifecycle_live.py`) -- H7 needs a real 60-90
+minute wait between a seeding pass and a confirming pass, so treat it as its own session -- then
+`assessment-finalize` + `report` to produce `docs/assessment.md`, then cleanup. Start the next
+session at the "Phase 3: Lifecycle, Assessment, and Handoff" section below. Every live gate needs
+a real interactive terminal (see the note under Phase 1) and a valid `aws sso login` session.
+
 ## Prerequisites
 
 Choose an AgentCore-supported AWS region and create the monthly AWS Budget named by
@@ -107,6 +122,40 @@ Always run every live gate as `.venv/bin/python -m pytest`, never a bare `pytest
 puts the current directory on `sys.path`, which is the only reason the root-level
 `operator_live_runtime` module (and its `scripts.provision_agentcore` import) resolves; a bare
 `pytest` invocation fails with an opaque `could not load AGENTCORE_POC_LIVE_RUNTIME` error.
+
+**Every live gate needs a real interactive terminal, not a piped or backgrounded shell.**
+`test_entra_obo_live.py` asks a mid-run yes/no question on stdin ("Did a consent/permission
+screen appear?"); if stdin is not a live terminal (for example the command is run through a
+backgrounded/piped tool call), that prompt gets EOF instead of an answer and the test silently
+treats it as "consent seen", failing H2 for a reason that has nothing to do with the actual run.
+Every device-code prompt across every live test likewise needs a human at a browser within its
+sign-in window. Run these commands directly in your own terminal session.
+
+**Finding: long-running `uvicorn` processes serve a stale `.env` snapshot.** `resource_api` (port
+8000) and `web:create_production_app` (port 8001) both read configuration once at process
+startup. If `.env` is edited after either has been started -- a new Google provider, a rotated
+tunnel URL, a changed workload name -- the running process keeps using its original values
+indefinitely. This produces a specific, easy-to-misdiagnose symptom in the Google flow: the
+browser-served `google-connect` establishes a grant under the stale process's (old) provider or
+workload name, while a fresh CLI invocation of `google-list` reads the current `.env` and looks
+up a different one, so it reports `authorization_required` permanently -- indistinguishable from
+the actual vaulting bug in the finding below except that retrying never resolves it. Restart both
+`uvicorn` processes (same ports, so any `cloudflared` tunnel already pointed at them keeps working
+unchanged) after any `.env` edit and before trusting a live gate result.
+
+**Finding: unattended `cloudflared tunnel --url` "quick tunnels" die silently after about a day.**
+These are unauthenticated, ephemeral tunnels; Cloudflare eventually drops the registration while
+the local `cloudflared` process keeps running and retrying, so the previously-working public
+hostname starts returning `NXDOMAIN` with no local error. The failure surfaces downstream as a
+plain DNS/connect error in whatever test tries to reach that hostname next (for example
+`test_entra_obo_live.py` failing with `httpx.ConnectError` against `RESOURCE_API_URL`), which
+looks like a code or network problem rather than a dead tunnel. Check the tunnel's own log for a
+repeating `"Unauthorized: Tunnel not found"` line before assuming a code-level bug. Fix: kill the
+dead `cloudflared` process, start a new one on the same local port (it gets a new random
+hostname), and update whichever `.env` variable (`RESOURCE_API_URL` or `PUBLIC_BASE_URL`) held the
+old one -- `PUBLIC_BASE_URL` changing also requires updating the registered Entra/Google redirect
+URIs, since that hostname is embedded in the OAuth callback registration; `RESOURCE_API_URL` does
+not, since it is only read client-side by whichever process calls into the synthetic resource API.
 
 ## Google Browser Callback
 
