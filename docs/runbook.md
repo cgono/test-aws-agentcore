@@ -394,10 +394,37 @@ Run lifecycle work only after both Phase 1 and the complete Phase 2 gate pass. I
 sanitized rows to `evidence/phase-2.jsonl`; that ignored file and the mode-`0600`
 `.poc-expiry-state.json` resume state must not be added to Git.
 
+### Phase 3 observations (2026-08-29)
+
+- Preflight succeeded after renewing the AWS SSO session.
+- The initial latency attempt returned `google_authorization_required` for User A despite
+  earlier durable-vault evidence. The configured provider still matched the recorded state and
+  the public callback health check returned HTTP 200. A fresh User A Google consent followed by
+  `google-list` restored a durable Drive-metadata read; no infrastructure change was required.
+- The 10-sample latency run passed: p50 1022 ms and p95 1949 ms. Its aggregate Drive results and
+  Google-token fingerprints were stable; workload-token fingerprints differed between samples.
+- The 5-worker, 20-request concurrency run passed with all requests completed, zero throttles,
+  zero retries, and zero backoff. The run did not establish a documented quota or temporal target,
+  so its readiness result remains `unknown` rather than a capacity pass.
+- The 30-minute CloudTrail observation passed with 13 eligible events and all three required
+  attribution fields present: AWS principal, workload identity, and user correlation.
+- H8 recorded `failed` with `drive_revocation_not_observed`. This is an evidence result, not a
+  command failure: the command exited zero and did not delete the shared credential provider.
+- H7 remains unstarted. `OperatorLiveRuntime.run_lifecycle_measurements()` invokes the live CLI
+  through Typer's `CliRunner`, which captures the Entra device-code prompt while the flow waits for
+  browser approval. An operator cannot see or complete that prompt, so the prescribed lifecycle
+  pytest gate cannot yet seed or confirm the real source-expiry experiment. This needs a runtime
+  change that preserves interactive terminal output before H7 can proceed.
+
+**Important ordering for H7:** do not run standalone `measure expiry` before the lifecycle gate.
+The operator runtime installs the H7 raw-state seeder only inside that gate, and the seeder runs
+only when `.poc-expiry-state.json` does not already exist. A standalone invocation creates that
+resume state without creating the raw H7 state, making the later gate unable to seed H7 without
+altering state.
+
 ```bash
 .venv/bin/agentcore-identity-poc measure latency --samples 10
 .venv/bin/agentcore-identity-poc measure concurrency --workers 5 --requests 20
-.venv/bin/agentcore-identity-poc measure expiry --resume-state .poc-expiry-state.json
 .venv/bin/agentcore-identity-poc measure cloudtrail --lookback-minutes 30
 .venv/bin/agentcore-identity-poc offboard google --user-alias user-a --apply
 ```
