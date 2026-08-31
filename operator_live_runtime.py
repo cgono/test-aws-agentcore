@@ -32,6 +32,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
 
+import typer
 from typer.testing import CliRunner
 
 import agentcore_identity_poc.cli as cli
@@ -188,12 +189,24 @@ class OperatorLiveRuntime:
         permanent product limitation, not something this adapter can improve on.
         `post_expiry_obo_refresh` delegates to `run_source_expiry_obo_experiment()`, which
         needs real elapsed time and a later, separate call to ever report True.
+
+        `measure latency`, `measure expiry`, and `offboard google` each acquire a fresh
+        inbound token via an Entra device-code prompt (`_measurement_identity` ->
+        `runtime.acquire_token`), which the operator must read and complete in a browser
+        before the call can return. `CliRunner.invoke` redirects `sys.stdout` into an
+        internal buffer for the whole call and only hands back `result.output` once the
+        command finishes -- so the device-code message the operator needs is invisible
+        until after the very call that is blocked waiting on the operator, a deadlock, not
+        a flakiness issue. `_invoke_cli_command` calls the Typer command function directly
+        instead, leaving `sys.stdout`/`sys.stdin` untouched so the prompt reaches the real
+        terminal live, exactly as running the command directly at a shell would.
+        `measure cloudtrail` needs no interactive token, so it keeps using `CliRunner`.
         """
         runner = CliRunner()
         result: dict[str, bool | str] = {}
 
         result["latency_recorded"] = (
-            runner.invoke(cli.app, ["measure", "latency", "--samples", "10"]).exit_code == 0
+            _invoke_cli_command(cli.measure_latency_command, samples=10) == 0
         )
         result["cloudtrail_recorded"] = (
             runner.invoke(
@@ -207,23 +220,21 @@ class OperatorLiveRuntime:
             cli._default_runtime(), source_expiry_runner=_live_source_expiry_runner
         )
         try:
-            expiry_result = runner.invoke(
-                cli.app, ["measure", "expiry", "--resume-state", str(_EXPIRY_STATE_PATH)]
+            expiry_exit_code = _invoke_cli_command(
+                cli.measure_expiry_command, resume_state=_EXPIRY_STATE_PATH
             )
         finally:
             cli.runtime_factory = original_runtime_factory
-        result["post_expiry_google_refresh"] = (
-            "failed" if expiry_result.exit_code == 0 else "unproven"
-        )
+        result["post_expiry_google_refresh"] = "failed" if expiry_exit_code == 0 else "unproven"
 
         experiment = self.run_source_expiry_obo_experiment()
         result["post_expiry_obo_refresh"] = True if experiment is True else "unknown"
 
         user_alias = os.environ.get("AGENTCORE_POC_USER_A_ALIAS", "").strip() or "user-a"
-        offboard_result = runner.invoke(
-            cli.app, ["offboard", "google", "--user-alias", user_alias, "--apply"]
+        _invoke_cli_command(cli.offboard_google, user_alias=user_alias, apply=True)
+        result["offboarding_h8"] = _read_last_offboarding_status(
+            cli._DEFAULT_GOOGLE_EVIDENCE_PATH, user_alias
         )
-        result["offboarding_h8"] = _offboarding_status(offboard_result.output)
 
         return result
 
@@ -300,15 +311,48 @@ def _close(resource_client: object) -> None:
         close()
 
 
-def _offboarding_status(output: str) -> Literal["pass", "failed"]:
-    lines = [line for line in output.strip().splitlines() if line.strip()]
-    if not lines:
-        return "failed"
+def _invoke_cli_command(command: Callable[..., None], /, **kwargs: object) -> int:
+    """Call a Typer command function directly, bypassing `CliRunner`'s stdio capture.
+
+    `typer.Exit` (raised by the CLI's own blocked/error paths) is the same signal
+    `CliRunner.invoke` would otherwise translate into `result.exit_code`; a normal return
+    means the command completed successfully, exit code 0.
+    """
     try:
-        payload = json.loads(lines[-1])
-    except json.JSONDecodeError:
+        command(**kwargs)
+    except typer.Exit as exc:
+        return exc.exit_code
+    return 0
+
+
+def _read_last_offboarding_status(
+    evidence_path: Path, user_alias: str
+) -> Literal["pass", "failed"]:
+    """Read the just-appended H8 `offboard_google` row for this alias.
+
+    `offboard_google` is now called directly (see `_invoke_cli_command`) rather than
+    through `CliRunner`, so there is no captured stdout left to parse for its status line;
+    the evidence row it appends is the durable record of what it actually decided.
+    """
+    try:
+        lines = evidence_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
         return "failed"
-    return "pass" if payload.get("status") == "pass" else "failed"
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (
+            row.get("hypothesis") == "H8"
+            and row.get("operation") == "offboard_google"
+            and row.get("details", {}).get("user_alias") == user_alias
+        ):
+            return "pass" if row.get("outcome") == "pass" else "failed"
+    return "failed"
 
 
 def _live_source_expiry_runner(

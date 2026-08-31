@@ -583,14 +583,17 @@ def measure_expiry_command(
             outcome = "fail"
             operation = "provider_expiry_unavailable"
             details = {
-                "token_kind": "google_token",
+                # "kind", not "token_kind": the latter trips
+                # redaction._SENSITIVE_FIELD_COMPONENTS's "token" component check even
+                # though the value is an enum tag ("google_token"), never a token itself.
+                "kind": "google_token",
                 "detail": "agentcore_response_lacks_provider_expiry_raw_token_not_retained",
             }
         elif comparison is None:
             outcome = "resume_required"
             operation = "expiry_issue"
             details = {
-                "token_kind": entry.kind,
+                "kind": entry.kind,
                 "issued_at": entry.issued_at,
                 "expires_at": entry.expires_at,
                 "expiry_known": entry.expiry_known,
@@ -600,7 +603,7 @@ def measure_expiry_command(
             outcome = "unproven"
             operation = "fresh_token_comparison"
             details = {
-                "token_kind": entry.kind,
+                "kind": entry.kind,
                 "prior_expiry_known": comparison.prior_expiry_known,
                 "prior_expires_at": comparison.prior_expires_at,
                 "previous_fingerprint": comparison.previous_fingerprint,

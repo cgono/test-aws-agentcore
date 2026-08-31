@@ -1,19 +1,20 @@
 # AgentCore Identity POC Runbook
 
-## Current Status (updated 2026-08-28)
+## Current Status (updated 2026-08-31)
 
-Phase 1 and Phase 2 are both complete with current, live, passing evidence: H1, H2, H6 (Entra
-OBO, both test users), the Google callback/consent/durable-vault gate, H4a, and H4b are all
-proven post-fix (see the `customParameters` and Secrets Manager findings under Phase 2 Isolation
-below, plus the stale-`.env`-process and dying-quick-tunnel findings under Phase 1). H3 remains a
-documented feasibility blocker (AgentCore exposes no provider-token expiry metadata), and H5 is
-out of scope (no PingOne/AD FS environment available).
+All three phases are complete with current, live, passing (or, for known limitations,
+live-confirmed-failing) evidence. H1, H2, H6 (Entra OBO, both test users), the Google
+callback/consent/durable-vault gate, H4a, and H4b are all proven post-fix (see the
+`customParameters` and Secrets Manager findings under Phase 2 Isolation below, plus the
+stale-`.env`-process and dying-quick-tunnel findings under Phase 1). H3 remains a documented
+feasibility blocker (AgentCore exposes no provider-token expiry metadata), and H5 is out of
+scope (no PingOne/AD FS environment available). H7 and H8 are both terminal `fail` (see Phase 3
+observations below). `docs/assessment.md` is generated: decision `reject_or_defer`, custom-provider
+production path `rejected`.
 
-**Remaining work:** Phase 3 lifecycle (H7/H8, `test_lifecycle_live.py`) -- H7 needs a real 60-90
-minute wait between a seeding pass and a confirming pass, so treat it as its own session -- then
-`assessment-finalize` + `report` to produce `docs/assessment.md`, then cleanup. Start the next
-session at the "Phase 3: Lifecycle, Assessment, and Handoff" section below. Every live gate needs
-a real interactive terminal (see the note under Phase 1) and a valid `aws sso login` session.
+**Remaining work:** only cleanup (`scripts/provision_agentcore.py cleanup`, see the Cleanup
+section) is left. Every live gate needs a real interactive terminal (see the note under Phase 1)
+and a valid `aws sso login` session.
 
 ## Prerequisites
 
@@ -410,11 +411,36 @@ sanitized rows to `evidence/phase-2.jsonl`; that ignored file and the mode-`0600
   attribution fields present: AWS principal, workload identity, and user correlation.
 - H8 recorded `failed` with `drive_revocation_not_observed`. This is an evidence result, not a
   command failure: the command exited zero and did not delete the shared credential provider.
-- H7 remains unstarted. `OperatorLiveRuntime.run_lifecycle_measurements()` invokes the live CLI
-  through Typer's `CliRunner`, which captures the Entra device-code prompt while the flow waits for
-  browser approval. An operator cannot see or complete that prompt, so the prescribed lifecycle
-  pytest gate cannot yet seed or confirm the real source-expiry experiment. This needs a runtime
-  change that preserves interactive terminal output before H7 can proceed.
+- H7 remains unstarted. `OperatorLiveRuntime.run_lifecycle_measurements()` invoked the live CLI
+  through Typer's `CliRunner`, which captured the Entra device-code prompt for `measure latency`,
+  `measure expiry`, and `offboard google` (each acquires its own fresh inbound token) while the flow
+  waited for browser approval; an operator could not see or complete that prompt, so the prescribed
+  lifecycle pytest gate could not yet seed or confirm the real source-expiry experiment.
+
+  **Fixed:** `operator_live_runtime.py` now calls those three Typer command functions directly
+  (`_invoke_cli_command`) instead of through `CliRunner`, so their device-code prompt reaches the
+  real terminal live, exactly as running the command directly at a shell would; `measure cloudtrail`
+  needs no interactive token and still uses `CliRunner`. `offboard google`'s pass/fail is now read
+  back from its just-appended H8 evidence row instead of parsed `CliRunner` output, since there is
+  no captured stdout left once the call is direct. The lifecycle live gate still needs a real
+  interactive terminal for every run (same requirement as every other live gate) and can involve up
+  to three separate device-code sign-ins per invocation (latency, expiry when it is not resuming,
+  offboard) -- run it with `-s` and be ready to sign in as `user-a` (or whichever alias
+  `AGENTCORE_POC_USER_A_ALIAS` names) each time it prompts.
+
+  **H7 seed/confirm timing:** after the seed run, do not just wait for the runbook's generic
+  "60-90 minutes" -- read the actual `inbound_expiry` timestamp the seed run wrote, and wait until
+  wall-clock time passes it before rerunning:
+
+  ```bash
+  python3 -c "import json,datetime; d=json.load(open('evidence/raw/h7-source-expiry-state.json')); \
+    print(datetime.datetime.fromtimestamp(d['inbound_expiry']))"
+  ```
+
+  Never `cat` that file directly -- it holds a real, unredacted workload access token. The confirm
+  run is only valid once real time has passed that timestamp; the resume state's own `resume_at` can
+  reflect a different (e.g. workload-token) boundary and is not the right thing to wait on for H7
+  specifically.
 
 **Important ordering for H7:** do not run standalone `measure expiry` before the lifecycle gate.
 The operator runtime installs the H7 raw-state seeder only inside that gate, and the seeder runs
@@ -473,6 +499,60 @@ abandoned between the two runs (for example, the operator does not return after 
 real workload access token is left sitting in
 `evidence/raw/h7-source-expiry-state.json` until the second run completes and deletes it, or
 until it is removed by hand. Delete that file manually if the H7 flow is abandoned.
+
+### Phase 3 completion (2026-08-31)
+
+- **Fixed an `UnsafeEvidenceError` crash in `measure expiry`'s first live run against the real
+  evidence writer.** The evidence key `"token_kind"` trips `redaction.py`'s component-level
+  blocklist (it contains the component `"token"`) even though its value is only an enum tag,
+  never a token; every prior test used a fake evidence writer that never called
+  `assert_safe_evidence`, so this was never caught before it hit the real writer. Renamed to
+  `"kind"` in `cli.py`; added a regression test in `test_measurements.py` that routes through the
+  real `EvidenceWriter` so a future evidence-detail key of this shape is caught in CI, not live.
+  If the crash happened after the seed run, check first whether
+  `evidence/raw/h7-source-expiry-state.json` still exists (via the Python one-liner above, never
+  `cat`) before assuming the H7 seed was lost -- `source_expiry_runner` and the resume-state write
+  both complete before the crashing evidence-append loop runs, so the seed usually survives.
+
+- **The confirming H7 run is a one-shot consumer, not a repeatable check.** The first time
+  `run_source_expiry_obo_experiment()` runs after wall-clock time passes `inbound_expiry`, it
+  makes the real OBO call and unconditionally deletes
+  `evidence/raw/h7-source-expiry-state.json` on either outcome (pass or fail). Once the
+  `obo_after_inbound_expiry` row lands in evidence, H7 is done -- there is nothing to rerun or
+  wait for, and later lifecycle-gate runs will just report `"unknown"` (no raw state left to
+  check), which the gate accepts. This session's actual result: OBO does **not** survive source
+  (inbound Entra) token expiry using the old workload token --
+  `{"hypothesis":"H7","operation":"obo_after_inbound_expiry","outcome":"fail",
+  "details":{"source_expired":true,"obo_succeeded":false}}`.
+
+- **Recurring, still-unresolved finding: the AgentCore-vaulted Google grant for a user can go
+  from working to `google_authorization_required` on every embedded device-code sign-in within
+  roughly an hour of being (re-)established via `/connect`.** Happened twice in this session.
+  Two live theories, neither confirmed: a short server-side grant TTL unrelated to source-token
+  expiry, or the device-code flow silently reusing a stale/wrong cached Microsoft account in the
+  browser (fixed once by signing out of every other Microsoft account and signing in only as the
+  test user). Ruled out: `offboard_google` does not cause this -- in production it is a read-only
+  probe (`purge_google_user_connection` exists only in test fakes, never called live), confirmed
+  by grep and by the evidence rows it actually wrote. **Workaround until root-caused:** reconnect
+  Google (`/connect` as the test user, then `google-list` to confirm the marker) immediately
+  before every lifecycle-gate rerun, not just once per session.
+
+- **`entra-obo`'s default evidence path (`evidence/phase-1.jsonl`) does not persist across
+  sessions in this worktree** -- it never got combined with `evidence/phase-2.jsonl`, so H2 had
+  zero evidence rows anywhere on disk despite being verified live back in Phase 1. Regenerate it
+  with one more quick, Google-independent sign-in, pointed at the evidence file you actually use
+  for assessment: `entra-obo --evidence-path evidence/phase-2.jsonl`.
+
+- **Building `evidence/sanitized.jsonl` from the accumulated evidence file is not always a
+  straight copy.** `assessment.py`'s `_validate_measurements` rejects `null` in any
+  `_COUNT_FIELDS` key (e.g. `documented_quota`), but a real `measure concurrency` row legitimately
+  emits `null` there for an AWS-undocumented quota -- a genuine schema mismatch between the
+  evidence writers and the assessment validator, not something a rerun fixes. Drop the offending
+  row(s) rather than editing values; `assessment-finalize`'s per-hypothesis check is
+  existence-based across the whole evidence history (any matching-operation row with the right
+  outcome), not "exactly one row," so dropping one row is safe as long as another qualifying row
+  remains for that hypothesis. Worth a follow-up to make the validator accept `null` for
+  genuinely-undocumented quota fields instead of requiring this manual step.
 
 ### Assessment
 

@@ -38,6 +38,7 @@ from agentcore_identity_poc.downstream import (
     DriveMetadata,
     drive_metadata_marker,
 )
+from agentcore_identity_poc.evidence import EvidenceWriter
 from agentcore_identity_poc.experiments import (
     CloudTrailAttribution,
     ExpiryObservation,
@@ -1128,9 +1129,39 @@ def test_measure_expiry_reports_opaque_google_expiry_as_terminal_h3_infeasibilit
     )
     assert (google["operation"], google["outcome"]) == ("provider_expiry_unavailable", "fail")
     assert google["details"] == {
-        "token_kind": "google_token",
+        "kind": "google_token",
         "detail": "agentcore_response_lacks_provider_expiry_raw_token_not_retained",
     }
+
+
+def test_measure_expiry_first_run_writes_safe_evidence_through_real_writer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`RecordingEvidence` (used by every other CLI test in this file) never calls
+    `assert_safe_evidence`, so a bad evidence-detail key in `measure_expiry_command`
+    can pass every other test here and still blow up the first time it hits a real
+    `EvidenceWriter` live -- exactly what happened with the `token_kind` key (it trips
+    `redaction._SENSITIVE_FIELD_COMPONENTS`'s "token" component check even though its
+    value is never a token, just an enum tag). Route this one test through the real
+    writer so a future key of this shape is caught here instead of live.
+    """
+    evidence_path = tmp_path / "evidence.jsonl"
+    runtime = _measurement_runtime(
+        MeasurementIdentity(),
+        EvidenceWriter(evidence_path),  # type: ignore[arg-type]
+        clock=lambda: 0.0,
+        wall_clock=lambda: 0.0,
+        inbound_expiry=100.0,
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(
+        app, ["measure", "expiry", "--resume-state", str(tmp_path / "state")]
+    )
+
+    assert result.exit_code == 0, result.output
+    rows = [json.loads(line) for line in evidence_path.read_text().splitlines()]
+    assert {row["hypothesis"] for row in rows} == {"H3", "H7"}
 
 
 def test_measure_expiry_uses_wall_clock_for_epoch_expiry_not_monotonic_clock(
