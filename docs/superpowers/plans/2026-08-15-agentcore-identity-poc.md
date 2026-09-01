@@ -6,7 +6,7 @@
 
 **Architecture:** A Typer CLI owns orchestration and sanitized evidence collection. Focused adapters wrap Entra, AgentCore, and downstream HTTP APIs; a small FastAPI process serves the synthetic Entra-protected resource and the Google session-binding callback. Cloud integrations are behind protocols so local tests use deterministic fakes, and each cloud phase has a stop gate before later work begins.
 
-**Tech Stack:** Python 3.12+, `boto3` 1.42.49, `bedrock-agentcore` 1.18.1, `msal` 1.37.0, `PyJWT[crypto]` 2.13.0, FastAPI 0.139.2, Uvicorn 0.51.0, HTTPX, Typer 0.27.0, pytest, pytest-cov, Ruff, and mypy.
+**Tech Stack:** Python 3.12+, `boto3` 1.43.31, `bedrock-agentcore` 1.18.1, `msal` 1.37.0, `PyJWT[crypto]` 2.13.0, FastAPI 0.139.2, Uvicorn 0.51.0, HTTPX, Typer 0.27.0, pytest, pytest-cov, Ruff, and mypy.
 
 ---
 
@@ -84,7 +84,7 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
   "bedrock-agentcore==1.18.1",
-  "boto3==1.42.49",
+  "boto3==1.43.31",
   "fastapi==0.139.2",
   "httpx==0.28.1",
   "msal==1.37.0",

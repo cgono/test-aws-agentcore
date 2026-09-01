@@ -1,0 +1,62 @@
+# Custom-Provider Compatibility Assessment
+
+This is a paper assessment, not provider certification. `Supported` means a documented mapping
+exists; `unknown` means the production tenant must prove the exact request and response before the
+custom-provider path can be approved. AgentCore's custom-provider surface is documented in the
+[custom OAuth client guide](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/identity-add-oauth-client-custom.html)
+and its [client-authentication reference](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/client-auth-methods.html).
+
+| Capability | PingOne | AD FS |
+| --- | --- | --- |
+| Discovery | **Unknown.** PingOne describes the discovery-document URI format but this assessment has not verified an exact target-environment endpoint ([source](https://docs.pingidentity.com/pingone/integrations/p1_discovery_document_uri.html)). **Consequence:** obtain and validate the production discovery document before configuring AgentCore `discoveryUrl`. | **Unknown.** The AD FS OAuth flow guide documents flow endpoints, but this assessment has not verified an exact AD FS discovery document ([source](https://learn.microsoft.com/en-us/windows-server/identity/ad-fs/overview/ad-fs-openid-connect-oauth-flows-scenarios)). **Consequence:** obtain and validate the tenant-specific metadata URL and issuer before provider creation. |
+| Grant | **Supported.** PingOne documents RFC 8693 token exchange ([source](https://docs.pingidentity.com/pingone/use_cases/p1_oauth_2_token_exchange.html)). **Consequence:** map the production client to AgentCore token exchange and validate the returned token type. | **Supported.** AD FS documents OBO using the JWT bearer grant and `requested_token_use=on_behalf_of` ([source](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-oapx/6bd31cd1-1ebf-4eef-9a12-5e3165522c3e)). **Consequence:** the vendor grant is a candidate; its AgentCore request mapping remains blocked on direct control-plane proof. |
+| Client authentication | **Supported.** PingOne supports `CLIENT_SECRET_BASIC` and `CLIENT_SECRET_POST` among its token-endpoint methods ([source](https://docs.pingidentity.com/pingone/applications/p1_token_endpoint_authentication_methods.html)). **Consequence:** use one of AgentCore's documented matching modes; do not assume JWT client auth works. | **Supported.** AD FS documents confidential-client shared-secret authentication for OBO ([source](https://learn.microsoft.com/en-us/windows-server/identity/ad-fs/overview/ad-fs-openid-connect-oauth-flows-scenarios)). **Consequence:** prove `CLIENT_SECRET_POST` against the production AD FS application. |
+| Actor token | **Unknown.** PingOne token exchange permits an optional actor token ([source](https://docs.pingidentity.com/pingone/use_cases/p1_oauth_2_token_exchange.html)). **Consequence:** test whether the selected PingOne policy accepts AgentCore `NONE`, M2M, or AWS IAM actor mode. | **Supported.** AD FS's documented OBO request supplies the user assertion, not a separate actor-token parameter ([source](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-oapx/6bd31cd1-1ebf-4eef-9a12-5e3165522c3e)). **Consequence:** start with AgentCore actor mode `NONE`; a separate actor assertion is unproven. |
+| Actor scopes | **Unknown.** PingOne evaluates application policy and requested scopes during delegation ([source](https://docs.pingidentity.com/pingone/ai_agents/p1_ai_agents.html)). **Consequence:** prove whether AgentCore `actorTokenScopes` is required and which scopes are accepted. | **Unknown.** AD FS documents optional OBO `scope` but not AgentCore actor-scope semantics ([source](https://learn.microsoft.com/en-us/windows-server/identity/ad-fs/overview/ad-fs-openid-connect-oauth-flows-scenarios)). **Consequence:** leave actor scopes unset until an AD FS integration proves them. |
+| Audience/resource | **Unknown.** PingOne documents audience restriction for delegation tokens ([source](https://docs.pingidentity.com/pingone/ai_agents/p1_ai_agents.html)). **Consequence:** validate the environment's exact audience/resource request parameter before deployment. | **Unknown.** AD FS OBO requires the downstream `resource` identifier ([source](https://learn.microsoft.com/en-us/windows-server/identity/ad-fs/overview/ad-fs-openid-connect-oauth-flows-scenarios)), but this assessment has no direct AgentCore Identity proof for forwarding it. **Consequence:** block the AD FS path until that mapping is proven. |
+| Custom parameters | **Unknown.** PingOne documents token exchange inputs but tenant policy determines optional audience and actor behavior ([source](https://docs.pingidentity.com/pingone/use_cases/p1_oauth_2_token_exchange.html)). **Consequence:** use a smallest mock only for an unresolved concrete parameter behavior; do not infer it. | **Unknown.** AD FS requires OBO `assertion`, `requested_token_use`, and `resource` inputs ([source](https://learn.microsoft.com/en-us/windows-server/identity/ad-fs/overview/ad-fs-openid-connect-oauth-flows-scenarios)), but no direct AgentCore Identity request/control-plane source proves arbitrary parameter forwarding. **Consequence:** this is a blocking proof item; do not infer support from AgentCore Gateway documentation. |
+| Outbound web identity federation | **Unknown.** AgentCore's AWS IAM JWT mode requires account-level outbound web identity federation and `sts:GetWebIdentityToken` ([source](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/client-auth-methods.html)). **Consequence:** cloud-team enablement is necessary, and PingOne acceptance of the AWS JWT remains unproven. | **Unknown.** AD FS documents its own certificate client assertion, not trust of an AWS IAM ID-token JWT ([source](https://learn.microsoft.com/en-us/windows-server/identity/ad-fs/overview/ad-fs-openid-connect-oauth-flows-scenarios)). **Consequence:** do not select AgentCore AWS IAM JWT client auth without an AD FS trust proof; use a documented secret mode or reject this path. |
+
+## AWS-side IAM prerequisite (proven in the POC, applies to both providers)
+
+Independent of which vendor is used, AgentCore Identity stores every OAuth2 credential provider's
+client secret in an AWS-managed Secrets Manager secret and authorizes `GetResourceOauth2Token`
+against `secretsmanager:GetSecretValue` on that exact secret, evaluated on the calling IAM
+principal itself -- not against `bedrock-agentcore:*` alone. This was undocumented in AWS's public
+reference and was proven empirically in this POC's H4b gate (see `docs/runbook.md`'s Phase 2
+Isolation section for the full finding). It applies identically whether the provider is Microsoft,
+Google, a custom PingOne provider, or a custom AD FS provider: **any execution role that calls
+AgentCore Identity for a given provider needs an explicit `secretsmanager:GetSecretValue` grant on
+that provider's AWS-managed secret ARN**, obtainable with no wildcard from
+`GetOAuth2CredentialProvider`'s `clientSecretArn.secretArn` field. Omitting it produces a generic
+`AccessDeniedException` that is easy to misattribute to `bedrock-agentcore` scoping or IAM
+propagation delay rather than to this separate, provider-scoped grant. Include this grant in the
+IAM design for any PingOne or AD FS custom-provider rollout, alongside whichever `bedrock-agentcore`
+actions that rollout's execution roles require.
+
+## `customParameters` must be minimal and exact (proven in the POC for Google; treat as a risk for both vendors)
+
+This directly bears on the "Custom parameters" row above, marked `Unknown` for both vendors. In
+this POC's Google integration, `GetResourceOauth2Token`'s `customParameters` only tolerates the
+keys AgentCore recognizes for that provider (`access_type`, documented). Adding one it does not
+recognize -- for example `prompt`, attempting to force the IdP's own re-consent screen -- produces
+**no error anywhere in the flow**: the authorization URL is still issued, the browser consent
+screen still completes normally, `CompleteResourceTokenAuth` still reports success, but nothing is
+actually vaulted, and every later retrieval reports "authorization required" indefinitely with
+nothing pointing at the real cause. Confirmed with a controlled A/B test: two otherwise-identical
+authorization requests differing only in the presence of a `prompt` key, one vaulted a durable,
+immediately retrievable token and the other vaulted nothing.
+
+**Consequence for PingOne/AD FS:** do not assume an unrecognized or vendor-specific custom
+parameter is silently ignored -- confirm the exact set of parameter keys the target provider's
+grant type accepts, keep that set identical between the establishing call and every later
+retrieval call, and verify durability with an explicit retrieval-after-establishment check rather
+than trusting a success response from the completion call. A 200/204 completion is not proof of a
+durable, retrievable grant.
+
+## Gate
+
+For either provider, record the exact discovery document, grant, client-authentication mode,
+actor-token choice, actor scopes, audience/resource behavior, custom parameters, and any AWS web
+identity federation prerequisite in sanitized evidence. Any unresolved production behavior remains
+a blocker for that provider path.

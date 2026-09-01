@@ -1,1 +1,17 @@
 .worktrees/
+.venv/
+.env
+.poc-state.json
+evidence/raw/
+evidence/*.jsonl
+
+__pycache__/
+*.py[cod]
+*$py.class
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+*.egg-info/
+dist/
+build/

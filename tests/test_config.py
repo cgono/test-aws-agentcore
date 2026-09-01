@@ -1,0 +1,112 @@
+import pytest
+
+from agentcore_identity_poc.config import Settings, SettingsError
+
+BASE = {
+    "AWS_REGION": "us-west-2",
+    "AWS_BUDGET_NAME": "agentcore-identity-poc-monthly",
+    "ENTRA_TENANT_ID": "11111111-1111-1111-1111-111111111111",
+    "ENTRA_PUBLIC_CLIENT_ID": "22222222-2222-2222-2222-222222222222",
+    "ENTRA_API_CLIENT_ID": "33333333-3333-3333-3333-333333333333",
+    "ENTRA_DOWNSTREAM_SCOPE": "api://44444444-4444-4444-4444-444444444444/access_as_user",
+    "AGENTCORE_WORKLOAD_NAME": "iig-poc-approved",
+    "AGENTCORE_SECOND_WORKLOAD_NAME": "iig-poc-unapproved",
+    "AGENTCORE_MICROSOFT_PROVIDER": "iig-poc-microsoft",
+    "AGENTCORE_GOOGLE_PROVIDER": "iig-poc-google",
+    "RESOURCE_API_AUDIENCE": "api://44444444-4444-4444-4444-444444444444",
+    "RESOURCE_API_URL": "https://poc-resource.example.test/metadata",
+    "PUBLIC_BASE_URL": "https://poc-callback.example.test",
+}
+
+
+def test_settings_require_exact_https_public_url() -> None:
+    values = BASE | {"PUBLIC_BASE_URL": "http://localhost:8000"}
+
+    with pytest.raises(SettingsError, match="PUBLIC_BASE_URL must use https"):
+        Settings.from_mapping(values)
+
+
+def test_settings_derive_pinned_issuer_and_callback() -> None:
+    settings = Settings.from_mapping(BASE)
+
+    assert (
+        settings.entra_issuer
+        == "https://login.microsoftonline.com/11111111-1111-1111-1111-111111111111/v2.0"
+    )
+    assert settings.google_return_url == "https://poc-callback.example.test/oauth/google/return"
+
+
+def test_settings_allow_global_ipv4_callback() -> None:
+    settings = Settings.from_mapping(BASE | {"PUBLIC_BASE_URL": "https://8.8.8.8"})
+
+    assert settings.google_return_url == "https://8.8.8.8/oauth/google/return"
+
+
+def test_settings_require_nonempty_values() -> None:
+    values = BASE | {"ENTRA_TENANT_ID": ""}
+
+    with pytest.raises(SettingsError, match="ENTRA_TENANT_ID"):
+        Settings.from_mapping(values)
+
+
+def test_settings_reject_whitespace_only_values() -> None:
+    values = BASE | {"ENTRA_TENANT_ID": "   "}
+
+    with pytest.raises(SettingsError, match="ENTRA_TENANT_ID"):
+        Settings.from_mapping(values)
+
+
+def test_settings_strip_trailing_slashes() -> None:
+    values = {name: f"{value}/" for name, value in BASE.items()}
+    settings = Settings.from_mapping(values)
+
+    assert settings.aws_region == "us-west-2"
+    assert settings.public_base_url == "https://poc-callback.example.test"
+
+
+def test_settings_normalize_surrounding_whitespace_before_trailing_slashes() -> None:
+    values = BASE | {
+        "AWS_REGION": " us-west-2 ",
+        "PUBLIC_BASE_URL": " https://poc-callback.example.test/ ",
+    }
+
+    settings = Settings.from_mapping(values)
+
+    assert settings.aws_region == "us-west-2"
+    assert settings.public_base_url == "https://poc-callback.example.test"
+
+
+def test_settings_reject_overlong_idna_hostname() -> None:
+    hostname = ".".join(["a" * 63] * 4)
+    values = BASE | {"PUBLIC_BASE_URL": f"https://{hostname}"}
+
+    with pytest.raises(SettingsError, match="PUBLIC_BASE_URL must use https"):
+        Settings.from_mapping(values)
+
+
+@pytest.mark.parametrize(
+    "public_base_url",
+    [
+        "https:///relative",
+        "https://user@",
+        "https://:443",
+        "https://localhost:8443",
+        "https://127.0.0.1:8443",
+        "https://0177.0.0.1",
+        "https://0x7f.0.0.1",
+        "https://127.1",
+        "https://127.0.1",
+        "https://0x7f.1",
+        "https://user:pass@poc-callback.example.test",
+        "https://exa mple.test",
+        "https://-example.test",
+        "https://example..test",
+        "https://poc-callback.example.test/metadata?unexpected=true",
+        "https://poc-callback.example.test/metadata#fragment",
+    ],
+)
+def test_settings_reject_unusable_https_public_urls(public_base_url: str) -> None:
+    values = BASE | {"PUBLIC_BASE_URL": public_base_url}
+
+    with pytest.raises(SettingsError, match="PUBLIC_BASE_URL must use https"):
+        Settings.from_mapping(values)

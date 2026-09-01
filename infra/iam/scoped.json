@@ -1,0 +1,44 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "UseOnlyNamedPocResources",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock-agentcore:GetWorkloadAccessTokenForJWT",
+        "bedrock-agentcore:GetResourceOauth2Token",
+        "bedrock-agentcore:CompleteResourceTokenAuth"
+      ],
+      "Resource": [
+        "${DIRECTORY_ARN}",
+        "${WORKLOAD_ARN}",
+        "${SECOND_WORKLOAD_ARN}",
+        "${VAULT_ARN}",
+        "${PROVIDER_ARN}"
+      ]
+    },
+    {
+      "Sid": "DenySecondWorkloadJwtBinding",
+      "Effect": "Deny",
+      "Action": "bedrock-agentcore:GetWorkloadAccessTokenForJWT",
+      "Resource": "${SECOND_WORKLOAD_ARN}"
+    },
+    {
+      "Sid": "AllowOauth2ProviderSecretAccess",
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": [
+        "${SECRET_ARN}"
+      ]
+    },
+    {
+      "Sid": "DenyUserIdWorkloadBinding",
+      "Effect": "Deny",
+      "Action": "bedrock-agentcore:GetWorkloadAccessTokenForUserId",
+      "Resource": [
+        "${WORKLOAD_ARN}",
+        "${SECOND_WORKLOAD_ARN}"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Completing connection</title></head>
+<body>
+<p id="outcome" aria-live="polite">Completing connection.</p>
+<script nonce="__CSP_NONCE__">
+(() => {
+  const outcome = document.getElementById("outcome");
+  const finish = (success) => {
+    window.sessionStorage.removeItem("agentcore_entra_access_token");
+    outcome.textContent = success
+      ? "Connection complete. Return to the CLI."
+      : "Connection could not be completed. Return to the CLI.";
+  };
+  const parameters = new URLSearchParams(window.location.search);
+  const state = parameters.get("state");
+  const sessionUri = parameters.get("session_uri") || parameters.get("session_id");
+  const accessToken = window.sessionStorage.getItem("agentcore_entra_access_token");
+  window.history.replaceState({}, document.title, "/oauth/google/return");
+  if (!state || !sessionUri || !accessToken) {
+    finish(false);
+    return;
+  }
+  try {
+    window.fetch("/oauth/google/complete", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json"},
+      body: JSON.stringify({session_uri: sessionUri, state})
+    }).then((response) => finish(response.ok)).catch(() => finish(false));
+  } catch (_) {
+    finish(false);
+  }
+})();
+</script>
+</body>
+</html>

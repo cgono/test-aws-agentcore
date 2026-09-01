@@ -1,0 +1,1791 @@
+from __future__ import annotations
+
+import base64
+import json
+import os
+import stat
+from dataclasses import replace
+from pathlib import Path
+from threading import Barrier
+
+import pytest
+from typer.testing import CliRunner
+
+from agentcore_identity_poc.agentcore import (
+    AgentCoreAccessDenied,
+    AgentCoreThrottled,
+    AuthorizationRequired,
+    OAuthToken,
+)
+from agentcore_identity_poc.cli import (
+    Runtime,
+    _cloudtrail_attribution,
+    _cloudtrail_attribution_from_events,
+    _expiry_run_salt,
+    _measurement_project_id,
+    _render_scoped_policy,
+    _run_workload_isolation,
+    _supported_token_expiry,
+    app,
+    run_live_user_isolation,
+    run_live_workload_isolation,
+)
+from agentcore_identity_poc.config import Settings, SettingsError
+from agentcore_identity_poc.downstream import (
+    DownstreamAccessDenied,
+    DownstreamThrottled,
+    DownstreamUnauthorized,
+    DriveMetadata,
+    drive_metadata_marker,
+)
+from agentcore_identity_poc.evidence import EvidenceWriter
+from agentcore_identity_poc.experiments import (
+    CloudTrailAttribution,
+    ExpiryObservation,
+    MeasurementConfigurationError,
+    RetryableMeasurementError,
+    SourceExpiryExperiment,
+    cold_warm_latency_report,
+    compare_expiry_observations,
+    load_expiry_resume_state,
+    measure_bounded_concurrency,
+    measure_latency,
+    record_expiry_state,
+    retry_with_backoff,
+    token_fingerprint,
+)
+
+SETTINGS = Settings(
+    aws_region="us-west-2",
+    aws_budget_name="agentcore-identity-poc-monthly",
+    entra_tenant_id="tenant-id",
+    entra_public_client_id="public-client-id",
+    entra_api_client_id="api-client-id",
+    entra_downstream_scope="api://resource/access_as_user",
+    agentcore_workload_name="approved-workload",
+    agentcore_second_workload_name="unapproved-workload",
+    agentcore_microsoft_provider="microsoft-provider",
+    agentcore_google_provider="google-provider",
+    resource_api_audience="api://resource",
+    resource_api_url="https://resource.example.test/metadata",
+    public_base_url="https://callback.example.test",
+)
+_INBOUND_TOKEN = "inbound-secret"
+
+
+class RecordingEvidence:
+    def __init__(self) -> None:
+        self.observations: list[object] = []
+
+    def append(self, observation: object) -> None:
+        self.observations.append(observation)
+
+
+class MeasurementIdentity:
+    def __init__(self, *, inbound_token: str = _INBOUND_TOKEN, token_suffix: str = "") -> None:
+        self.inbound_token = inbound_token
+        self.token_suffix = token_suffix
+        self.workload_calls = 0
+        self.force_authentication: list[bool] = []
+
+    def workload_token(self, workload_name: str, user_token: str) -> str:
+        assert workload_name == SETTINGS.agentcore_workload_name
+        assert user_token == self.inbound_token
+        self.workload_calls += 1
+        return f"workload-secret{self.token_suffix}"
+
+    def obo_token(self, workload_token: str, provider: str, scopes: list[str]) -> str:
+        assert workload_token == f"workload-secret{self.token_suffix}"
+        return f"obo-secret{self.token_suffix}"
+
+    def google_token(
+        self,
+        workload_token: str,
+        provider: str,
+        scopes: list[str],
+        return_url: str,
+        state: str,
+        *,
+        force_authentication: bool = False,
+    ) -> OAuthToken | AuthorizationRequired:
+        self.force_authentication.append(force_authentication)
+        return OAuthToken(f"google-secret{self.token_suffix}")
+
+
+class MeasurementDrive:
+    def __init__(self, results: list[DriveMetadata | Exception] | None = None) -> None:
+        self.results = results or [DriveMetadata(1, {"text/plain": 1})]
+        self.access_tokens: list[str] = []
+
+    def list(self, access_token: str) -> DriveMetadata:
+        self.access_tokens.append(access_token)
+        result = self.results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def close(self) -> None:
+        return None
+
+
+def _measurement_runtime(
+    identity: MeasurementIdentity,
+    evidence: RecordingEvidence,
+    *,
+    clock: object = lambda: 0.0,
+    drive: MeasurementDrive | None = None,
+    inbound_expiry: float = 100.0,
+    wall_clock: object | None = None,
+) -> Runtime:
+    measurement_drive = drive or MeasurementDrive()
+    return Runtime(
+        load_settings=lambda: SETTINGS,
+        check_reachability=lambda _: None,
+        acquire_token=lambda _, __: identity.inbound_token,
+        validate_token=lambda _, __: {"sub": "subject", "exp": inbound_expiry},
+        agentcore=lambda _: identity,
+        downstream=lambda _: None,  # type: ignore[arg-type]
+        google_drive=lambda _: measurement_drive,
+        clock=clock,  # type: ignore[arg-type]
+        wall_clock=wall_clock or clock,  # type: ignore[arg-type]
+        evidence_writer=lambda _: evidence,
+        stdin_isatty=lambda: False,
+        random_urlsafe=lambda: "opaque-state",
+    )
+
+
+def test_latency_reports_distinct_cold_and_warm_samples_with_percentiles() -> None:
+    now = iter((0.0, 0.100, 0.100, 0.120, 0.120, 0.150))
+
+    report = measure_latency(
+        samples=3,
+        operation=lambda cold: "cold" if cold else "warm",
+        clock=lambda: next(now),
+    )
+
+    assert [sample.cold for sample in report.samples] == [True, False, False]
+    assert [sample.latency_ms for sample in report.samples] == [100, 20, 30]
+    assert report.p50_ms == 30
+    assert report.p95_ms == 100
+
+
+def test_cold_warm_latency_report_keeps_stage_percentiles_separate() -> None:
+    report = cold_warm_latency_report(
+        (
+            (True, 10),
+            (False, 20),
+            (False, 30),
+        )
+    )
+
+    assert report.cold_p50_ms == 10
+    assert report.cold_p95_ms == 10
+    assert report.warm_p50_ms == 20
+    assert report.warm_p95_ms == 30
+
+
+def test_token_fingerprints_are_salted_per_run_and_do_not_include_token() -> None:
+    token = "header.payload.signature"
+
+    first = token_fingerprint(token, run_salt="run-one")
+    second = token_fingerprint(token, run_salt="run-two")
+
+    assert first != second
+    assert len(first) == 64
+    assert token not in first
+
+
+def test_bounded_concurrency_reports_observed_serial_peak_within_requested_workers() -> None:
+    active = 0
+    maximum_active = 0
+
+    def request(index: int) -> int:
+        nonlocal active, maximum_active
+        active += 1
+        maximum_active = max(maximum_active, active)
+        active -= 1
+        return index
+
+    result = measure_bounded_concurrency(workers=2, requests=5, request=request)
+
+    assert result.completed == 5
+    assert result.maximum_workers == 1
+    assert maximum_active <= 2
+
+
+def test_bounded_concurrency_reports_peak_for_controlled_overlapping_requests() -> None:
+    barrier = Barrier(2)
+
+    def request(index: int) -> int:
+        barrier.wait(timeout=1)
+        return index
+
+    result = measure_bounded_concurrency(workers=2, requests=2, request=request)
+
+    assert result.completed == 2
+    assert result.maximum_workers == 2
+
+
+def test_retry_uses_jittered_exponential_backoff_for_retryable_failures() -> None:
+    attempts = 0
+    delays: list[float] = []
+
+    def operation() -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise RetryableMeasurementError("throttled")
+        return "ok"
+
+    assert (
+        retry_with_backoff(
+            operation,
+            sleep=delays.append,
+            random_unit=lambda: 0.5,
+            max_attempts=3,
+        )
+        == "ok"
+    )
+    assert delays == [0.125, 0.25]
+
+
+def test_retry_does_not_retry_non_retryable_4xx() -> None:
+    attempts = 0
+
+    def operation() -> str:
+        nonlocal attempts
+        attempts += 1
+        raise MeasurementConfigurationError("invalid request")
+
+    with pytest.raises(MeasurementConfigurationError):
+        retry_with_backoff(operation, sleep=lambda _: None, random_unit=lambda: 0.5)
+
+    assert attempts == 1
+
+
+def test_expiry_state_records_distinct_token_kinds_without_tokens(tmp_path: Path) -> None:
+    path = tmp_path / "resume.json"
+    entries = (
+        ExpiryObservation("inbound_jwt", "inbound.token.value", 10.0, 20.0),
+        ExpiryObservation("workload_token", "workload.token.value", 11.0, 21.0),
+        ExpiryObservation("obo_token", "obo.token.value", 12.0, 22.0),
+        ExpiryObservation("google_token", "google.token.value", 13.0, 23.0),
+    )
+
+    resume_at = record_expiry_state(
+        path,
+        project_id="project-a",
+        entries=entries,
+        run_salt="deterministic-salt",
+    )
+
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert set(item["kind"] for item in stored["entries"]) == {
+        "inbound_jwt",
+        "workload_token",
+        "obo_token",
+        "google_token",
+    }
+    assert "inbound.token.value" not in path.read_text(encoding="utf-8")
+    assert stored["entries"][0]["fingerprint"] != "inbound.token.value"
+    assert resume_at == 20.0
+
+
+def test_resume_state_requires_private_mode_matching_project_and_no_jwt_values(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "resume.json"
+    path.write_text(
+        json.dumps(
+            {
+                "project_id": "project-a",
+                "entries": [
+                    {
+                        "kind": "inbound_jwt",
+                        "issued_at": 1.0,
+                        "expires_at": 2.0,
+                        "fingerprint": "a" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(path, 0o644)
+
+    with pytest.raises(MeasurementConfigurationError, match="mode 0600"):
+        load_expiry_resume_state(path, project_id="project-a")
+
+    os.chmod(path, 0o600)
+    with pytest.raises(MeasurementConfigurationError, match="current project"):
+        load_expiry_resume_state(path, project_id="other-project")
+
+    record_expiry_state(
+        path,
+        project_id="project-a",
+        run_salt="salt",
+        entries=(
+            ExpiryObservation("inbound_jwt", "inbound", 1, 2),
+            ExpiryObservation("workload_token", "workload", 1, 2),
+            ExpiryObservation("obo_token", "obo", 1, 2),
+            ExpiryObservation("google_token", "google", 1, 2),
+        ),
+    )
+    # Inject an actual JWT-shaped value rather than relying on a token-like test fixture.
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["entries"][0]["fingerprint"] = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1In0.signature"
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(MeasurementConfigurationError, match="JWT-shaped"):
+        load_expiry_resume_state(path, project_id="project-a")
+
+
+def test_resume_state_rejects_jwt_shaped_values_anywhere_in_decoded_json(tmp_path: Path) -> None:
+    path = tmp_path / "resume.json"
+    record_expiry_state(
+        path,
+        project_id="project-a",
+        run_salt="salt",
+        entries=(
+            ExpiryObservation("inbound_jwt", "inbound", 1, 2),
+            ExpiryObservation("workload_token", "workload", 1, 2),
+            ExpiryObservation("obo_token", "obo", 1, 2),
+            ExpiryObservation("google_token", "google", 1, 2),
+        ),
+    )
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["unrelated"] = {"nested": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1In0.signature"}
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(MeasurementConfigurationError, match="JWT-shaped"):
+        load_expiry_resume_state(path, project_id="project-a")
+
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state = {"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1In0.signature": state}
+    path.write_text(json.dumps(state), encoding="utf-8")
+    with pytest.raises(MeasurementConfigurationError, match="JWT-shaped"):
+        load_expiry_resume_state(path, project_id="project-a")
+
+
+def test_measure_latency_reports_cold_warm_percentiles_and_no_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = MeasurementIdentity()
+    evidence = RecordingEvidence()
+    drive = MeasurementDrive([DriveMetadata(1, {"text/plain": 1}) for _ in range(3)])
+    clock = iter(
+        (
+            0.0,
+            0.0,
+            0.01,
+            0.01,
+            0.03,
+            0.03,
+            0.06,
+            0.06,
+            0.1,
+            0.1,
+            0.11,
+            0.11,
+            0.13,
+            0.13,
+            0.16,
+            0.16,
+            0.2,
+            0.2,
+            0.21,
+            0.21,
+            0.23,
+            0.23,
+            0.26,
+            0.26,
+        )
+    )
+    runtime = _measurement_runtime(identity, evidence, clock=lambda: next(clock), drive=drive)
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(app, ["measure", "latency", "--samples", "3"])
+
+    assert result.exit_code == 0
+    rendered = json.loads(result.stdout)
+    assert rendered["p50_ms"] == 60
+    assert rendered["p95_ms"] == 60
+    assert rendered["stage_latency_ms"]["workload"] == {
+        "cold_p50_ms": 10,
+        "cold_p95_ms": 10,
+        "warm_p50_ms": 10,
+        "warm_p95_ms": 10,
+    }
+    assert rendered["stage_latency_ms"]["google"] == {
+        "cold_p50_ms": 20,
+        "cold_p95_ms": 20,
+        "warm_p50_ms": 20,
+        "warm_p95_ms": 20,
+    }
+    assert rendered["stage_latency_ms"]["drive"] == {
+        "cold_p50_ms": 30,
+        "cold_p95_ms": 30,
+        "warm_p50_ms": 30,
+        "warm_p95_ms": 30,
+    }
+    assert identity.workload_calls == 3
+    assert drive.access_tokens == ["google-secret"] * 3
+    assert "inbound-secret" not in result.output
+    assert "workload-secret" not in result.output
+
+
+def test_live_user_isolation_executes_two_distinct_validated_users_locally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class IsolationIdentity(MeasurementIdentity):
+        def workload_token(self, workload_name: str, user_token: str) -> str:
+            assert workload_name == SETTINGS.agentcore_workload_name
+            return f"workload-{user_token}"
+
+        def google_token(
+            self,
+            workload_token: str,
+            provider: str,
+            scopes: list[str],
+            return_url: str,
+            state: str,
+            *,
+            force_authentication: bool = False,
+        ) -> OAuthToken:
+            assert provider == SETTINGS.agentcore_google_provider
+            assert not force_authentication
+            return OAuthToken(f"google-{workload_token}")
+
+    metadata_a = DriveMetadata(1, {"text/plain": 1})
+    metadata_b = DriveMetadata(2, {"application/json": 2})
+    evidence = RecordingEvidence()
+    tokens = iter(("inbound-a", "inbound-b"))
+    runtime = replace(
+        _measurement_runtime(
+            IsolationIdentity(),
+            evidence,
+            drive=MeasurementDrive([metadata_a, metadata_b]),
+        ),
+        acquire_token=lambda _, __: next(tokens),
+        validate_token=lambda _, token: {"sub": f"subject-{token}"},
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli._default_runtime", lambda: runtime)
+    monkeypatch.setenv("AGENTCORE_POC_USER_A_ALIAS", "user-a")
+    monkeypatch.setenv("AGENTCORE_POC_USER_B_ALIAS", "user-b")
+    monkeypatch.setenv("AGENTCORE_POC_USER_A_DRIVE_MARKER", drive_metadata_marker(metadata_a))
+    monkeypatch.setenv("AGENTCORE_POC_USER_B_DRIVE_MARKER", drive_metadata_marker(metadata_b))
+    verified_subject_counts: list[int] = []
+
+    rows = run_live_user_isolation(on_verified_subject_count=verified_subject_counts.append)
+
+    assert [row.outcome for row in rows] == ["pass", "pass"]
+    assert verified_subject_counts == [2]
+    observations = [item.as_dict() for item in evidence.observations]
+    assert [item["hypothesis"] for item in observations].count("H4a") == 2
+    assert [item["hypothesis"] for item in observations].count("H6") == 2
+
+
+def test_render_scoped_policy_grants_the_google_provider_when_it_exists_in_state() -> None:
+    state = {
+        "directory_arn": "arn:directory",
+        "vault_arn": "arn:vault",
+        "workloads": [{"arn": "arn:workload:approved"}, {"arn": "arn:workload:unapproved"}],
+        "provider": {"arn": "arn:provider:microsoft", "secret_arn": "arn:secret:microsoft"},
+        "google_provider": {"arn": "arn:provider:google", "secret_arn": "arn:secret:google"},
+    }
+
+    policy = _render_scoped_policy(state)
+
+    named_resources = next(
+        statement["Resource"]
+        for statement in policy["Statement"]
+        if statement.get("Sid") == "UseOnlyNamedPocResources"
+    )
+    assert "arn:provider:microsoft" in named_resources
+    assert "arn:provider:google" in named_resources
+    secret_resources = next(
+        statement["Resource"]
+        for statement in policy["Statement"]
+        if statement.get("Sid") == "AllowOauth2ProviderSecretAccess"
+    )
+    assert "arn:secret:microsoft" in secret_resources
+    assert "arn:secret:google" in secret_resources
+
+
+def test_render_scoped_policy_omits_the_google_provider_when_absent_from_state() -> None:
+    state = {
+        "directory_arn": "arn:directory",
+        "vault_arn": "arn:vault",
+        "workloads": [{"arn": "arn:workload:approved"}, {"arn": "arn:workload:unapproved"}],
+        "provider": {"arn": "arn:provider:microsoft", "secret_arn": "arn:secret:microsoft"},
+    }
+
+    policy = _render_scoped_policy(state)
+
+    assert "arn:provider:google" not in json.dumps(policy)
+    assert "arn:secret:google" not in json.dumps(policy)
+
+
+def test_workload_isolation_uses_mocked_iam_policy_transitions_locally(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeIam:
+        scoped = False
+
+        def put_role_policy(self, *, PolicyDocument: str, **_kwargs: object) -> None:
+            self.scoped = "BroadObservationOnly" not in PolicyDocument
+
+    class FakeSts:
+        def get_caller_identity(self) -> dict[str, str]:
+            return {"Arn": "arn:aws:iam::123456789012:role/poc"}
+
+    class IsolationIdentity(MeasurementIdentity):
+        def __init__(self, iam: FakeIam) -> None:
+            super().__init__()
+            self.iam = iam
+
+        def workload_token(self, workload_name: str, user_token: str) -> str:
+            return f"workload-{workload_name}"
+
+        def google_token(
+            self,
+            workload_token: str,
+            provider: str,
+            scopes: list[str],
+            return_url: str,
+            state: str,
+            *,
+            force_authentication: bool = False,
+        ) -> OAuthToken:
+            if self.iam.scoped and workload_token.endswith(SETTINGS.agentcore_second_workload_name):
+                raise AgentCoreAccessDenied()
+            return OAuthToken("google-access")
+
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "directory_arn": "arn:directory",
+                "vault_arn": "arn:vault",
+                "workloads": [{"arn": "arn:approved"}, {"arn": "arn:unapproved"}],
+                "provider": {"arn": "arn:provider", "secret_arn": "arn:secret"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    iam = FakeIam()
+    identity = IsolationIdentity(iam)
+    runtime = replace(_measurement_runtime(identity, RecordingEvidence()), clock=lambda: 0.0)
+    monkeypatch.setenv("AGENTCORE_POC_IAM_ROLE_NAME", "poc-role")
+    monkeypatch.setenv("AGENTCORE_POC_USER_ALIAS", "user-a")
+    monkeypatch.setattr("agentcore_identity_poc.cli._STATE_PATH", state_path)
+    monkeypatch.setattr(
+        "agentcore_identity_poc.cli.boto3.client",
+        lambda service, **_kwargs: iam if service == "iam" else FakeSts(),
+    )
+    recorded = []
+
+    rows = _run_workload_isolation(runtime, SETTINGS, record_row=recorded.append)
+
+    assert [row.policy_mode for row in rows] == ["broad", "broad", "scoped", "scoped"]
+    assert [row.outcome for row in rows] == ["pass", "pass", "pass", "denied"]
+    assert len(recorded) == 4
+    assert iam.scoped is True
+
+
+def test_workload_isolation_measures_as_the_role_when_agentcore_as_role_is_provided(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """H4b must call AgentCore Identity as the policy-bearing role, not ambient creds.
+
+    Ambient operator credentials (e.g. an admin SSO session) are typically far more
+    permissive than the named role, so measuring as ambient creds would make every
+    policy transition look like it converges instantly regardless of policy content.
+    `Runtime.agentcore_as_role`, when provided, must be used instead of `agentcore`.
+    """
+
+    class FakeIam:
+        scoped = False
+
+        def put_role_policy(self, *, PolicyDocument: str, **_kwargs: object) -> None:
+            self.scoped = "BroadObservationOnly" not in PolicyDocument
+
+    class FakeSts:
+        def get_caller_identity(self) -> dict[str, str]:
+            return {"Arn": "arn:aws:iam::123456789012:role/poc", "Account": "123456789012"}
+
+    class IsolationIdentity(MeasurementIdentity):
+        def __init__(self, iam: FakeIam) -> None:
+            super().__init__()
+            self.iam = iam
+
+        def workload_token(self, workload_name: str, user_token: str) -> str:
+            return f"workload-{workload_name}"
+
+        def google_token(
+            self,
+            workload_token: str,
+            provider: str,
+            scopes: list[str],
+            return_url: str,
+            state: str,
+            *,
+            force_authentication: bool = False,
+        ) -> OAuthToken:
+            if self.iam.scoped and workload_token.endswith(SETTINGS.agentcore_second_workload_name):
+                raise AgentCoreAccessDenied()
+            return OAuthToken("google-access")
+
+    class UnusedIdentity(MeasurementIdentity):
+        """Stands in for `runtime.agentcore`, which must not be called at all."""
+
+        def workload_token(self, workload_name: str, user_token: str) -> str:
+            raise AssertionError("runtime.agentcore must not be used when agentcore_as_role is set")
+
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "directory_arn": "arn:directory",
+                "vault_arn": "arn:vault",
+                "workloads": [{"arn": "arn:approved"}, {"arn": "arn:unapproved"}],
+                "provider": {"arn": "arn:provider", "secret_arn": "arn:secret"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    iam = FakeIam()
+    identity = IsolationIdentity(iam)
+    role_arns_used: list[str] = []
+
+    def fake_agentcore_as_role(_settings: Settings, role_arn: str) -> IsolationIdentity:
+        role_arns_used.append(role_arn)
+        return identity
+
+    runtime = replace(
+        _measurement_runtime(UnusedIdentity(), RecordingEvidence()),
+        clock=lambda: 0.0,
+        agentcore_as_role=fake_agentcore_as_role,
+    )
+    monkeypatch.setenv("AGENTCORE_POC_IAM_ROLE_NAME", "poc-role")
+    monkeypatch.setenv("AGENTCORE_POC_USER_ALIAS", "user-a")
+    monkeypatch.setattr("agentcore_identity_poc.cli._STATE_PATH", state_path)
+    monkeypatch.setattr(
+        "agentcore_identity_poc.cli.boto3.client",
+        lambda service, **_kwargs: iam if service == "iam" else FakeSts(),
+    )
+    recorded = []
+
+    rows = _run_workload_isolation(runtime, SETTINGS, record_row=recorded.append)
+
+    assert [row.policy_mode for row in rows] == ["broad", "broad", "scoped", "scoped"]
+    assert [row.outcome for row in rows] == ["pass", "pass", "pass", "denied"]
+    assert role_arns_used == ["arn:aws:iam::123456789012:role/poc-role"]
+
+
+def test_run_live_workload_isolation_writes_h4b_evidence_locally(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeIam:
+        scoped = False
+
+        def put_role_policy(self, *, PolicyDocument: str, **_kwargs: object) -> None:
+            self.scoped = "BroadObservationOnly" not in PolicyDocument
+
+    class FakeSts:
+        def get_caller_identity(self) -> dict[str, str]:
+            return {"Arn": "arn:aws:iam::123456789012:role/poc"}
+
+    class IsolationIdentity(MeasurementIdentity):
+        def __init__(self, iam: FakeIam) -> None:
+            super().__init__()
+            self.iam = iam
+
+        def workload_token(self, workload_name: str, user_token: str) -> str:
+            return f"workload-{workload_name}"
+
+        def google_token(
+            self,
+            workload_token: str,
+            provider: str,
+            scopes: list[str],
+            return_url: str,
+            state: str,
+            *,
+            force_authentication: bool = False,
+        ) -> OAuthToken:
+            if self.iam.scoped and workload_token.endswith(SETTINGS.agentcore_second_workload_name):
+                raise AgentCoreAccessDenied()
+            return OAuthToken("google-access")
+
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "directory_arn": "arn:directory",
+                "vault_arn": "arn:vault",
+                "workloads": [{"arn": "arn:approved"}, {"arn": "arn:unapproved"}],
+                "provider": {"arn": "arn:provider", "secret_arn": "arn:secret"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    iam = FakeIam()
+    identity = IsolationIdentity(iam)
+    evidence = RecordingEvidence()
+    runtime = replace(_measurement_runtime(identity, evidence), clock=lambda: 0.0)
+    monkeypatch.setenv("AGENTCORE_POC_IAM_ROLE_NAME", "poc-role")
+    monkeypatch.setenv("AGENTCORE_POC_USER_ALIAS", "user-a")
+    monkeypatch.setattr("agentcore_identity_poc.cli._STATE_PATH", state_path)
+    monkeypatch.setattr("agentcore_identity_poc.cli._default_runtime", lambda: runtime)
+    monkeypatch.setattr(
+        "agentcore_identity_poc.cli.boto3.client",
+        lambda service, **_kwargs: iam if service == "iam" else FakeSts(),
+    )
+
+    rows = run_live_workload_isolation()
+
+    assert [row.policy_mode for row in rows] == ["broad", "broad", "scoped", "scoped"]
+    assert [row.outcome for row in rows] == ["pass", "pass", "pass", "denied"]
+    observations = [item.as_dict() for item in evidence.observations]
+    assert [item["hypothesis"] for item in observations].count("H4b") == 4
+    assert all(item["operation"] == "workload_isolation" for item in observations)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["measure", "latency"],
+        ["measure", "concurrency"],
+        ["measure", "expiry"],
+    ],
+)
+def test_lifecycle_commands_report_configuration_blocks_without_provider_calls(
+    monkeypatch: pytest.MonkeyPatch, command: list[str]
+) -> None:
+    def unavailable_settings() -> Settings:
+        raise SettingsError("required configuration is absent")
+
+    runtime = replace(
+        _measurement_runtime(MeasurementIdentity(), RecordingEvidence()),
+        load_settings=unavailable_settings,
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(app, command)
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout) == {
+        "status": "blocked",
+        "category": "configuration",
+        "detail": "required configuration is absent",
+    }
+
+
+def test_measure_latency_maps_drive_access_denied_without_provider_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _measurement_runtime(
+        MeasurementIdentity(),
+        RecordingEvidence(),
+        drive=MeasurementDrive([DownstreamAccessDenied()]),
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(app, ["measure", "latency", "--samples", "2"])
+
+    assert result.exit_code == 5
+    assert json.loads(result.stdout) == {
+        "status": "blocked",
+        "category": "downstream_denied",
+        "detail": "google_drive_denied",
+    }
+
+
+def test_offboard_rejects_missing_apply_and_unsafe_alias() -> None:
+    runner = CliRunner()
+
+    missing_apply = runner.invoke(app, ["offboard", "google", "--user-alias", "user-a"])
+    unsafe_alias = runner.invoke(
+        app,
+        ["offboard", "google", "--user-alias", "not an alias", "--apply"],
+    )
+
+    assert missing_apply.exit_code == 2
+    assert json.loads(missing_apply.stdout)["detail"] == "offboard_google_requires_apply"
+    assert unsafe_alias.exit_code == 2
+    assert json.loads(unsafe_alias.stdout)["detail"] == "invalid_user_alias"
+
+
+def test_offboard_records_narrow_purge_failure_without_deleting_shared_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingPurgeIdentity(MeasurementIdentity):
+        def purge_google_user_connection(self, user_alias: str) -> None:
+            assert user_alias == "user-a"
+            raise RuntimeError("purge operation failed")
+
+    evidence = RecordingEvidence()
+    runtime = _measurement_runtime(FailingPurgeIdentity(), evidence)
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(app, ["offboard", "google", "--user-alias", "user-a", "--apply"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == {
+        "status": "failed",
+        "operation": "offboard_google",
+        "hypothesis": "H8",
+        "detail": "per_user_purge_failed",
+    }
+    assert evidence.observations[-1].as_dict()["details"] == {
+        "user_alias": "user-a",
+        "detail": "per_user_purge_failed",
+    }
+
+
+def test_supported_token_expiry_reads_only_a_well_formed_jwt_payload() -> None:
+    payload = base64.urlsafe_b64encode(json.dumps({"exp": 42}).encode("utf-8")).decode().rstrip("=")
+
+    assert _supported_token_expiry(f"header.{payload}.signature") == 42.0
+    assert _supported_token_expiry("opaque-token") is None
+
+
+def test_cloudtrail_measurement_uses_a_narrow_provider_event_query_locally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePaginator:
+        def __init__(self) -> None:
+            self.query: dict[str, object] | None = None
+
+        def paginate(self, **kwargs: object) -> list[dict[str, object]]:
+            self.query = kwargs
+            return [
+                {
+                    "Events": [
+                        {
+                            "CloudTrailEvent": json.dumps(
+                                {
+                                    "eventName": "GetResourceOauth2Token",
+                                    "userIdentity": {"principalId": "opaque"},
+                                    "requestParameters": {
+                                        "workloadName": "approved-workload",
+                                        "userIdentifier": "opaque",
+                                    },
+                                }
+                            )
+                        }
+                    ]
+                }
+            ]
+
+    class FakeCloudTrail:
+        def __init__(self, paginator: FakePaginator) -> None:
+            self.paginator = paginator
+
+        def get_paginator(self, operation_name: str) -> FakePaginator:
+            assert operation_name == "lookup_events"
+            return self.paginator
+
+    paginator = FakePaginator()
+    monkeypatch.setattr(
+        "agentcore_identity_poc.cli.boto3.client",
+        lambda service, **_kwargs: FakeCloudTrail(paginator),
+    )
+
+    attribution = _cloudtrail_attribution(SETTINGS, 30)
+
+    assert attribution.outcome == "pass"
+    assert paginator.query is not None
+    assert paginator.query["LookupAttributes"] == [
+        {
+            "AttributeKey": "EventSource",
+            "AttributeValue": "bedrock-agentcore.amazonaws.com",
+        }
+    ]
+    assert "StartTime" in paginator.query
+
+
+def test_cloudtrail_command_rejects_out_of_range_lookback_before_runtime_creation() -> None:
+    result = CliRunner().invoke(app, ["measure", "cloudtrail", "--lookback-minutes", "0"])
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout) == {
+        "status": "blocked",
+        "category": "configuration",
+        "detail": "lookback_minutes_must_be_1_to_1440",
+    }
+
+
+def test_measure_expiry_writes_private_resume_state_and_exits_immediately(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    identity = MeasurementIdentity()
+    evidence = RecordingEvidence()
+    runtime = _measurement_runtime(identity, evidence, clock=lambda: 10.0)
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+    state_path = tmp_path / "expiry-state.json"
+
+    result = CliRunner().invoke(app, ["measure", "expiry", "--resume-state", str(state_path)])
+
+    assert result.exit_code == 0
+    rendered = json.loads(result.stdout)
+    assert rendered["status"] == "unproven"
+    assert rendered["resume_at"] == 100.0
+    assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
+    assert "inbound-secret" not in state_path.read_text(encoding="utf-8")
+    assert "workload-secret" not in state_path.read_text(encoding="utf-8")
+    assert "obo-secret" not in state_path.read_text(encoding="utf-8")
+    assert "google-secret" not in state_path.read_text(encoding="utf-8")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert [entry["expiry_known"] for entry in state["entries"]] == [True, False, False, False]
+    assert [entry["expires_at"] for entry in state["entries"]] == [100.0, None, None, None]
+
+
+def test_measure_expiry_does_not_call_identity_again_before_resume_time(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state_path = tmp_path / "expiry-state.json"
+    first_identity = MeasurementIdentity()
+    first_runtime = _measurement_runtime(first_identity, RecordingEvidence(), clock=lambda: 10.0)
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: first_runtime)
+    assert (
+        CliRunner().invoke(app, ["measure", "expiry", "--resume-state", str(state_path)]).exit_code
+        == 0
+    )
+
+    resumed_identity = MeasurementIdentity()
+    resumed_runtime = _measurement_runtime(
+        resumed_identity, RecordingEvidence(), clock=lambda: 10.0
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: resumed_runtime)
+    result = CliRunner().invoke(app, ["measure", "expiry", "--resume-state", str(state_path)])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == {
+        "status": "resume_required",
+        "operation": "measure_expiry",
+        "resume_at": 100.0,
+        "pending_token_kinds": ["inbound_jwt"],
+    }
+    assert resumed_identity.workload_calls == 0
+
+
+def test_measure_expiry_compares_old_and_new_fingerprints_after_known_expiry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state_path = tmp_path / "expiry-state.json"
+    first_evidence = RecordingEvidence()
+    first_runtime = _measurement_runtime(MeasurementIdentity(), first_evidence, clock=lambda: 10.0)
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: first_runtime)
+    assert (
+        CliRunner().invoke(app, ["measure", "expiry", "--resume-state", str(state_path)]).exit_code
+        == 0
+    )
+
+    resumed_evidence = RecordingEvidence()
+    resumed_runtime = _measurement_runtime(
+        MeasurementIdentity(), resumed_evidence, clock=lambda: 101.0, inbound_expiry=200.0
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: resumed_runtime)
+    result = CliRunner().invoke(app, ["measure", "expiry", "--resume-state", str(state_path)])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["status"] == "unproven"
+
+
+def test_measure_expiry_uses_persisted_issue_timestamp_for_resume_salt(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "expiry-state.json"
+    original = (
+        ExpiryObservation("inbound_jwt", "same-inbound", 10.0, 100.0),
+        ExpiryObservation("workload_token", "same-workload", 10.0, None),
+        ExpiryObservation("obo_token", "same-obo", 10.0, None),
+        ExpiryObservation("google_token", "same-google", 10.0, 100.0),
+    )
+    record_expiry_state(
+        state_path,
+        project_id="project-a",
+        entries=original,
+        run_salt=_expiry_run_salt("project-a", 10.0),
+    )
+    comparisons = compare_expiry_observations(
+        load_expiry_resume_state(state_path, project_id="project-a"),
+        (
+            ExpiryObservation("inbound_jwt", "same-inbound", 11.0, 200.0),
+            ExpiryObservation("workload_token", "same-workload", 11.0, None),
+            ExpiryObservation("obo_token", "same-obo", 11.0, None),
+            ExpiryObservation("google_token", "same-google", 11.0, 200.0),
+        ),
+        prior_run_salt=_expiry_run_salt("project-a", 10.0),
+    )
+    assert all(not comparison.fingerprint_changed for comparison in comparisons)
+
+
+def test_measure_expiry_keeps_opaque_google_state_unknown_and_preserves_resume_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state_path = tmp_path / "expiry-state.json"
+    first_runtime = _measurement_runtime(
+        MeasurementIdentity(), RecordingEvidence(), clock=lambda: 10.0
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: first_runtime)
+    assert (
+        CliRunner().invoke(app, ["measure", "expiry", "--resume-state", str(state_path)]).exit_code
+        == 0
+    )
+    original_state = state_path.read_text(encoding="utf-8")
+
+    resumed_identity = MeasurementIdentity()
+    resumed_runtime = _measurement_runtime(
+        resumed_identity,
+        RecordingEvidence(),
+        clock=lambda: 50.0,
+        inbound_expiry=200.0,
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: resumed_runtime)
+    result = CliRunner().invoke(app, ["measure", "expiry", "--resume-state", str(state_path)])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["status"] == "resume_required"
+    assert resumed_identity.workload_calls == 0
+    assert state_path.read_text(encoding="utf-8") == original_state
+
+
+def test_measure_expiry_reports_next_pending_h7_boundary_not_an_expired_earlier_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state_path = tmp_path / "expiry-state.json"
+    record_expiry_state(
+        state_path,
+        project_id=_measurement_project_id(SETTINGS),
+        run_salt="salt",
+        entries=(
+            ExpiryObservation("inbound_jwt", "inbound", 1, 100),
+            ExpiryObservation("workload_token", "workload", 1, 200),
+            ExpiryObservation("obo_token", "obo", 1, None),
+            ExpiryObservation("google_token", "google", 1, None),
+        ),
+    )
+    runtime = _measurement_runtime(
+        MeasurementIdentity(), RecordingEvidence(), clock=lambda: 1.0, wall_clock=lambda: 150.0
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(app, ["measure", "expiry", "--resume-state", str(state_path)])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["resume_at"] == 200.0
+
+
+def test_measure_expiry_rejects_operator_supplied_google_boundary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state_path = tmp_path / "expiry-state.json"
+    first_runtime = _measurement_runtime(
+        MeasurementIdentity(), RecordingEvidence(), clock=lambda: 10.0
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: first_runtime)
+    result = CliRunner().invoke(
+        app,
+        [
+            "measure",
+            "expiry",
+            "--resume-state",
+            str(state_path),
+            "--google-resume-at",
+            "100",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "No such option" in result.stderr
+
+
+def test_measure_expiry_reports_opaque_google_expiry_as_terminal_h3_infeasibility(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    evidence = RecordingEvidence()
+    runtime = _measurement_runtime(
+        MeasurementIdentity(),
+        evidence,
+        clock=lambda: 0.0,
+        wall_clock=lambda: 1_700_000_000.0,
+        inbound_expiry=1_700_000_100.0,
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+    result = CliRunner().invoke(
+        app, ["measure", "expiry", "--resume-state", str(tmp_path / "state")]
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["status"] == "unproven"
+    google = next(
+        item.as_dict()
+        for item in evidence.observations
+        if item.as_dict()["hypothesis"] == "H3"
+    )
+    assert (google["operation"], google["outcome"]) == ("provider_expiry_unavailable", "fail")
+    assert google["details"] == {
+        "kind": "google_token",
+        "detail": "agentcore_response_lacks_provider_expiry_raw_token_not_retained",
+    }
+
+
+def test_measure_expiry_first_run_writes_safe_evidence_through_real_writer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`RecordingEvidence` (used by every other CLI test in this file) never calls
+    `assert_safe_evidence`, so a bad evidence-detail key in `measure_expiry_command`
+    can pass every other test here and still blow up the first time it hits a real
+    `EvidenceWriter` live -- exactly what happened with the `token_kind` key (it trips
+    `redaction._SENSITIVE_FIELD_COMPONENTS`'s "token" component check even though its
+    value is never a token, just an enum tag). Route this one test through the real
+    writer so a future key of this shape is caught here instead of live.
+    """
+    evidence_path = tmp_path / "evidence.jsonl"
+    runtime = _measurement_runtime(
+        MeasurementIdentity(),
+        EvidenceWriter(evidence_path),  # type: ignore[arg-type]
+        clock=lambda: 0.0,
+        wall_clock=lambda: 0.0,
+        inbound_expiry=100.0,
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(
+        app, ["measure", "expiry", "--resume-state", str(tmp_path / "state")]
+    )
+
+    assert result.exit_code == 0, result.output
+    rows = [json.loads(line) for line in evidence_path.read_text().splitlines()]
+    assert {row["hypothesis"] for row in rows} == {"H3", "H7"}
+
+
+def test_measure_expiry_uses_wall_clock_for_epoch_expiry_not_monotonic_clock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runtime = _measurement_runtime(
+        MeasurementIdentity(),
+        RecordingEvidence(),
+        clock=lambda: 4.0,
+        wall_clock=lambda: 1_700_000_000.0,
+        inbound_expiry=1_700_000_100.0,
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(
+        app, ["measure", "expiry", "--resume-state", str(tmp_path / "state")]
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["resume_at"] == 1_700_000_100.0
+
+
+def test_measure_expiry_only_passes_h7_with_existing_workload_after_source_expiry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class ExistingWorkloadIdentity(MeasurementIdentity):
+        def __init__(self) -> None:
+            super().__init__()
+            self.obo_workloads: list[str] = []
+
+        def obo_token(self, workload_token: str, provider: str, scopes: list[str]) -> str:
+            self.obo_workloads.append(workload_token)
+            return "obo-secret"
+
+    identity = ExistingWorkloadIdentity()
+    evidence_writer = RecordingEvidence()
+    clock = iter((50.0, 101.0, 101.0))
+
+    def run_after_expiry(
+        settings: Settings,
+        runner_identity: MeasurementIdentity,
+        existing_workload_token: str,
+        inbound_expiry: float,
+        wall_clock: object,
+    ) -> SourceExpiryExperiment:
+        assert settings is SETTINGS
+        assert runner_identity is identity
+        assert existing_workload_token == "workload-secret"
+        assert callable(wall_clock)
+        assert wall_clock() >= inbound_expiry  # type: ignore[operator]
+        runner_identity.obo_token(
+            existing_workload_token,
+            SETTINGS.agentcore_microsoft_provider,
+            [SETTINGS.entra_downstream_scope],
+        )
+        return SourceExpiryExperiment(source_expired=True, obo_succeeded=True)
+
+    runtime = replace(
+        _measurement_runtime(
+            identity,
+            evidence_writer,
+            wall_clock=lambda: next(clock),
+            inbound_expiry=100.0,
+        ),
+        source_expiry_runner=run_after_expiry,  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(
+        app, ["measure", "expiry", "--resume-state", str(tmp_path / "state")]
+    )
+
+    assert result.exit_code == 0
+    observations = [item.as_dict() for item in evidence_writer.observations]
+    source_expiry = next(
+        item for item in observations if item["operation"] == "obo_after_inbound_expiry"
+    )
+    assert source_expiry["outcome"] == "pass"
+    assert identity.workload_calls == 1
+    assert identity.obo_workloads == ["workload-secret", "workload-secret"]
+    assert "workload-secret" not in result.output
+
+
+def test_measure_expiry_records_h7_unproven_without_continuous_runner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    evidence = RecordingEvidence()
+    runtime = _measurement_runtime(MeasurementIdentity(), evidence)
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(
+        app, ["measure", "expiry", "--resume-state", str(tmp_path / "state")]
+    )
+
+    assert result.exit_code == 0
+    observations = [item.as_dict() for item in evidence.observations]
+    source_expiry = next(
+        item for item in observations if item["operation"] == "obo_after_inbound_expiry"
+    )
+    assert source_expiry["outcome"] == "unproven"
+    assert source_expiry["details"] == {"detail": "continuous_runner_not_configured"}
+
+
+def test_cloudtrail_attribution_parses_only_field_presence() -> None:
+    attribution = _cloudtrail_attribution_from_events(
+        [
+            {
+                "CloudTrailEvent": json.dumps(
+                    {
+                        "eventName": "GetResourceOauth2Token",
+                        "userIdentity": {"principalId": "sensitive-principal"},
+                        "requestParameters": {
+                            "workloadName": "approved-workload",
+                            "userIdentifier": "sensitive-user",
+                        },
+                    }
+                )
+            }
+        ]
+    )
+
+    assert attribution == CloudTrailAttribution(
+        eligible_event_count=1,
+        aws_principal_present=True,
+        workload_identity_present=True,
+        user_correlation_present=True,
+        attribution_complete=True,
+    )
+
+
+def test_measure_cloudtrail_reports_unknown_when_attribution_fields_are_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence = RecordingEvidence()
+    runtime = replace(
+        _measurement_runtime(MeasurementIdentity(), evidence),
+        cloudtrail_events=lambda _, __: CloudTrailAttribution(
+            eligible_event_count=2,
+            aws_principal_present=True,
+            workload_identity_present=False,
+            user_correlation_present=False,
+        ),
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(app, ["measure", "cloudtrail"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == {
+        "status": "unknown",
+        "operation": "measure_cloudtrail",
+        "lookback_minutes": 30,
+        "eligible_event_count": 2,
+        "aws_principal_present": True,
+        "workload_identity_present": False,
+        "user_correlation_present": False,
+    }
+    assert evidence.observations[-1].as_dict()["operation"] == "audit_attribution"
+    assert "sensitive" not in repr(evidence.observations)
+
+
+@pytest.mark.parametrize(
+    ("quota", "target", "readiness"),
+    [
+        (5, 20, "not_ready"),
+        (1, 20, "not_ready"),
+        (5, 5, "unknown"),
+        (5, 2, "unknown"),
+        (None, None, "unknown"),
+    ],
+)
+def test_measure_concurrency_reports_documented_quota_and_temporal_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+    quota: int | None,
+    target: int | None,
+    readiness: str,
+) -> None:
+    runtime = _measurement_runtime(
+        MeasurementIdentity(),
+        RecordingEvidence(),
+        drive=MeasurementDrive([DriveMetadata(1, {"text/plain": 1}) for _ in range(10)]),
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+    arguments = ["measure", "concurrency", "--workers", "2", "--requests", "10"]
+    if quota is not None:
+        arguments.extend(("--documented-quota", str(quota)))
+    if target is not None:
+        arguments.extend(("--temporal-target", str(target)))
+
+    result = CliRunner().invoke(app, arguments)
+
+    assert result.exit_code == 0
+    rendered = json.loads(result.stdout)
+    assert rendered["readiness"] == readiness
+    assert rendered["documented_quota"] == quota
+    assert rendered["temporal_target"] == target
+
+
+def test_measure_concurrency_uses_actual_probe_concurrency_for_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _measurement_runtime(MeasurementIdentity(), RecordingEvidence())
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "measure",
+            "concurrency",
+            "--workers",
+            "5",
+            "--requests",
+            "1",
+            "--documented-quota",
+            "5",
+            "--temporal-target",
+            "5",
+        ],
+    )
+
+    assert result.exit_code == 0
+    rendered = json.loads(result.stdout)
+    assert rendered["workers"] == 1
+    assert rendered["probe_target_status"] == "probe_below_target"
+    assert rendered["readiness"] == "unknown"
+
+
+def test_measure_concurrency_reports_ready_only_for_overlapping_target_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BlockingDrive(MeasurementDrive):
+        def __init__(self) -> None:
+            super().__init__([DriveMetadata(1, {"text/plain": 1}) for _ in range(2)])
+            self.barrier = Barrier(2)
+
+        def list(self, access_token: str) -> DriveMetadata:
+            self.barrier.wait(timeout=1)
+            return super().list(access_token)
+
+    runtime = _measurement_runtime(
+        MeasurementIdentity(),
+        RecordingEvidence(),
+        drive=BlockingDrive(),
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "measure",
+            "concurrency",
+            "--workers",
+            "2",
+            "--requests",
+            "2",
+            "--documented-quota",
+            "2",
+            "--temporal-target",
+            "2",
+        ],
+    )
+
+    assert result.exit_code == 0
+    rendered = json.loads(result.stdout)
+    assert rendered["workers"] == 2
+    assert rendered["probe_target_status"] == "probe_exercises_target"
+    assert rendered["readiness"] == "ready"
+
+
+def test_cloudtrail_attribution_does_not_combine_categories_across_events() -> None:
+    attribution = _cloudtrail_attribution_from_events(
+        [
+            {
+                "CloudTrailEvent": json.dumps(
+                    {
+                        "eventName": "GetResourceOauth2Token",
+                        "userIdentity": {"principalId": "sensitive-principal"},
+                    }
+                )
+            },
+            {
+                "CloudTrailEvent": json.dumps(
+                    {
+                        "eventName": "GetResourceOauth2Token",
+                        "requestParameters": {"workloadName": "approved-workload"},
+                    }
+                )
+            },
+            {
+                "CloudTrailEvent": json.dumps(
+                    {
+                        "eventName": "GetResourceOauth2Token",
+                        "requestParameters": {"userIdentifier": "sensitive-user"},
+                    }
+                )
+            },
+        ]
+    )
+
+    assert attribution.eligible_event_count == 3
+    assert attribution.aws_principal_present is True
+    assert attribution.workload_identity_present is True
+    assert attribution.user_correlation_present is True
+    assert attribution.outcome == "unknown"
+
+
+def test_cloudtrail_attribution_ignores_unrelated_events_and_requires_one_complete_event() -> None:
+    attribution = _cloudtrail_attribution_from_events(
+        [
+            {
+                "CloudTrailEvent": json.dumps(
+                    {
+                        "eventName": "GetWorkloadAccessTokenForJWT",
+                        "userIdentity": {"principalId": "sensitive-principal"},
+                        "requestParameters": {
+                            "workloadName": "approved-workload",
+                            "userIdentifier": "sensitive-user",
+                        },
+                    }
+                )
+            },
+            {
+                "CloudTrailEvent": json.dumps(
+                    {
+                        "eventName": "getresourceoauth2token",
+                        "userIdentity": {"principalId": "sensitive-principal"},
+                        "requestParameters": {
+                            "workloadName": "approved-workload",
+                            "userIdentifier": "sensitive-user",
+                        },
+                    }
+                )
+            },
+        ]
+    )
+
+    assert attribution == CloudTrailAttribution(
+        eligible_event_count=1,
+        aws_principal_present=True,
+        workload_identity_present=True,
+        user_correlation_present=True,
+        attribution_complete=True,
+    )
+    assert attribution.outcome == "pass"
+
+
+def test_offboard_google_detects_drive_revocation_before_forcing_authentication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = MeasurementIdentity()
+    evidence = RecordingEvidence()
+    drive = MeasurementDrive([DownstreamUnauthorized()])
+    runtime = _measurement_runtime(identity, evidence, drive=drive)
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(app, ["offboard", "google", "--user-alias", "user-a", "--apply"])
+
+    assert result.exit_code == 0
+    assert identity.force_authentication == [False, True]
+    assert drive.access_tokens == ["google-secret"]
+    rendered = json.loads(result.stdout)
+    assert rendered == {
+        "status": "failed",
+        "operation": "offboard_google",
+        "hypothesis": "H8",
+        "detail": "per_user_purge_unavailable",
+    }
+    observations = [item.as_dict() for item in evidence.observations]
+    assert observations[-2] == {
+        "hypothesis": "H8",
+        "operation": "google_revocation_probe",
+        "outcome": "pass",
+        "details": {
+            "user_alias": "user-a",
+            "detail": "drive_revoked_401_force_authentication_requested",
+            "reauthentication": "token_reissued",
+        },
+    }
+    assert observations[-1]["outcome"] == "fail"
+    assert "inbound-secret" not in repr(observations)
+
+
+def test_offboard_google_does_not_force_authentication_without_drive_revocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = MeasurementIdentity()
+    evidence = RecordingEvidence()
+    runtime = _measurement_runtime(identity, evidence)
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(app, ["offboard", "google", "--user-alias", "user-a", "--apply"])
+
+    assert result.exit_code == 0
+    assert identity.force_authentication == [False]
+    assert json.loads(result.stdout)["detail"] == "drive_revocation_not_observed"
+    observations = [item.as_dict() for item in evidence.observations]
+    assert [item["operation"] for item in observations] == [
+        "google_revocation_probe",
+        "offboard_google",
+    ]
+    assert observations[-1]["outcome"] == "fail"
+
+
+def test_offboard_google_attempts_narrow_purge_after_nonrevoked_probe_but_keeps_h8_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PurgableIdentity(MeasurementIdentity):
+        def __init__(self) -> None:
+            super().__init__()
+            self.purged_aliases: list[str] = []
+
+        def purge_google_user_connection(self, user_alias: str) -> None:
+            self.purged_aliases.append(user_alias)
+
+    identity = PurgableIdentity()
+    runtime = _measurement_runtime(identity, RecordingEvidence())
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(app, ["offboard", "google", "--user-alias", "user-a", "--apply"])
+
+    assert result.exit_code == 0
+    assert identity.purged_aliases == ["user-a"]
+    assert json.loads(result.stdout) == {
+        "status": "failed",
+        "operation": "offboard_google",
+        "hypothesis": "H8",
+        "detail": "drive_revocation_not_observed",
+    }
+
+
+def test_measure_concurrency_records_end_to_end_throttle_and_retry_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = MeasurementIdentity()
+    evidence = RecordingEvidence()
+    drive = MeasurementDrive([DriveMetadata(1, {"text/plain": 1}) for _ in range(3)])
+    runtime = _measurement_runtime(identity, evidence, drive=drive)
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(
+        app,
+        ["measure", "concurrency", "--workers", "1", "--requests", "3"],
+    )
+
+    assert result.exit_code == 0
+    rendered = json.loads(result.stdout)
+    assert rendered["operation"] == "measure_concurrency"
+    assert rendered["throttle_count"] == 0
+    assert rendered["retry_attempts"] == 0
+    assert rendered["workload_cache_equivalent"] is True
+    assert rendered["google_cache_equivalent"] is True
+    assert rendered["drive_result_equivalent"] is True
+    assert set(rendered["stage_latency_ms"]) == {"workload", "google", "drive"}
+    assert rendered["stage_latency_ms"]["workload"]["cold_p50_ms"] == 0
+    assert rendered["stage_latency_ms"]["google"]["warm_p95_ms"] == 0
+    assert rendered["stage_latency_ms"]["drive"]["cold_p95_ms"] == 0
+    assert drive.access_tokens == ["google-secret"] * 3
+
+
+def test_measure_concurrency_records_throttled_retry_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ThrottledIdentity(MeasurementIdentity):
+        def workload_token(self, workload_name: str, user_token: str) -> str:
+            if self.workload_calls == 0:
+                self.workload_calls += 1
+                raise AgentCoreThrottled()
+            return super().workload_token(workload_name, user_token)
+
+    identity = ThrottledIdentity()
+    runtime = replace(
+        _measurement_runtime(identity, RecordingEvidence()),
+        sleep=lambda _: None,
+        random_unit=lambda: 0.0,
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(
+        app,
+        ["measure", "concurrency", "--workers", "1", "--requests", "1"],
+    )
+
+    assert result.exit_code == 0
+    rendered = json.loads(result.stdout)
+    assert rendered["throttle_count"] == 1
+    assert rendered["retry_attempts"] == 1
+    assert rendered["backoff_ms"] == 100
+
+
+def test_measure_latency_does_not_infer_token_cache_from_matching_drive_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RotatingIdentity(MeasurementIdentity):
+        def workload_token(self, workload_name: str, user_token: str) -> str:
+            self.workload_calls += 1
+            return f"workload-{self.workload_calls}"
+
+        def google_token(
+            self,
+            workload_token: str,
+            provider: str,
+            scopes: list[str],
+            return_url: str,
+            state: str,
+            *,
+            force_authentication: bool = False,
+        ) -> OAuthToken:
+            return OAuthToken(f"google-for-{workload_token}")
+
+    runtime = _measurement_runtime(
+        RotatingIdentity(),
+        RecordingEvidence(),
+        clock=lambda: 0.0,
+        drive=MeasurementDrive([DriveMetadata(1, {"text/plain": 1}) for _ in range(2)]),
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(app, ["measure", "latency", "--samples", "2"])
+
+    assert result.exit_code == 0
+    rendered = json.loads(result.stdout)
+    assert rendered["workload_cache_equivalent"] is False
+    assert rendered["google_cache_equivalent"] is False
+    assert rendered["drive_result_equivalent"] is True
+
+
+def test_measure_latency_maps_drive_unauthorized_without_a_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _measurement_runtime(
+        MeasurementIdentity(),
+        RecordingEvidence(),
+        clock=lambda: 0.0,
+        drive=MeasurementDrive([DownstreamUnauthorized()]),
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(app, ["measure", "latency", "--samples", "2"])
+
+    assert result.exit_code == 5
+    assert json.loads(result.stdout) == {
+        "status": "blocked",
+        "category": "downstream_denied",
+        "detail": "google_drive_unauthorized",
+    }
+    assert "Traceback" not in result.output
+
+
+def test_measure_concurrency_maps_drive_access_denied_without_a_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _measurement_runtime(
+        MeasurementIdentity(),
+        RecordingEvidence(),
+        drive=MeasurementDrive([DownstreamAccessDenied()]),
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(
+        app,
+        ["measure", "concurrency", "--workers", "1", "--requests", "1"],
+    )
+
+    assert result.exit_code == 5
+    assert json.loads(result.stdout) == {
+        "status": "blocked",
+        "category": "downstream_denied",
+        "detail": "google_drive_denied",
+    }
+    assert "Traceback" not in result.output
+
+
+def test_measure_latency_maps_exhausted_agentcore_throttling_without_a_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class AlwaysThrottledIdentity(MeasurementIdentity):
+        def workload_token(self, workload_name: str, user_token: str) -> str:
+            raise AgentCoreThrottled()
+
+    runtime = replace(
+        _measurement_runtime(
+            AlwaysThrottledIdentity(),
+            RecordingEvidence(),
+            clock=lambda: 0.0,
+        ),
+        sleep=lambda _: None,
+        random_unit=lambda: 0.0,
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(app, ["measure", "latency", "--samples", "2"])
+
+    assert result.exit_code == 4
+    assert json.loads(result.stdout) == {
+        "status": "blocked",
+        "category": "identity_broker",
+        "detail": "measurement_throttled",
+    }
+    assert "Traceback" not in result.output
+
+
+def test_measure_concurrency_maps_exhausted_drive_throttling_without_a_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = replace(
+        _measurement_runtime(
+            MeasurementIdentity(),
+            RecordingEvidence(),
+            drive=MeasurementDrive([DownstreamThrottled()] * 4),
+        ),
+        sleep=lambda _: None,
+        random_unit=lambda: 0.0,
+    )
+    monkeypatch.setattr("agentcore_identity_poc.cli.runtime_factory", lambda: runtime)
+
+    result = CliRunner().invoke(
+        app,
+        ["measure", "concurrency", "--workers", "1", "--requests", "1"],
+    )
+
+    assert result.exit_code == 4
+    assert json.loads(result.stdout) == {
+        "status": "blocked",
+        "category": "identity_broker",
+        "detail": "measurement_throttled",
+    }
+    assert "Traceback" not in result.output
