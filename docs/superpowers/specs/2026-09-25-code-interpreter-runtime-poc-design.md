@@ -65,10 +65,15 @@ src/
   agentcore_runtime_poc/
     gateway_sim/                 # mock centralized LLM gateway
     runtime_agent/                # BedrockAgentCoreApp entrypoint
+infra/terraform/
+  modules/agentcore_code_interpreter/
+  modules/agentcore_agent_runtime/
+  poc/                           # root module for this POC
 docs/
   code-interpreter-findings.md   # Phase 1 output
   runtime-findings.md            # Phase 2 output
-  superpowers/plans/2026-09-25-code-interpreter-runtime-poc.md  # (next step)
+  superpowers/plans/2026-09-25-code-interpreter-poc.md   # Phase 1 plan
+  superpowers/plans/2026-09-25-runtime-gateway-poc.md    # Phase 2 plan
 ```
 
 Work happens on a new branch, `feature/agentcore-code-interpreter-runtime-poc`,
@@ -235,14 +240,69 @@ wheels — confirm during implementation).
   mirror; only the finished zip goes to S3. The build script takes the
   index URL as a setting so this swap needs no code change.
 - The deployment path must create **no** ECR repository, CodeBuild
-  project, or container image. If the chosen tool (AgentCore CLI or the
-  legacy starter toolkit) cannot do a direct-code deploy without also
-  creating those, deploy with plain boto3 `bedrock-agentcore-control`
-  calls (`create_agent_runtime` / `update_agent_runtime` with a code
-  configuration pointing at the S3 object) instead.
-- The findings doc records exactly what gets created (S3 bucket/object,
-  IAM execution role, runtime resource, log groups) and the control-plane
-  calls made, so the "understand how it works" goal is met.
+  project, or container image.
+
+## Provisioning with Terraform
+
+All AWS resources in this POC are provisioned with **Terraform**, not
+with boto3 scripts, the AgentCore CLI, or the starter toolkit. The user
+writes the work Terraform modules for Code Interpreter and Runtime, so
+the POC doubles as a rehearsal for those modules. (The AgentCore CLI
+deploys through CDK/CloudFormation, and a default `cdk bootstrap` creates
+an ECR repository, which also rules it out.)
+
+- **Versions:** Terraform `1.14.x` (installed locally: 1.14.8) and the
+  `hashicorp/aws` provider pinned to exactly `6.66.0`. The provider has
+  `aws_bedrockagentcore_code_interpreter` and
+  `aws_bedrockagentcore_agent_runtime`, and the runtime resource supports
+  `agent_runtime_artifact.code_configuration` (S3 zip). Commit
+  `.terraform.lock.hcl`.
+- **Layout:**
+  - `infra/terraform/modules/agentcore_code_interpreter/`: a reusable
+    module for a custom Code Interpreter (name, network mode, optional
+    execution role, optional VPC config), with input validation.
+  - `infra/terraform/modules/agentcore_agent_runtime/`: a reusable module
+    for a zip-deployed Runtime and its execution role (S3 read of the one
+    zip object, CloudWatch Logs, X-Ray, metrics, and read access to named
+    secrets). It has no ECR permissions and no container option.
+  - `infra/terraform/poc/`: the root module for this POC. It holds the
+    budget guard, the Q1.6 scoped caller role, the Q1.4 custom
+    interpreter, the code bucket, the zip object, the secret shell, and
+    the runtime.
+  - Each module has `terraform test` files that use `mock_provider "aws"`,
+    so the modules are unit-tested with no AWS credentials.
+- **Budget guard:** the root reads `data "aws_budgets_budget"` by the
+  configured name. If the budget does not exist, `terraform plan` fails.
+  This replaces the Identity POC's Python budget check.
+- **Code updates:** the code bucket has versioning on. The runtime
+  references the zip object's `version_id`, so a new zip changes the
+  runtime's artifact and Terraform updates the runtime in place. Without
+  this, a new zip under the same key would never redeploy the agent.
+- **Secrets stay out of Terraform state:** Terraform creates only the
+  Secrets Manager secret itself, with no version. The operator writes the
+  secret value from a small script that reads it from the environment, so
+  the value never enters state or plan output.
+- **State:** local backend, gitignored (`*.tfstate*`, `.terraform/`,
+  `*.tfplan`, `terraform.tfvars`). At work this becomes a remote backend;
+  that is out of scope here.
+- **Out of Terraform:** the Entra app registrations (manual portal steps,
+  as in the Identity POC), the local gateway simulation and its tunnel,
+  and the zip build (a Python script, because it needs `uv` to fetch
+  Linux ARM64 wheels). Terraform consumes the built zip through a
+  variable.
+
+**Terraform verification questions** (answers go in the findings docs;
+they feed the work modules directly):
+- TF.1 A clean `apply` creates only the expected resources: no ECR
+  repository and no CodeBuild project.
+- TF.2 A second `plan` right after `apply` shows no changes (no
+  perpetual diff from computed or normalized attributes).
+- TF.3 A new zip triggers an in-place runtime update, not a
+  replacement, and the runtime's version number increases.
+- TF.4 Which argument changes force replacement (for example the name or
+  the network mode), taken from `plan` output.
+- TF.5 `destroy` removes everything, including after an `apply` that
+  failed partway through (Terraform state tracks what exists).
 
 **Invocation for this POC:** a local script (`scripts/invoke_runtime_agent.py`
 or similar) calls the deployed Runtime agent directly via its invoke API,
@@ -312,9 +372,9 @@ configuration/version, status.
 
 ## Cost and cleanup
 
-- Reuse the existing named-AWS-Budget preflight check from the Identity
-  POC before provisioning anything in this POC — don't skip that guard
-  just because it's a new package.
+- Keep the named-AWS-Budget guard before provisioning anything (in
+  Terraform, as a `data "aws_budgets_budget"` read; see "Provisioning
+  with Terraform").
 - Cost is small: a handful of real LLM calls during verification, plus
   standard AgentCore Runtime/Code Interpreter usage charges, plus
   negligible S3 storage for the code zip. Code Interpreter sessions are short-lived; Runtime sessions
@@ -329,20 +389,24 @@ configuration/version, status.
   new Entra app registrations and roles, and stop the local gateway
   simulation + `cloudflared` tunnel.
 - Cleanup must work even after a **partial** deployment failure (e.g. the
-  zip was uploaded to S3 but creating the runtime resource failed) — extend
-  `scripts/provision_agentcore.py` (or add a sibling script) with the
-  existing preview → `--apply --confirm <name>` pattern, but don't assume
-  every resource in the inventory above will always exist.
+  zip was uploaded to S3 but creating the runtime resource failed).
+  `terraform destroy` covers every AWS resource in the inventory, because
+  Terraform state records what was actually created. The code bucket uses
+  `force_destroy = true` so its object versions don't block deletion. The
+  Entra apps and the local gateway and tunnel are removed by hand, from a
+  checklist in the runbook.
 
 ## Dependencies
 
-Add to `pyproject.toml`, pinned to exact versions at implementation time
-(matching this repo's existing exact-pin convention): a deployment
-dependency for whichever path Runtime's "Deployment" section above settles
-on, plus `openai` and `anthropic`. Reuse existing `msal`, `PyJWT[crypto]`,
-`fastapi`, `uvicorn`, `boto3`, `typer`. Extend `pyproject.toml`'s coverage
-target and mypy `packages` list to include the two new packages, not just
-`agentcore_identity_poc`.
+No new Python dependencies. The gateway simulation and the agent send
+plain JSON over `httpx`, so the `openai` and `anthropic` SDKs are not
+needed. Reuse the existing pinned `bedrock-agentcore`, `boto3`, `msal`,
+`PyJWT[crypto]`, `fastapi`, `uvicorn`, and `httpx`. The agent's own zip
+dependencies are pinned in a separate requirements file, at the same
+versions as `pyproject.toml`. External tools: Terraform 1.14.x and `uv`
+(both installed). Extend the coverage flags and the mypy `packages` list
+to include both new packages. The 90% coverage floor applies to the
+combined total.
 
 ## Open items
 
@@ -350,11 +414,9 @@ target and mypy `packages` list to include the two new packages, not just
   are available in `ap-southeast-1` for this account before writing more
   code than a smoke-test call — first task of implementation, not assumed
   here.
-- **Deployment tool for the S3-zip path** — check early whether the
-  AgentCore CLI supports a direct-code deploy that creates no ECR/CodeBuild
-  resources; if not, use plain boto3 (see "Deployment").
-- **Direct code deployment in `ap-southeast-1`** — confirm it is
+- **Direct code deployment in `ap-southeast-1`**: confirm it is
   available in this region, together with the regional check above.
+  `.env` currently has no `AWS_REGION` line; Task 0 of the plan sets it.
 - **Real gateway schema is unknown** beyond "OpenAI + Anthropic proxy,
   AD-issued JWT auth." The gateway simulation's routes
   (`/openai/v1/chat/completions`, `/anthropic/v1/messages`) are a
