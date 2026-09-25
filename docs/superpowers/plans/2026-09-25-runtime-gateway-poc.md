@@ -3338,9 +3338,14 @@ import json
 from pathlib import Path
 
 import boto3  # type: ignore[import-untyped]
+from botocore.config import Config  # type: ignore[import-untyped]
 
 from agentcore_runtime_poc.invoke import RuntimeInvoker, new_session_id
 from scripts.terraform_outputs import load_terraform_outputs
+
+# botocore's default 60 s read timeout would cut off the 110 s in-flight probe (Task 10), and a
+# retry would replay the invocation.
+_CLIENT_CONFIG = Config(read_timeout=180, retries={"total_max_attempts": 1})
 
 ACTIONS = (
     "whoami",
@@ -3365,7 +3370,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     outputs = load_terraform_outputs(Path("infra/terraform/poc"))
-    client = boto3.client("bedrock-agentcore", region_name=outputs["aws_region"])
+    client = boto3.client(
+        "bedrock-agentcore", region_name=outputs["aws_region"], config=_CLIENT_CONFIG
+    )
     invoker = RuntimeInvoker(client, outputs["agent_runtime_arn"])
     session_id = args.session_id or new_session_id()
     payload = {
@@ -4111,12 +4118,15 @@ Follow the Phase 2 runbook section in full. Record the resource list from the pl
 terraform -chdir=infra/terraform/poc output -raw agent_runtime_version
 # Make a visible, harmless code change, e.g. set _MAX_OUTPUT_TOKENS = 48 in runtime_agent/agent.py
 .venv/bin/python -m scripts.build_agent_zip
-# Terminal D: hold an invocation open across the deploy (prints session_id and boot_id when done)
-.venv/bin/python -m scripts.invoke_runtime_agent --action sleep --seconds 110 --session-id "poc-inflight-$(uuidgen | tr -d -)"
+# Terminal C: choose the session id first and copy it (terminal D needs the same value)
+INFLIGHT="poc-inflight-$(uuidgen | tr -d - | tr 'A-Z' 'a-z')"; echo "$INFLIGHT"
+.venv/bin/python -m scripts.invoke_runtime_agent --action whoami --session-id "$INFLIGHT"   # note boot_id
+# Terminal D: hold an invocation open across the deploy (the client allows 180 s, no retries)
+.venv/bin/python -m scripts.invoke_runtime_agent --action sleep --seconds 110 --session-id <value of INFLIGHT>
 # Terminal C, within a few seconds of starting terminal D:
 time terraform -chdir=infra/terraform/poc apply
 terraform -chdir=infra/terraform/poc output -raw agent_runtime_version
-.venv/bin/python -m scripts.invoke_runtime_agent --action whoami --session-id <same session id as terminal D>
+.venv/bin/python -m scripts.invoke_runtime_agent --action whoami --session-id "$INFLIGHT"
 ```
 
 Expected: the plan shows `aws_s3_object.agent_zip[0]` updated and `module.agent_runtime[0].aws_bedrockagentcore_agent_runtime.this` **updated in place** (`~`), not replaced (`-/+`). The version number increases. Record:
