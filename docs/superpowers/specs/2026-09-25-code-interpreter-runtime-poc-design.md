@@ -200,28 +200,49 @@ entrypoint that, per invocation:
    calling any Bedrock/Anthropic/OpenAI SDK directly.
 3. Returns the LLM response back through Runtime's response contract.
 
-**Secret delivery to the deployed container:** the Entra client secret
+**Secret delivery to the deployed agent:** the Entra client secret
 (and any other secret the deployed agent needs) is stored in AWS Secrets
-Manager, not baked into the container image or read from a local `.env` —
+Manager, not packed into the code zip or read from a local `.env` —
 a local `.env` only makes sense for code running on the operator's
 machine, not code running inside Runtime. The Runtime execution role gets
 a narrowly-scoped `secretsmanager:GetSecretValue` grant on that one
-secret. The container build/upload context explicitly excludes `.env`,
-`.poc-state.json`, and any Identity-POC state files (e.g. via
-`.dockerignore`), and redaction requirements from the existing repo-safety
+secret. The zip build uses an explicit include list (agent package plus
+resolved dependencies only), so `.env`, `.poc-state.json`, and any
+Identity-POC state files can never be packed; a local test asserts the
+built zip contains none of them. Redaction requirements from the existing repo-safety
 test extend to whatever this agent logs — CloudWatch log lines,
 exceptions, and traces must not contain the JWT, the client secret, or raw
 LLM request/response bodies.
 
-**Deployment:** AWS currently labels the standalone Python
-`bedrock-agentcore-starter-toolkit` as legacy in favor of the AgentCore
-CLI; the toolkit's own default launch path already builds via CodeBuild
-rather than requiring a local Docker daemon. Concretely deciding which
-tool and which build mode (CodeBuild-backed vs. local Docker) to use is an
-early implementation task, not assumed here — whichever is chosen, the
-findings doc records what it does under the hood (IAM role(s) it creates,
-ECR repo, any CodeBuild/S3 resources, control-plane API calls) so the
-"understand how it works" goal is met regardless of which path is picked.
+**Deployment — hard requirement: no ECR.** The employer does not allow
+ECR; container images may only live in JFrog Artifactory. AgentCore
+Runtime's `ContainerConfiguration.containerUri` accepts only a private ECR
+URI or `public.ecr.aws`, so container deployment cannot pull from
+Artifactory, even with a network route to it. ECR pull-through cache is
+also out, because it still stores the image in ECR.
+
+This POC therefore uses **direct code deployment**: a zip of the agent
+code plus its dependencies, uploaded to an S3 bucket and referenced from
+the agent runtime's code configuration. This mirrors how Runtime would be
+deployed at work. Constraints to respect and record in the findings:
+Python 3.10–3.13 managed runtime only, 250 MB package limit, no
+Dockerfile or custom OS packages, and dependencies built for the
+runtime's target platform (per AWS's packaging instructions, Linux ARM64
+wheels — confirm during implementation).
+
+- Dependency source: this POC resolves dependencies from public PyPI. At
+  work, the same build step would resolve from Artifactory's PyPI
+  mirror; only the finished zip goes to S3. The build script takes the
+  index URL as a setting so this swap needs no code change.
+- The deployment path must create **no** ECR repository, CodeBuild
+  project, or container image. If the chosen tool (AgentCore CLI or the
+  legacy starter toolkit) cannot do a direct-code deploy without also
+  creating those, deploy with plain boto3 `bedrock-agentcore-control`
+  calls (`create_agent_runtime` / `update_agent_runtime` with a code
+  configuration pointing at the S3 object) instead.
+- The findings doc records exactly what gets created (S3 bucket/object,
+  IAM execution role, runtime resource, log groups) and the control-plane
+  calls made, so the "understand how it works" goal is met.
 
 **Invocation for this POC:** a local script (`scripts/invoke_runtime_agent.py`
 or similar) calls the deployed Runtime agent directly via its invoke API,
@@ -267,6 +288,10 @@ documented as part of Q2.2's findings.
 - Q2.5 How logs and errors surface (CloudWatch? Runtime-specific
   observability?) — relevant for debugging a real deployment later, and
   where the redaction requirement above needs to be enforced in practice.
+- Q2.6 ECR-free deployment: deploy and update the agent from an S3 zip
+  only, then confirm (by listing ECR repositories and CodeBuild projects
+  in the region) that nothing container-related was created. Record the
+  update-deploy time and whether an update affects in-flight sessions.
 
 **Output:** `docs/runtime-findings.md`, in the same structured format as
 Phase 1: procedure, expected behavior, observed result,
@@ -291,22 +316,20 @@ configuration/version, status.
   POC before provisioning anything in this POC — don't skip that guard
   just because it's a new package.
 - Cost is small: a handful of real LLM calls during verification, plus
-  standard AgentCore Runtime/Code Interpreter usage charges, plus whatever
-  build-time resources the chosen deployment path uses (e.g. CodeBuild
-  minutes). Code Interpreter sessions are short-lived; Runtime sessions
+  standard AgentCore Runtime/Code Interpreter usage charges, plus
+  negligible S3 storage for the code zip. Code Interpreter sessions are short-lived; Runtime sessions
   persist for their idle-timeout window (see Q2.4), not indefinitely, but
   are not instant scale-to-zero either — cleanup must not assume no
   billable resource is ever left running between sessions.
-- Cleanup inventory, tracked explicitly (not just "Runtime/ECR/one role"):
-  the Runtime resource itself, its ECR repository/image, its IAM execution
-  role, any CodeBuild project/artifacts or S3 buckets the chosen
-  deployment path created, the Secrets Manager secret holding the Entra
+- Cleanup inventory, tracked explicitly (not just "Runtime/one role"):
+  the Runtime resource itself, the S3 bucket/objects holding the code
+  zip, its IAM execution role, the Secrets Manager secret holding the Entra
   client secret, CloudWatch log groups, and any custom Code Interpreter
   resource created for Q1.4's custom-network test. Also revoke/delete the
   new Entra app registrations and roles, and stop the local gateway
   simulation + `cloudflared` tunnel.
 - Cleanup must work even after a **partial** deployment failure (e.g. the
-  build succeeded but `agentcore launch` didn't finish) — extend
+  zip was uploaded to S3 but creating the runtime resource failed) — extend
   `scripts/provision_agentcore.py` (or add a sibling script) with the
   existing preview → `--apply --confirm <name>` pattern, but don't assume
   every resource in the inventory above will always exist.
@@ -327,10 +350,11 @@ target and mypy `packages` list to include the two new packages, not just
   are available in `ap-southeast-1` for this account before writing more
   code than a smoke-test call — first task of implementation, not assumed
   here.
-- **Deployment tool/build-mode choice** for Runtime (AgentCore CLI vs. the
-  legacy starter toolkit; CodeBuild-backed vs. local-Docker build) — decide
-  this early, since it determines whether local Docker is even needed and
-  what the cleanup inventory looks like.
+- **Deployment tool for the S3-zip path** — check early whether the
+  AgentCore CLI supports a direct-code deploy that creates no ECR/CodeBuild
+  resources; if not, use plain boto3 (see "Deployment").
+- **Direct code deployment in `ap-southeast-1`** — confirm it is
+  available in this region, together with the regional check above.
 - **Real gateway schema is unknown** beyond "OpenAI + Anthropic proxy,
   AD-issued JWT auth." The gateway simulation's routes
   (`/openai/v1/chat/completions`, `/anthropic/v1/messages`) are a
