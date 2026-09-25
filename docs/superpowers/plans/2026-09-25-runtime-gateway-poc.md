@@ -29,6 +29,8 @@
 - Untyped imports follow repo style: `import boto3  # type: ignore[import-untyped]`, `import msal  # type: ignore[import-untyped]`.
 - Tracked files must pass `tests/test_repository_safety.py`. In tests, build any credential-shaped fixture by string concatenation. Use `example-tenant`, `123456789012`, and `*.example.test`.
 - The Phase 0 gate (Phase 1's, extended in Task 9) must pass before every commit. The coverage floor is 90% of the combined total.
+- Run repo scripts as modules from the repo root: `.venv/bin/python -m scripts.<name>`. Plain `python scripts/<name>.py` cannot import `scripts.terraform_outputs`.
+- Probe statuses: `pass`/`fail` only when the probe's own control steps succeeded; `blocked` when a control failed or a response lacked the fields being compared.
 - Signed commits: use a plain `git commit`. If 1Password signing fails, stop and ask the user.
 
 ---
@@ -66,9 +68,10 @@ GATEWAY_ANTHROPIC_MODELS=claude-haiku-4-5-20251001
 AGENT_OPENAI_MODEL=<same as GATEWAY_OPENAI_MODELS>
 AGENT_ANTHROPIC_MODEL=claude-haiku-4-5-20251001
 GATEWAY_MAX_OUTPUT_TOKENS=256
+ENTRA_TENANT_ID=<tenant id, the same tenant as the Identity POC>
 ```
 
-`ENTRA_TENANT_ID` already exists from the Identity POC.
+The main checkout's `.env` does not contain `ENTRA_TENANT_ID`, so add it here.
 
 - [ ] **Step 4: Check the token shape before any AWS work**
 
@@ -166,7 +169,8 @@ git commit -m "test: flag OpenAI/Anthropic-shaped API keys in tracked files"
   - `GatewaySettingsError(ValueError)`.
   - `CallerRejected(Exception)`.
   - `Authorizer` (Protocol): `authorize(header: str | None) -> str`.
-  - `AppRoleAuthorizer(policy, required_role, allowed_caller_ids)`: its `authorize` returns the caller's `azp`.
+  - `AppRoleAuthorizer(policy, required_role, allowed_caller_ids)`: its `authorize` returns the caller's `azp`. It requires `ver == "2.0"`, rejects `scp` and non-`app` `idtyp`, and requires the role and an allowed `azp`.
+  - `build_authorizer` accepts exactly the bare gateway app ID as audience (v2 tokens never carry `api://`). It does not use `audience_variants()`.
   - `build_authorizer(settings: GatewaySettings) -> AppRoleAuthorizer`.
 
 - [ ] **Step 1: Write the failing settings tests**
@@ -310,6 +314,9 @@ def test_token_without_idtyp_is_accepted_when_otherwise_valid(
         ("v1 issuer", {"iss": "https://sts.windows.net/example-tenant/"}),
         ("wrong audience", {"aud": "other-app"}),
         ("expired", {"exp": datetime.now(UTC) - timedelta(minutes=5)}),
+        ("v1 token version", {"ver": "1.0"}),
+        ("missing version", {"drop": ("ver",)}),
+        ("api uri audience", {"aud": "api://gateway-app-id"}),
     ],
 )
 def test_rejections(
@@ -449,7 +456,6 @@ from typing import Protocol
 from agentcore_identity_poc.jwt_validation import (
     JwtPolicy,
     TokenRejected,
-    audience_variants,
     make_http_jwks_loader,
 )
 from agentcore_runtime_poc.gateway_sim.settings import GatewaySettings
@@ -479,6 +485,8 @@ class AppRoleAuthorizer:
             claims = self.policy.validate(token)
         except TokenRejected as error:
             raise CallerRejected("token rejected") from error
+        if claims.get("ver") != "2.0":
+            raise CallerRejected("not a v2.0 token")
         if "scp" in claims:
             raise CallerRejected("delegated token")
         if claims.get("idtyp", "app") != "app":
@@ -495,7 +503,7 @@ class AppRoleAuthorizer:
 def build_authorizer(settings: GatewaySettings) -> AppRoleAuthorizer:
     policy = JwtPolicy(
         issuer=settings.issuer,
-        audience=audience_variants(settings.gateway_app_client_id),
+        audience=settings.gateway_app_client_id,
         jwks_loader=make_http_jwks_loader(settings.jwks_url),
     )
     return AppRoleAuthorizer(
@@ -533,7 +541,8 @@ git commit -m "feat: add gateway simulation settings and app-role authorization"
   - `create_app(settings: GatewaySettings, *, authorizer: Authorizer | None = None, upstream: httpx.AsyncClient | None = None) -> FastAPI`
   - `create_production_app() -> FastAPI`, the uvicorn factory
   - Constants `OPENAI_URL`, `ANTHROPIC_URL`, `ANTHROPIC_VERSION`
-  - Routes: `GET /healthz`, `POST /openai/v1/chat/completions`, `POST /anthropic/v1/messages`
+  - Routes: `GET /healthz` (unauthenticated and returns no data; the spec's "every request" auth rule applies to the proxy routes), `POST /openai/v1/chat/completions`, `POST /anthropic/v1/messages`
+  - Limits are applied in this order: auth, then the concurrency slot, then a bounded streaming body read (declared `content-length` checked first), then JSON and body rules. OpenAI's `n` must be absent or 1, so output tokens can't be multiplied.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -543,7 +552,7 @@ git commit -m "feat: add gateway simulation settings and app-role authorization"
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 
 import httpx
 import pytest
@@ -690,6 +699,7 @@ def test_anthropic_forward_uses_fixed_url_and_provider_headers() -> None:
             "max_tokens_out_of_range",
         ),
         ("/anthropic/v1/messages", ["not", "an", "object"], "invalid_json"),
+        ("/openai/v1/chat/completions", {"model": "model-o", "n": 3}, "n_must_be_1"),
     ],
 )
 def test_request_limits(path: str, body: object, error: str) -> None:
@@ -763,6 +773,19 @@ def test_saturated_gateway_returns_429() -> None:
 
     assert response.status_code == 429
     assert seen == []
+
+
+def test_oversized_body_without_content_length_is_rejected_while_streaming() -> None:
+    client, seen = _client(_ok)
+
+    def chunks() -> Iterator[bytes]:
+        for _ in range(8):
+            yield b" " * 512
+
+    response = client.post("/openai/v1/chat/completions", content=chunks(), headers=GOOD)
+
+    assert response.status_code == 413
+    assert seen == []
 ```
 
 - [ ] **Step 2: Run the tests and confirm they fail**
@@ -819,6 +842,8 @@ def _normalize_body(
         return "model_not_allowed"
     if provider == "openai" and "max_tokens" in body:
         return "use_max_completion_tokens"
+    if provider == "openai" and body.get("n", 1) != 1:
+        return "n_must_be_1"
     field = _TOKEN_FIELD[provider]
     value = body.get(field)
     if value is None:
@@ -880,6 +905,20 @@ async def _forward(
     return 200, data
 
 
+async def _read_limited(request: Request, limit: int) -> bytes | None:
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > limit:
+        return None
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def create_app(
     settings: GatewaySettings,
     *,
@@ -904,21 +943,21 @@ def create_app(
         except CallerRejected as rejection:
             logger.info("gateway reject provider=%s reason=%s", provider, rejection)
             return _error(401, "unauthorized")
-        raw = await request.body()
-        if len(raw) > settings.max_body_bytes:
-            return _error(413, "body_too_large")
-        try:
-            body = json.loads(raw)
-        except ValueError:
-            return _error(400, "invalid_json")
-        if not isinstance(body, dict):
-            return _error(400, "invalid_json")
-        problem = _normalize_body(provider, body, settings)
-        if problem is not None:
-            return _error(400, problem)
         if semaphore.locked():
             return _error(429, "too_many_requests")
         async with semaphore:
+            raw = await _read_limited(request, settings.max_body_bytes)
+            if raw is None:
+                return _error(413, "body_too_large")
+            try:
+                body = json.loads(raw)
+            except ValueError:
+                return _error(400, "invalid_json")
+            if not isinstance(body, dict):
+                return _error(400, "invalid_json")
+            problem = _normalize_body(provider, body, settings)
+            if problem is not None:
+                return _error(400, problem)
             started = time.perf_counter()
             status, payload = await _forward(client, provider, body, settings)
         logger.info(
@@ -998,6 +1037,7 @@ git commit -m "feat: add gateway simulation proxy with fixed upstreams and stric
     - `probe_egress`
     - `chat`
     - `chat_unauthenticated`
+    - `sleep` (`seconds` 1–120; used in Task 10 to hold an invocation open during a deploy)
   - `BOOT_ID: str`.
   - The response keys that Task 9 relies on:
     - `action`, `boot_id`, `session_id`, `uptime_s`
@@ -1007,7 +1047,8 @@ git commit -m "feat: add gateway simulation proxy with fixed upstreams and stric
     - `timings_ms.token`, `timings_ms.gateway`
     - `text`
     - `error`
-  - `entrypoint.app` (`BedrockAgentCoreApp`), `entrypoint.get_agent()` (cached), `entrypoint.invoke(payload, context)`, `entrypoint.main()`.
+  - `entrypoint.app` (`BedrockAgentCoreApp`), `entrypoint.get_agent()` (cached), `entrypoint.invoke(payload, context)`, `entrypoint.configure_logging()`, and `entrypoint.main()` (calls `configure_logging()` then `app.run()`).
+  - Every handled request logs one line: `agent action=<action> session=<session_id> outcome=<status or error>`. The Q2.5 live check keys on this line.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1191,7 +1232,7 @@ def test_logs_never_contain_token_or_prompt(caplog: pytest.LogCaptureFixture) ->
     with caplog.at_level(logging.DEBUG):
         agent.handle({"action": "chat", "provider": "openai", "prompt": prompt}, "s-1")
 
-    assert "action=chat" in caplog.text
+    assert "action=chat session=s-1" in caplog.text
     assert TOKEN_VALUE not in caplog.text
     assert prompt not in caplog.text
 
@@ -1305,6 +1346,33 @@ def test_get_agent_builds_from_environment(monkeypatch: pytest.MonkeyPatch) -> N
     assert isinstance(agent, Agent)
     assert entrypoint.get_agent() is agent
     entrypoint.get_agent.cache_clear()
+
+
+def test_sleep_action_is_bounded() -> None:
+    slept: list[float] = []
+    agent = Agent(
+        AgentConfig.from_env(ENV),
+        FakeTokens(),
+        httpx.Client(transport=httpx.MockTransport(_openai_reply)),
+        sleeper=slept.append,
+    )
+
+    assert agent.handle({"action": "sleep", "seconds": 5}, "s-1")["slept_s"] == 5
+    assert agent.handle({"action": "sleep", "seconds": 500}, "s-1")["error"] == "bad_request"
+    assert slept == [5]
+
+
+def test_configure_logging_enables_agent_info_logs_once() -> None:
+    logger = logging.getLogger("agentcore_runtime_poc")
+    logger.handlers.clear()
+
+    entrypoint.configure_logging()
+    entrypoint.configure_logging()
+
+    assert logger.level == logging.INFO
+    assert len(logger.handlers) == 1
+    logger.handlers.clear()
+    logger.setLevel(logging.NOTSET)
 ```
 
 - [ ] **Step 2: Run the tests and confirm they fail**
@@ -1495,11 +1563,13 @@ class Agent:
         tokens: TokenSource,
         http: httpx.Client,
         clock: Callable[[], float] = time.perf_counter,
+        sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self._config = config
         self._tokens = tokens
         self._http = http
         self._clock = clock
+        self._sleeper = sleeper
         self._marker: str | None = None
 
     def handle(self, payload: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:
@@ -1518,11 +1588,14 @@ class Agent:
             result = self._chat(payload, authenticated=True)
         elif action == "chat_unauthenticated":
             result = self._chat(payload, authenticated=False)
+        elif action == "sleep":
+            result = self._sleep(payload)
         else:
             result = {"error": "unknown_action"}
         logger.info(
-            "agent action=%s outcome=%s",
+            "agent action=%s session=%s outcome=%s",
             action,
+            session_id,
             result.get("gateway_status", result.get("error", "ok")),
         )
         return {
@@ -1532,6 +1605,13 @@ class Agent:
             "uptime_s": round(time.monotonic() - _BOOTED_AT, 3),
             **result,
         }
+
+    def _sleep(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        seconds = payload.get("seconds")
+        if isinstance(seconds, bool) or not isinstance(seconds, int) or not 1 <= seconds <= 120:
+            return {"error": "bad_request"}
+        self._sleeper(seconds)
+        return {"slept_s": seconds}
 
     def _probe_egress(self) -> dict[str, Any]:
         try:
@@ -1598,6 +1678,7 @@ class Agent:
 from __future__ import annotations
 
 import functools
+import logging
 import os
 from typing import Any
 
@@ -1629,7 +1710,18 @@ def invoke(payload: dict[str, Any], context: RequestContext) -> dict[str, Any]:
 app.entrypoint(invoke)
 
 
+def configure_logging() -> None:
+    # The SDK configures only its own logger; without this, agent INFO lines never reach CloudWatch.
+    logger = logging.getLogger("agentcore_runtime_poc")
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
+        logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+
 def main() -> None:
+    configure_logging()
     app.run()
 ```
 
@@ -1661,7 +1753,7 @@ git commit -m "feat: add Runtime agent that routes all inference through the gat
 - Produces:
   - `build_agent_zip(output: Path, *, source_root: Path, index_url: str, installer: Installer, workdir: Path) -> Path`
   - `verify_agent_zip(path: Path, *, max_bytes: int = MAX_ZIP_BYTES) -> None`
-  - `uv_installer(requirements: Path = AGENT_REQUIREMENTS, run=subprocess.run) -> Installer`
+  - `uv_installer(requirements: Path = AGENT_REQUIREMENTS, run=subprocess.run) -> Installer`. It passes the index URL to `uv` in the `UV_DEFAULT_INDEX` environment variable, never in argv, because at work the URL can carry Artifactory credentials.
   - `agent_source_files(source_root: Path) -> list[Path]`
   - `PackagingError`
   - `Installer = Callable[[Path, str], None]`
@@ -1817,7 +1909,8 @@ def test_uv_installer_targets_linux_arm64_wheels(
     assert args[:3] == ["/usr/local/bin/uv", "pip", "install"]
     assert args[args.index("--python-platform") + 1] == "aarch64-manylinux2014"
     assert args[args.index("--python-version") + 1] == "3.13"
-    assert args[args.index("--index-url") + 1] == "https://mirror.example.test/simple"
+    assert "https://mirror.example.test/simple" not in args
+    assert seen["kwargs"]["env"]["UV_DEFAULT_INDEX"] == "https://mirror.example.test/simple"
     assert "--only-binary=:all:" in args
     assert seen["kwargs"]["check"] is True
 
@@ -1901,12 +1994,12 @@ def uv_installer(
                 "--target",
                 str(target),
                 "--only-binary=:all:",
-                "--index-url",
-                index_url,
                 "-r",
                 str(requirements),
             ],
             check=True,
+            # Via env, not argv: at work the index URL can carry Artifactory credentials.
+            env={**os.environ, "UV_DEFAULT_INDEX": index_url},
         )
 
     return install
@@ -2026,7 +2119,7 @@ Expected: all pass.
 
 - [ ] **Step 5: Build the real zip once (needs network, no AWS)**
 
-Run: `.venv/bin/python scripts/build_agent_zip.py`
+Run: `.venv/bin/python -m scripts.build_agent_zip`
 Expected: `build/agent/agent.zip <N> bytes sha256=<hex>`, with N well under 250 MB (roughly 20–40 MB). Run it again; the sha256 must be identical. If `uv` fails because a wheel has no `aarch64-manylinux2014` build, record the package name. That is a finding about the agent's dependency set.
 
 - [ ] **Step 6: Lint, type-check, commit**
@@ -2168,7 +2261,7 @@ run "execution_policy_has_no_ecr_or_bedrock_model_access" {
   }
 
   assert {
-    condition     = length(jsondecode(aws_iam_role_policy.execution.policy).Statement) == 6
+    condition     = length(jsondecode(aws_iam_role_policy.execution.policy).Statement) == 7
     error_message = "no secret statement without secret_arns"
   }
 }
@@ -2409,6 +2502,12 @@ locals {
       Effect   = "Allow"
       Action   = ["logs:CreateLogGroup", "logs:DescribeLogStreams"]
       Resource = ["${local.log_group_arn}/*"]
+    },
+    {
+      Sid      = "RuntimeLogResourcePolicy"
+      Effect   = "Allow"
+      Action   = ["logs:PutResourcePolicy"]
+      Resource = ["${local.log_group_arn}/${var.name}-*"]
     },
     {
       Sid      = "DescribeLogGroups"
@@ -3243,7 +3342,15 @@ import boto3  # type: ignore[import-untyped]
 from agentcore_runtime_poc.invoke import RuntimeInvoker, new_session_id
 from scripts.terraform_outputs import load_terraform_outputs
 
-ACTIONS = ("whoami", "set_marker", "get_marker", "probe_egress", "chat", "chat_unauthenticated")
+ACTIONS = (
+    "whoami",
+    "set_marker",
+    "get_marker",
+    "probe_egress",
+    "chat",
+    "chat_unauthenticated",
+    "sleep",
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -3252,6 +3359,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--provider", choices=("openai", "anthropic"))
     parser.add_argument("--prompt")
     parser.add_argument("--marker")
+    parser.add_argument("--seconds", type=int)
     parser.add_argument("--session-id")
     parser.add_argument("--stop", action="store_true", help="stop the session afterwards")
     args = parser.parse_args(argv)
@@ -3267,6 +3375,7 @@ def main(argv: list[str] | None = None) -> int:
             "provider": args.provider,
             "prompt": args.prompt,
             "marker": args.marker,
+            "seconds": args.seconds,
         }.items()
         if value is not None
     }
@@ -3307,6 +3416,9 @@ git commit -m "feat: add SigV4 Runtime invoker and CLI"
 ### Task 9: Phase 2 live gate, gate updates, and runbook
 
 **Files:**
+- Create: `src/agentcore_runtime_poc/inventory.py`
+- Create: `scripts/container_inventory.py`
+- Test: `tests/test_container_inventory.py`
 - Create: `tests/integration/test_runtime_live.py`
 - Modify: `pyproject.toml` (`[tool.mypy] packages`)
 - Modify: `README.md` and `docs/runbook.md` (Phase 0 commands; a Phase 2 section)
@@ -3317,8 +3429,163 @@ git commit -m "feat: add SigV4 Runtime invoker and CLI"
   - `RuntimeInvoker`, `new_session_id` (Task 8)
   - `Observation`, `append_observations` (Phase 1)
   - The agent response keys (Task 4)
+- Produces:
+  - `inventory.container_inventory(ecr, codebuild) -> dict[str, list[str]]` (paginated), `inventory.new_resources(before, after) -> dict[str, list[str]]`, `inventory.save_inventory(path, inventory)`, and `inventory.load_inventory(path)`
+  - `scripts.container_inventory.BEFORE_PATH` (`evidence/raw/container-inventory-before.json`), written by `python -m scripts.container_inventory` before the first apply
 
-- [ ] **Step 1: Write the live gate**
+- [ ] **Step 1: Write the failing inventory tests**
+
+`tests/test_container_inventory.py`:
+
+```python
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from agentcore_runtime_poc.inventory import (
+    container_inventory,
+    load_inventory,
+    new_resources,
+    save_inventory,
+)
+
+
+class FakePaginated:
+    def __init__(self, operation: str, pages: list[dict[str, Any]]) -> None:
+        self.operation = operation
+        self.pages = pages
+
+    def get_paginator(self, name: str) -> FakePaginated:
+        assert name == self.operation
+        return self
+
+    def paginate(self) -> list[dict[str, Any]]:
+        return self.pages
+
+
+def test_inventory_reads_every_page() -> None:
+    ecr = FakePaginated(
+        "describe_repositories",
+        [
+            {"repositories": [{"repositoryName": "b"}]},
+            {"repositories": [{"repositoryName": "a"}]},
+        ],
+    )
+    codebuild = FakePaginated("list_projects", [{"projects": ["p1"]}, {"projects": ["p2"]}])
+
+    assert container_inventory(ecr, codebuild) == {
+        "ecr_repositories": ["a", "b"],
+        "codebuild_projects": ["p1", "p2"],
+    }
+
+
+def test_new_resources_ignores_pre_existing_ones() -> None:
+    before = {"ecr_repositories": ["team-repo"], "codebuild_projects": []}
+    after = {"ecr_repositories": ["team-repo", "bedrock-agentcore-x"], "codebuild_projects": ["p"]}
+
+    assert new_resources(before, after) == {
+        "ecr_repositories": ["bedrock-agentcore-x"],
+        "codebuild_projects": ["p"],
+    }
+
+
+def test_inventory_round_trips_through_a_file(tmp_path: Path) -> None:
+    path = tmp_path / "raw" / "before.json"
+    inventory = {"ecr_repositories": ["a"], "codebuild_projects": []}
+
+    save_inventory(path, inventory)
+
+    assert load_inventory(path) == inventory
+```
+
+- [ ] **Step 2: Run them and confirm they fail**
+
+Run: `.venv/bin/python -m pytest tests/test_container_inventory.py -v`
+Expected: FAIL with `ModuleNotFoundError: No module named 'agentcore_runtime_poc.inventory'`.
+
+- [ ] **Step 3: Implement the inventory module and snapshot script**
+
+`src/agentcore_runtime_poc/inventory.py`:
+
+```python
+"""Paginated inventory of container-build resources, compared before and after a deploy."""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
+KEYS = ("ecr_repositories", "codebuild_projects")
+
+
+def container_inventory(ecr: Any, codebuild: Any) -> dict[str, list[str]]:
+    repositories = [
+        repo["repositoryName"]
+        for page in ecr.get_paginator("describe_repositories").paginate()
+        for repo in page.get("repositories", [])
+    ]
+    projects = [
+        name
+        for page in codebuild.get_paginator("list_projects").paginate()
+        for name in page.get("projects", [])
+    ]
+    return {"ecr_repositories": sorted(repositories), "codebuild_projects": sorted(projects)}
+
+
+def new_resources(
+    before: Mapping[str, list[str]], after: Mapping[str, list[str]]
+) -> dict[str, list[str]]:
+    return {key: sorted(set(after.get(key, [])) - set(before.get(key, []))) for key in KEYS}
+
+
+def save_inventory(path: Path, inventory: Mapping[str, list[str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(dict(inventory), indent=2, sort_keys=True), encoding="utf-8")
+
+
+def load_inventory(path: Path) -> dict[str, list[str]]:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    return {key: [str(name) for name in raw.get(key, [])] for key in KEYS}
+```
+
+`scripts/container_inventory.py`:
+
+```python
+"""Snapshot ECR repositories and CodeBuild projects before a deploy (for Q2.6)."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import boto3  # type: ignore[import-untyped]
+
+from agentcore_runtime_poc.inventory import container_inventory, save_inventory
+
+BEFORE_PATH = Path("evidence/raw/container-inventory-before.json")
+
+
+def main() -> int:
+    region = os.environ["AWS_REGION"]
+    inventory = container_inventory(
+        boto3.client("ecr", region_name=region), boto3.client("codebuild", region_name=region)
+    )
+    save_inventory(BEFORE_PATH, inventory)
+    print(f"{BEFORE_PATH}: {', '.join(f'{k}={len(v)}' for k, v in inventory.items())}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+Run: `.venv/bin/python -m pytest tests/test_container_inventory.py -v`
+Expected: 3 passed.
+
+- [ ] **Step 4: Write the live gate**
 
 `tests/integration/test_runtime_live.py`:
 
@@ -3341,7 +3608,9 @@ import httpx
 import pytest
 
 from agentcore_code_interpreter_poc.observations import Observation, Status, append_observations
-from agentcore_runtime_poc.invoke import RuntimeInvoker, new_session_id
+from agentcore_runtime_poc.inventory import container_inventory, load_inventory, new_resources
+from agentcore_runtime_poc.invoke import InvokeResult, RuntimeInvoker, new_session_id
+from scripts.container_inventory import BEFORE_PATH
 from scripts.terraform_outputs import load_terraform_outputs
 
 pytestmark = pytest.mark.integration
@@ -3352,6 +3621,17 @@ _JWT_SHAPE = re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.")
 
 def _status(ok: bool) -> Status:
     return "pass" if ok else "fail"
+
+
+def _valid(result: InvokeResult, action: str, *required: str) -> bool:
+    body = result.body
+    return (
+        result.status_code == 200
+        and body.get("action") == action
+        and "error" not in body
+        and bool(body.get("boot_id"))
+        and all(key in body for key in required)
+    )
 
 
 @pytest.fixture(scope="module")
@@ -3408,15 +3688,20 @@ def _pick(body: dict[str, Any], *keys: str) -> str:
 def test_q2_1_runtime_reaches_external_gateway(
     invoker: RuntimeInvoker, opened: list[str], outputs: dict[str, str]
 ) -> None:
-    body = invoker.invoke({"action": "probe_egress"}, _session(opened)).body
+    result = invoker.invoke({"action": "probe_egress"}, _session(opened))
+    status: Status = (
+        _status(result.body.get("healthz_status") == 200)
+        if _valid(result, "probe_egress", "healthz_status")
+        else "blocked"
+    )
     _record(
         [
             Observation(
                 "Q2.1",
                 "egress_to_external_https",
-                _status(body.get("healthz_status") == 200),
+                status,
                 "the tunnel URL's /healthz returns 200 from inside Runtime (PUBLIC network mode)",
-                _pick(body, "healthz_status", "error"),
+                _pick(result.body, "healthz_status", "error"),
                 _config(outputs),
             )
         ]
@@ -3438,7 +3723,7 @@ def test_q2_2_round_trip_through_gateway(
             Observation(
                 "Q2.2",
                 f"{provider}_round_trip",
-                _status(body.get("gateway_status") == 200 and bool(text)),
+                _status(_valid(result, "chat", "text") and body.get("gateway_status") == 200),
                 "Runtime -> Entra token -> gateway -> provider -> back to caller",
                 f"gateway_status={body.get('gateway_status')} text_chars={len(text)} "
                 f"timings_ms={body.get('timings_ms')} client_ms={result.elapsed_ms} "
@@ -3452,18 +3737,23 @@ def test_q2_2_round_trip_through_gateway(
 def test_q2_2_gateway_rejects_unauthenticated_call_from_runtime(
     invoker: RuntimeInvoker, opened: list[str], outputs: dict[str, str]
 ) -> None:
-    body = invoker.invoke(
+    result = invoker.invoke(
         {"action": "chat_unauthenticated", "provider": "openai", "prompt": "ping"},
         _session(opened),
-    ).body
+    )
+    status: Status = (
+        _status(result.body.get("gateway_status") == 401)
+        if _valid(result, "chat_unauthenticated", "gateway_status")
+        else "blocked"
+    )
     _record(
         [
             Observation(
                 "Q2.2",
                 "unauthenticated_call_rejected",
-                _status(body.get("gateway_status") == 401),
+                status,
                 "a gateway call without a JWT is rejected with 401",
-                _pick(body, "gateway_status", "error"),
+                _pick(result.body, "gateway_status", "error"),
                 _config(outputs),
             )
         ]
@@ -3496,31 +3786,41 @@ def test_q2_3_isolation_is_per_session(
 ) -> None:
     first, second = _session(opened), _session(opened)
     marker = uuid.uuid4().hex
-    set_body = invoker.invoke({"action": "set_marker", "marker": marker}, first).body
-    same = invoker.invoke({"action": "get_marker"}, first).body
-    other = invoker.invoke({"action": "get_marker"}, second).body
+    set_result = invoker.invoke({"action": "set_marker", "marker": marker}, first)
+    same = invoker.invoke({"action": "get_marker"}, first)
+    other = invoker.invoke({"action": "get_marker"}, second)
+    controls_ok = (
+        _valid(set_result, "set_marker", "marker")
+        and set_result.body["marker"] == marker
+        and _valid(same, "get_marker", "marker")
+        and _valid(other, "get_marker", "marker")
+    )
+    same_ok = same.body.get("marker") == marker and (
+        same.body.get("boot_id") == set_result.body.get("boot_id")
+    )
+    other_ok = other.body.get("marker") is None and (
+        other.body.get("boot_id") != same.body.get("boot_id")
+    )
     _record(
         [
             Observation(
                 "Q2.3",
                 "state_persists_within_session",
-                _status(
-                    same.get("marker") == marker and same.get("boot_id") == set_body.get("boot_id")
-                ),
+                _status(same_ok) if controls_ok else "blocked",
                 "same runtimeSessionId reaches the same process and sees the marker",
-                f"same_boot={same.get('boot_id') == set_body.get('boot_id')} "
-                f"marker_seen={same.get('marker') == marker}",
+                f"controls_ok={controls_ok} same_boot="
+                f"{same.body.get('boot_id') == set_result.body.get('boot_id')} "
+                f"marker_seen={same.body.get('marker') == marker}",
                 _config(outputs),
             ),
             Observation(
                 "Q2.3",
                 "state_isolated_across_sessions",
-                _status(
-                    other.get("marker") is None and other.get("boot_id") != same.get("boot_id")
-                ),
+                _status(other_ok) if controls_ok else "blocked",
                 "a different runtimeSessionId gets a different environment and no marker",
-                f"different_boot={other.get('boot_id') != same.get('boot_id')} "
-                f"marker={other.get('marker')!r}",
+                f"controls_ok={controls_ok} different_boot="
+                f"{other.body.get('boot_id') != same.body.get('boot_id')} "
+                f"marker={other.body.get('marker')!r}",
                 _config(outputs),
             ),
         ]
@@ -3534,14 +3834,20 @@ def test_q2_4_cold_warm_and_token_cache(
     cold = invoker.invoke({"action": "whoami"}, session_id)
     warm = invoker.invoke({"action": "whoami"}, session_id)
     chat = {"action": "chat", "provider": "anthropic", "prompt": "Reply ok"}
-    first_chat = invoker.invoke(chat, session_id).body
-    second_chat = invoker.invoke(chat, session_id).body
+    first_chat = invoker.invoke(chat, session_id)
+    second_chat = invoker.invoke(chat, session_id)
+    whoami_ok = _valid(cold, "whoami") and _valid(warm, "whoami")
+    chats_ok = _valid(first_chat, "chat", "token_cached") and _valid(
+        second_chat, "chat", "token_cached"
+    )
+    first_timings = first_chat.body.get("timings_ms") or {}
+    second_timings = second_chat.body.get("timings_ms") or {}
     _record(
         [
             Observation(
                 "Q2.4",
                 "cold_vs_warm_latency",
-                _status(cold.body.get("boot_id") == warm.body.get("boot_id")),
+                _status(cold.body["boot_id"] == warm.body["boot_id"]) if whoami_ok else "blocked",
                 "record cold (first call in a new session) vs warm client latency",
                 f"cold_ms={cold.elapsed_ms} warm_ms={warm.elapsed_ms} "
                 f"uptime_at_first_call_s={cold.body.get('uptime_s')}",
@@ -3550,11 +3856,11 @@ def test_q2_4_cold_warm_and_token_cache(
             Observation(
                 "Q2.4",
                 "token_cached_across_invocations",
-                _status(second_chat.get("token_cached") is True),
+                _status(second_chat.body["token_cached"] is True) if chats_ok else "blocked",
                 "the second call in a warm session reuses the MSAL-cached token",
-                f"first_token_ms={(first_chat.get('timings_ms') or {}).get('token')} "
-                f"second_token_ms={(second_chat.get('timings_ms') or {}).get('token')} "
-                f"gateway_ms={(second_chat.get('timings_ms') or {}).get('gateway')}",
+                f"first_token_ms={first_timings.get('token')} "
+                f"second_token_ms={second_timings.get('token')} "
+                f"gateway_ms={second_timings.get('gateway')}",
                 _config(outputs),
             ),
         ]
@@ -3568,110 +3874,140 @@ def test_q2_4_idle_timeout_reclaims_session(
         pytest.skip("set AGENTCORE_POC_SLOW=1 to run the idle-timeout probe (~3 minutes)")
     idle = int(outputs["runtime_idle_session_timeout_seconds"])
     session_id = _session(opened)
-    before = invoker.invoke({"action": "set_marker", "marker": "idle-check"}, session_id).body
+    before = invoker.invoke({"action": "set_marker", "marker": "idle-check"}, session_id)
     time.sleep(idle + 45)
-    after = invoker.invoke({"action": "get_marker"}, session_id).body
+    after = invoker.invoke({"action": "get_marker"}, session_id)
+    controls_ok = (
+        _valid(before, "set_marker", "marker")
+        and before.body["marker"] == "idle-check"
+        and _valid(after, "get_marker", "marker")
+    )
+    reclaimed = after.body.get("boot_id") != before.body.get("boot_id") and (
+        after.body.get("marker") is None
+    )
     _record(
         [
             Observation(
                 "Q2.4",
                 "idle_session_reclaimed",
-                _status(
-                    after.get("boot_id") != before.get("boot_id") or after.get("marker") is None
-                ),
-                f"after {idle + 45}s idle (timeout {idle}s) the same session id "
+                _status(reclaimed) if controls_ok else "blocked",
+                f"after {idle + 45}s idle (configured timeout {idle}s) the same session id "
                 "gets a fresh environment",
-                f"same_boot={after.get('boot_id') == before.get('boot_id')} "
-                f"marker={after.get('marker')!r}",
+                f"controls_ok={controls_ok} "
+                f"same_boot={after.body.get('boot_id') == before.body.get('boot_id')} "
+                f"marker={after.body.get('marker')!r}",
                 _config(outputs),
             )
         ]
     )
+
+
+def _log_messages(logs: Any, prefix: str, start_ms: int) -> tuple[list[str], list[str]]:
+    groups = [
+        group["logGroupName"]
+        for page in logs.get_paginator("describe_log_groups").paginate(logGroupNamePrefix=prefix)
+        for group in page.get("logGroups", [])
+    ]
+    messages = [
+        event["message"]
+        for group in groups
+        for page in logs.get_paginator("filter_log_events").paginate(
+            logGroupName=group, startTime=start_ms
+        )
+        for event in page.get("events", [])
+    ]
+    return groups, messages
 
 
 def test_q2_5_logs_hold_no_tokens_secrets_or_prompts(
     invoker: RuntimeInvoker, opened: list[str], outputs: dict[str, str]
 ) -> None:
     marker = f"prompt-marker-{uuid.uuid4().hex}"
-    invoker.invoke(
+    session_id = _session(opened)
+    start_ms = int(time.time() * 1000) - 60_000
+    chat = invoker.invoke(
         {"action": "chat", "provider": "anthropic", "prompt": f"Ignore {marker}. Reply ok."},
-        _session(opened),
+        session_id,
+    )
+    denied = invoker.invoke(
+        {"action": "chat_unauthenticated", "provider": "openai", "prompt": marker}, session_id
     )
     logs = boto3.client("logs", region_name=outputs["aws_region"])
     prefix = f"/aws/bedrock-agentcore/runtimes/{outputs['agent_runtime_id']}"
-    start_ms = int((time.time() - 900) * 1000)
     groups: list[str] = []
     messages: list[str] = []
-    deadline = time.monotonic() + 120
+    correlated: list[str] = []
+    deadline = time.monotonic() + 180
     while time.monotonic() < deadline:
-        found = logs.describe_log_groups(logGroupNamePrefix=prefix).get("logGroups", [])
-        groups = [group["logGroupName"] for group in found]
-        messages = [
-            event["message"]
-            for group in groups
-            for event in logs.filter_log_events(logGroupName=group, startTime=start_ms).get(
-                "events", []
-            )
-        ]
-        if any("action=chat" in message for message in messages):
+        groups, messages = _log_messages(logs, prefix, start_ms)
+        correlated = [m for m in messages if f"session={session_id}" in m]
+        if any("action=chat " in m for m in correlated) and any(
+            "action=chat_unauthenticated" in m for m in correlated
+        ):
             break
-        time.sleep(10)
+        time.sleep(15)
     secret = os.environ.get("GATEWAY_CALLER_CLIENT_SECRET", "")
+    completion = str(chat.body.get("text") or "")
     checks = {
         "jwt": any(_JWT_SHAPE.search(message) for message in messages),
         "prompt": any(marker in message for message in messages),
         "client_secret": bool(secret) and any(secret in message for message in messages),
+        "completion": len(completion) >= 12 and any(completion in m for m in messages),
     }
     leaks = [name for name, hit in checks.items() if hit]
+    evidence_ok = (
+        _valid(chat, "chat")
+        and _valid(denied, "chat_unauthenticated")
+        and any("action=chat " in m for m in correlated)
+        and any("action=chat_unauthenticated" in m for m in correlated)
+    )
     _record(
         [
             Observation(
                 "Q2.5",
                 "runtime_logs_redacted",
-                _status(bool(messages) and not leaks),
-                "agent logs reach CloudWatch and hold no JWTs, client secret, or prompt text",
-                f"log_groups={groups} events={len(messages)} leaks={leaks}",
+                _status(not leaks) if evidence_ok else "blocked",
+                "agent log lines for this session reach CloudWatch (success and failure paths) "
+                "and no log holds a JWT, the client secret, the prompt, or the completion",
+                f"log_groups={groups} events={len(messages)} correlated={len(correlated)} "
+                f"leaks={leaks}",
                 _config(outputs),
             )
         ]
     )
 
 
-def test_q2_6_no_container_resources(outputs: dict[str, str]) -> None:
+def test_q2_6_no_container_resources_created(outputs: dict[str, str]) -> None:
+    if not BEFORE_PATH.exists():
+        pytest.fail(
+            f"{BEFORE_PATH} missing: run python -m scripts.container_inventory before apply"
+        )
     region = outputs["aws_region"]
-    prefix = outputs["name_prefix"]
-    repositories = [
-        repo["repositoryName"]
-        for repo in boto3.client("ecr", region_name=region)
-        .describe_repositories()
-        .get("repositories", [])
-    ]
-    projects = boto3.client("codebuild", region_name=region).list_projects().get("projects", [])
-    related = [
-        name
-        for name in (*repositories, *projects)
-        if "bedrock-agentcore" in name or prefix in name or prefix.replace("_", "-") in name
-    ]
+    after = container_inventory(
+        boto3.client("ecr", region_name=region), boto3.client("codebuild", region_name=region)
+    )
+    created = new_resources(load_inventory(BEFORE_PATH), after)
     _record(
         [
             Observation(
                 "Q2.6",
-                "no_ecr_or_codebuild",
-                _status(not related),
-                "no ECR repository or CodeBuild project exists for this POC",
-                f"ecr_total={len(repositories)} codebuild_total={len(projects)} related={related}",
+                "no_ecr_or_codebuild_created",
+                _status(not any(created.values())),
+                "no ECR repository or CodeBuild project appeared between the pre-apply snapshot "
+                "and now",
+                f"created={created} totals={ {key: len(value) for key, value in after.items()} }",
                 _config(outputs),
             )
         ]
     )
 ```
 
-- [ ] **Step 2: Confirm that it skips cleanly without the flag**
+- [ ] **Step 5: Confirm that it skips cleanly without the flag**
 
 Run: `.venv/bin/python -m pytest tests/integration/test_runtime_live.py -v`
 Expected: 10 skipped (2 of them are the parametrized round-trip cases).
 
-- [ ] **Step 3: Update the gates**
+- [ ] **Step 6: Update the gates**
 
 In `pyproject.toml`: `packages = ["agentcore_identity_poc", "agentcore_code_interpreter_poc", "agentcore_runtime_poc"]`.
 
@@ -3689,7 +4025,7 @@ and add, after the Phase 1 Terraform lines:
 (cd infra/terraform/modules/agentcore_agent_runtime && terraform init -backend=false -input=false >/dev/null && terraform test)
 ```
 
-- [ ] **Step 4: Add the Phase 2 runbook section**
+- [ ] **Step 7: Add the Phase 2 runbook section**
 
 Append to `docs/runbook.md`:
 
@@ -3718,7 +4054,8 @@ Terminal C, build, deploy, secret, and live gate:
 set -a; source .env; set +a
 export GATEWAY_BASE_URL=<tunnel URL from terminal B>
 curl -s "$GATEWAY_BASE_URL/healthz"                       # expect {"status":"ok"}
-.venv/bin/python scripts/build_agent_zip.py
+.venv/bin/python -m scripts.build_agent_zip
+.venv/bin/python -m scripts.container_inventory             # Q2.6 baseline, before any apply
 export TF_VAR_aws_region="$AWS_REGION" TF_VAR_aws_budget_name="$AWS_BUDGET_NAME" \
   TF_VAR_deploy_runtime=true TF_VAR_entra_tenant_id="$ENTRA_TENANT_ID" \
   TF_VAR_gateway_app_client_id="$GATEWAY_APP_CLIENT_ID" \
@@ -3728,12 +4065,15 @@ export TF_VAR_aws_region="$AWS_REGION" TF_VAR_aws_budget_name="$AWS_BUDGET_NAME"
 terraform -chdir=infra/terraform/poc plan -out=phase2.tfplan   # TF.1: no ECR/CodeBuild
 terraform -chdir=infra/terraform/poc apply phase2.tfplan
 terraform -chdir=infra/terraform/poc plan -detailed-exitcode   # TF.2: exit 0
-.venv/bin/python scripts/put_gateway_secret.py
-.venv/bin/python scripts/invoke_runtime_agent.py --action chat --provider anthropic --prompt "Reply ok" --stop
+.venv/bin/python -m scripts.put_gateway_secret
+.venv/bin/python -m scripts.invoke_runtime_agent --action chat --provider anthropic --prompt "Reply ok" --stop
 AGENTCORE_POC_LIVE=1 .venv/bin/python -m pytest tests/integration/test_runtime_live.py -m integration -v -s
 AGENTCORE_POC_LIVE=1 AGENTCORE_POC_SLOW=1 .venv/bin/python -m pytest \
   tests/integration/test_runtime_live.py -m integration -k idle -v -s
 ```
+
+The live gate configures a 120 s idle timeout to keep the probe short. The service default
+(15 minutes, per AWS docs) is not measured; record the configured value in the findings.
 
 A quick tunnel gets a new URL each time it restarts. After a restart, export the new
 `GATEWAY_BASE_URL` and `TF_VAR_gateway_base_url` and apply again (an environment-variable
@@ -3744,12 +4084,14 @@ as an IAM-propagation finding for the work module.
 Observations go to `evidence/raw/runtime-observations.jsonl` (ignored).
 ````
 
-- [ ] **Step 5: Run the full Phase 0 gate and commit**
+- [ ] **Step 8: Run the full Phase 0 gate and commit**
 
 Expected: every gate command exits 0 and total coverage is at least 90%.
 
 ```bash
-git add tests/integration/test_runtime_live.py pyproject.toml README.md docs/runbook.md
+git add src/agentcore_runtime_poc/inventory.py scripts/container_inventory.py \
+  tests/test_container_inventory.py tests/integration/test_runtime_live.py \
+  pyproject.toml README.md docs/runbook.md
 git commit -m "feat: add Phase 2 live gate and extend the local gate to the runtime package"
 ```
 
@@ -3768,12 +4110,21 @@ Follow the Phase 2 runbook section in full. Record the resource list from the pl
 ```bash
 terraform -chdir=infra/terraform/poc output -raw agent_runtime_version
 # Make a visible, harmless code change, e.g. set _MAX_OUTPUT_TOKENS = 48 in runtime_agent/agent.py
-.venv/bin/python scripts/build_agent_zip.py
+.venv/bin/python -m scripts.build_agent_zip
+# Terminal D: hold an invocation open across the deploy (prints session_id and boot_id when done)
+.venv/bin/python -m scripts.invoke_runtime_agent --action sleep --seconds 110 --session-id "poc-inflight-$(uuidgen | tr -d -)"
+# Terminal C, within a few seconds of starting terminal D:
 time terraform -chdir=infra/terraform/poc apply
 terraform -chdir=infra/terraform/poc output -raw agent_runtime_version
+.venv/bin/python -m scripts.invoke_runtime_agent --action whoami --session-id <same session id as terminal D>
 ```
 
-Expected: the plan shows `aws_s3_object.agent_zip[0]` updated and `module.agent_runtime[0].aws_bedrockagentcore_agent_runtime.this` **updated in place** (`~`), not replaced (`-/+`). The version number increases. Record the wall-clock time of the apply for Q2.6, and whether a session opened before the update kept its `boot_id`. Afterwards, revert the code change and build and apply again.
+Expected: the plan shows `aws_s3_object.agent_zip[0]` updated and `module.agent_runtime[0].aws_bedrockagentcore_agent_runtime.this` **updated in place** (`~`), not replaced (`-/+`). The version number increases. Record:
+- the wall-clock time of the apply (Q2.6);
+- whether terminal D's in-flight invocation completed or failed during the deploy;
+- whether the follow-up `whoami` on the same session returns the same `boot_id` (old environment kept) or a new one.
+
+Afterwards, revert the code change and build and apply again.
 
 - [ ] **Step 3: TF.4, attributes that force replacement (plan only; do not apply)**
 
@@ -3795,7 +4146,22 @@ aws s3api head-bucket --bucket "ci-rt-poc-agent-code-$(aws sts get-caller-identi
 aws bedrock-agentcore-control list-agent-runtimes --region "$AWS_REGION"
 ```
 
-Expected: both destroys finish, the bucket is gone, and no `ci_rt_poc_agent` runtime is listed. Then remove the non-Terraform pieces:
+Expected: both destroys finish, the bucket is gone, and no `ci_rt_poc_agent` runtime is listed.
+
+The service creates the runtime's CloudWatch log groups itself, so they are not in Terraform state and `destroy` leaves them. Delete and verify them:
+
+```bash
+PREFIX=/aws/bedrock-agentcore/runtimes/ci_rt_poc_agent-
+for group in $(aws logs describe-log-groups --region "$AWS_REGION" --log-group-name-prefix "$PREFIX" \
+    --query 'logGroups[].logGroupName' --output text); do
+  aws logs delete-log-group --region "$AWS_REGION" --log-group-name "$group"
+done
+aws logs describe-log-groups --region "$AWS_REGION" --log-group-name-prefix "$PREFIX" --query 'length(logGroups)'
+```
+
+Expected: `0`. Record this as a TF finding: the work module must decide how to own these log groups (for example, pre-create them with retention, or clean them up outside Terraform).
+
+Then remove the non-Terraform pieces:
 - Stop terminals A and B.
 - Delete the two Entra app registrations (or remove the caller secret) in the portal.
 - Remove the `GATEWAY_*`, `OPENAI_API_KEY`, and `ANTHROPIC_API_KEY` lines from `.env`.

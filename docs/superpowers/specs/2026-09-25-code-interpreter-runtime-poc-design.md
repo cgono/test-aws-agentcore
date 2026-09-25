@@ -162,7 +162,9 @@ A FastAPI app, same operational pattern as the Identity POC's
 Runtime something realistic to call — its own correctness is not what's
 under test.
 
-- Requires `Authorization: Bearer <JWT>` on every request. Authorization is
+- Requires `Authorization: Bearer <JWT>` on every proxy request. (`GET /healthz`
+  stays unauthenticated and returns no data; Q2.1 uses it as the egress probe.)
+  Authorization is
   **application (client-credentials), not delegated**: define a
   gateway-resource app registration with an **app role** (e.g.
   `Gateway.Invoke`), assign that role to a separate caller app registration
@@ -338,9 +340,10 @@ documented as part of Q2.2's findings.
   visible from a *different* session, using explicit state markers (not
   inference from timing).
 - Q2.4 Lifecycle: Runtime does not necessarily tear down between
-  invocations — sessions have an idle-timeout setting (verify the default,
-  commonly on the order of minutes, not immediate scale-to-zero) before
-  AWS reclaims them. Measure cold-start latency (first invocation of a
+  invocations — sessions have an idle-timeout setting (AWS documents a
+  15-minute default) before AWS reclaims them. The POC configures 120 s so the
+  probe stays short, and verifies that the configured value is enforced; it
+  does not re-measure the default. Measure cold-start latency (first invocation of a
   fresh session) separately from warm-invocation latency, and separately
   again from the Entra-token-fetch + gateway + LLM latency inside the
   round trip — these should be reported as distinct numbers, not one
@@ -377,8 +380,8 @@ configuration/version, status.
   with Terraform").
 - Cost is small: a handful of real LLM calls during verification, plus
   standard AgentCore Runtime/Code Interpreter usage charges, plus
-  negligible S3 storage for the code zip. Code Interpreter sessions are short-lived; Runtime sessions
-  persist for their idle-timeout window (see Q2.4), not indefinitely, but
+  negligible S3 storage for the code zip. Code Interpreter sessions are
+  short-lived; Runtime sessions persist for their idle-timeout window (see Q2.4), not indefinitely, but
   are not instant scale-to-zero either — cleanup must not assume no
   billable resource is ever left running between sessions.
 - Cleanup inventory, tracked explicitly (not just "Runtime/one role"):
@@ -390,8 +393,12 @@ configuration/version, status.
   simulation + `cloudflared` tunnel.
 - Cleanup must work even after a **partial** deployment failure (e.g. the
   zip was uploaded to S3 but creating the runtime resource failed).
-  `terraform destroy` covers every AWS resource in the inventory, because
-  Terraform state records what was actually created. The code bucket uses
+  `terraform destroy` covers every AWS resource that Terraform created,
+  because Terraform state records what was actually created. The runtime's
+  CloudWatch log groups are the exception: the service creates them, so they
+  are outside Terraform state. The runbook deletes them by name prefix and
+  verifies they are gone, and the findings record how the work module should
+  own them. The code bucket uses
   `force_destroy = true` so its object versions don't block deletion. The
   Entra apps and the local gateway and tunnel are removed by hand, from a
   checklist in the runbook.

@@ -39,13 +39,14 @@ Expected: the browser sign-in completes. `aws sts get-caller-identity` then prin
 
 - [ ] **Step 2: Set the region in `.env`**
 
-`.env` currently has no `AWS_REGION` line. Add:
+The main checkout's `.env` has only three Identity POC lines. It has no `AWS_REGION` and no
+`AWS_BUDGET_NAME`. Add both (the account's only budget is named `My Monthly Cost Budget`;
+keep the quotes, because `set -a; source .env` would split the unquoted value):
 
 ```
 AWS_REGION=ap-southeast-1
+AWS_BUDGET_NAME="My Monthly Cost Budget"
 ```
-
-Keep `AWS_BUDGET_NAME` as it is. The Identity POC's budget is reused.
 
 - [ ] **Step 3: Check service availability (read-only)**
 
@@ -794,7 +795,7 @@ git commit -m "feat: parse Code Interpreter tool responses"
 - Consumes: `parse_tool_result`, `ToolResult` (Task 3).
 - Produces:
   - `sessions.BUILTIN_IDENTIFIER: str` (`"aws.codeinterpreter.v1"`)
-  - `sessions.open_session(region: str, *, boto_session: Any = None, identifier: str = BUILTIN_IDENTIFIER, timeout_seconds: int = 900) -> ContextManager[CodeInterpreter]`
+  - `sessions.open_session(region: str, *, boto_session: Any = None, identifier: str = BUILTIN_IDENTIFIER, timeout_seconds: int = 900, tolerate_stop_errors: bool = False) -> ContextManager[CodeInterpreter]`
   - `sessions.assume_role_session(role_arn: str, region: str, *, session_policy: Mapping[str, Any] | None = None, base_session: Any = None) -> Any` (returns a `boto3.Session`)
   - `observations.Status = Literal["pass", "fail", "blocked"]`; `observations.Observation(question, check, status, expected, observed, config)` with `as_dict() -> dict[str, object]`; `observations.append_observations(path: Path, observations: Iterable[Observation]) -> None`
   - `probes.Session` (Protocol), `probes.SessionFactory = Callable[[], AbstractContextManager[Session]]`
@@ -859,6 +860,10 @@ class FakeSession:
         if path not in self.files:
             raise FileNotFoundError(path)
         return self.files[path]
+
+    def get_session(self) -> dict[str, Any]:
+        self.calls.append(("get_session", ""))
+        return {"status": "READY"}
 
 
 def factory_of(
@@ -931,16 +936,23 @@ def test_open_session_stops_even_when_body_raises() -> None:
     assert FakeInterpreter.instances[0].stopped is True
 
 
-def test_stop_failure_after_ttl_is_suppressed(monkeypatch: pytest.MonkeyPatch) -> None:
-    gone = ClientError(
+def _gone() -> ClientError:
+    return ClientError(
         {"Error": {"Code": "ResourceNotFoundException", "Message": "gone"}},
         "StopCodeInterpreterSession",
     )
 
-    with sessions.open_session("ap-southeast-1") as interpreter:
-        interpreter.stop_error = gone
+
+def test_stop_failure_is_suppressed_only_when_tolerated() -> None:
+    with sessions.open_session("ap-southeast-1", tolerate_stop_errors=True) as interpreter:
+        interpreter.stop_error = _gone()
 
     assert FakeInterpreter.instances[0].stopped is True
+
+
+def test_stop_failure_raises_by_default() -> None:
+    with pytest.raises(ClientError), sessions.open_session("ap-southeast-1") as interpreter:
+        interpreter.stop_error = _gone()
 
 
 def test_builtin_identifier_is_the_aws_default() -> None:
@@ -1049,6 +1061,22 @@ def test_state_leak_across_sessions_is_a_failure() -> None:
     assert observations["state_isolated_across_sessions"].status == "fail"
 
 
+def test_unrelated_error_in_new_session_is_blocked_not_pass() -> None:
+    def first(session: FakeSession, language: str, code: str) -> dict[str, object]:
+        return ok("42\n") if "print" in code else ok("")
+
+    def throttled(session: FakeSession, language: str, code: str) -> dict[str, object]:
+        return err("ThrottlingException: slow down")
+
+    observations = _by_check(
+        probes.probe_state_persistence(
+            factory_of(FakeSession(first), FakeSession(throttled)), CONFIG
+        )
+    )
+
+    assert observations["state_isolated_across_sessions"].status == "blocked"
+
+
 def test_languages_probe_covers_js_ts_shell_and_switch_back() -> None:
     def respond(session: FakeSession, language: str, code: str) -> dict[str, object]:
         if language == "shell":
@@ -1149,15 +1177,19 @@ def open_session(
     boto_session: Any = None,
     identifier: str = BUILTIN_IDENTIFIER,
     timeout_seconds: int = 900,
+    tolerate_stop_errors: bool = False,
 ) -> Iterator[CodeInterpreter]:
     client = CodeInterpreter(region, session=boto_session)
     client.start(identifier=identifier, session_timeout_seconds=timeout_seconds)
     try:
         yield client
     finally:
-        # A session past its TTL is already gone; stopping it can fail with nothing left to clean.
-        with contextlib.suppress(ClientError):
+        try:
             client.stop()
+        except ClientError:
+            # Only probes that outlive the session TTL expect this: the session is already gone.
+            if not tolerate_stop_errors:
+                raise
 
 
 def assume_role_session(
@@ -1256,6 +1288,8 @@ class Session(Protocol):
 
     def download_file(self, path: str) -> str | bytes: ...
 
+    def get_session(self) -> dict[str, Any]: ...
+
 
 SessionFactory = Callable[[], AbstractContextManager[Session]]
 Config = Mapping[str, str]
@@ -1273,6 +1307,13 @@ def error_code(error: Exception) -> str:
 
 def _status(ok: bool) -> Status:
     return "pass" if ok else "fail"
+
+
+def _classify(*, ok: bool, conclusive: bool) -> Status:
+    """Report blocked, not fail, when an unrelated error prevented a conclusion."""
+    if ok:
+        return "pass"
+    return "fail" if conclusive else "blocked"
 
 
 def _run(session: Session, code: str, language: str = "python") -> ToolResult:
@@ -1301,7 +1342,7 @@ def probe_state_persistence(factory: SessionFactory, config: Config) -> list[Obs
         Observation(
             "Q1.1",
             "state_isolated_across_sessions",
-            _status(other.failed or "NameError" in other.output),
+            _classify(ok="NameError" in other.output, conclusive=not other.failed),
             "a new session cannot see the variable",
             clip(other.output),
             config,
@@ -1372,8 +1413,10 @@ def probe_files(factory: SessionFactory, config: Config) -> list[Observation]:
     with factory() as session:
         try:
             leaked: str = _as_text(session.download_file("poc_internal.txt"))
-        except (FileNotFoundError, ClientError) as error:
-            leaked = f"absent:{error_code(error)}"
+        except FileNotFoundError:
+            leaked = "absent:FileNotFoundError"
+        except ClientError as error:
+            leaked = f"blocked:{error_code(error)}"
 
     try:
         sum_b = json.loads(produced).get("sum_b")
@@ -1392,7 +1435,9 @@ def probe_files(factory: SessionFactory, config: Config) -> list[Observation]:
         Observation(
             "Q1.3",
             "internal_file_absent_in_new_session",
-            _status(leaked.startswith("absent:")),
+            _classify(
+                ok=leaked.startswith("absent:"), conclusive=not leaked.startswith("blocked:")
+            ),
             "a new session does not see the file",
             clip(leaked),
             config,
@@ -1419,7 +1464,7 @@ def probe_files(factory: SessionFactory, config: Config) -> list[Observation]:
 - [ ] **Step 8: Run the tests and confirm they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_code_interpreter_sessions.py tests/test_code_interpreter_probes.py -v`
-Expected: all pass (6 session tests, 6 probe tests).
+Expected: all pass (7 session tests, 7 probe tests).
 
 If `from tests.code_interpreter_fakes import ...` fails with `ModuleNotFoundError: No module named 'tests'`, create an empty `tests/__init__.py`. Then run the full suite once to confirm that existing tests still collect.
 
@@ -1449,6 +1494,8 @@ git commit -m "feat: add Code Interpreter sessions, observations, and Q1.1-Q1.3 
   - `probes.probe_session_ttl(open_with_timeout: Callable[[int], AbstractContextManager[Session]], config: Config, *, ttl_seconds: int = 60, sleep: Callable[[float], None] = time.sleep) -> list[Observation]`
   - `probes.INVOKE_EXCLUDED_SESSION_POLICY: dict[str, Any]`
   - `probes.probe_scoped_caller(allowed: SessionFactory, denied: SessionFactory, config: Config) -> list[Observation]`
+  - `probes.probe_execution_limit(factory: SessionFactory, config: Config, *, seconds: int = 600, clock: Callable[[], float] = time.monotonic) -> list[Observation]`
+  - Status meanings for every probe: `pass`/`fail` only when the check's own preconditions held; `blocked` when a control step failed or an unrelated error (throttling, access denied, execution failure) prevented a conclusion.
 
 - [ ] **Step 1: Append the failing tests**
 
@@ -1474,6 +1521,8 @@ def _client_error(code: str) -> ClientError:
         ("status 200\n", True, "pass"),
         ("blocked URLError\n", False, "pass"),
         ("status 200\n", False, "fail"),
+        ("status 403\n", True, "pass"),
+        ("Traceback (most recent call last)\n", True, "blocked"),
     ],
 )
 def test_egress_compares_reachability_with_expectation(
@@ -1540,6 +1589,26 @@ def test_session_ttl_expires_when_idle_and_when_active() -> None:
     assert "ResourceNotFoundException" in observations["idle_session_ends_at_ttl"].observed
 
 
+def test_session_ttl_throttling_after_wait_is_blocked() -> None:
+    clock = {"now": 0.0}
+
+    def respond(session: FakeSession, language: str, code: str) -> dict[str, object]:
+        if clock["now"] > 60:
+            raise _client_error("ThrottlingException")
+        return ok("alive\n")
+
+    def open_with_timeout(ttl: int) -> contextlib.AbstractContextManager[FakeSession]:
+        clock["now"] = 0.0
+        return contextlib.nullcontext(FakeSession(respond))
+
+    def sleep(seconds: float) -> None:
+        clock["now"] += seconds
+
+    observations = _by_check(probes.probe_session_ttl(open_with_timeout, CONFIG, sleep=sleep))
+
+    assert observations["idle_session_ends_at_ttl"].status == "blocked"
+
+
 def test_session_ttl_extended_by_activity_is_reported_as_fail() -> None:
     def open_with_timeout(ttl: int) -> contextlib.AbstractContextManager[FakeSession]:
         return contextlib.nullcontext(FakeSession(lambda s, language, code: ok("alive\n")))
@@ -1555,15 +1624,17 @@ def test_scoped_caller_allowed_runs_and_denied_invoke_is_access_denied() -> None
     allowed = FakeSession(lambda s, language, code: ok("scoped-ok\n"))
 
     def deny(session: FakeSession, language: str, code: str) -> dict[str, object]:
-        raise _client_error("AccessDeniedException")
+        raise _client_error("accessDeniedException")
 
     observations = _by_check(
         probes.probe_scoped_caller(factory_of(allowed), factory_of(FakeSession(deny)), CONFIG)
     )
 
     assert observations["scoped_role_can_execute"].status == "pass"
+    assert "session_status=READY" in observations["scoped_role_can_execute"].observed
+    assert ("get_session", "") in allowed.calls
     assert observations["invoke_denied_without_permission"].status == "pass"
-    assert observations["invoke_denied_without_permission"].observed == "AccessDeniedException"
+    assert observations["invoke_denied_without_permission"].observed == "accessDeniedException"
 
 
 def test_scoped_caller_denied_session_that_runs_is_a_failure() -> None:
@@ -1574,6 +1645,25 @@ def test_scoped_caller_denied_session_that_runs_is_a_failure() -> None:
     )
 
     assert observations["invoke_denied_without_permission"].status == "fail"
+
+
+def test_execution_limit_records_completion_or_client_timeout() -> None:
+    ticks = iter([0.0, 600.4])
+    done = probes.probe_execution_limit(
+        factory_of(FakeSession(lambda s, language, code: ok("slept\n"))),
+        CONFIG,
+        clock=lambda: next(ticks),
+    )
+    assert done[0].observed == "outcome=completed after 600s"
+
+    def time_out(session: FakeSession, language: str, code: str) -> dict[str, object]:
+        raise TimeoutError("read timeout")
+
+    ticks = iter([0.0, 300.2])
+    timed_out = probes.probe_execution_limit(
+        factory_of(FakeSession(time_out)), CONFIG, clock=lambda: next(ticks)
+    )
+    assert timed_out[0].observed == "outcome=raised:TimeoutError after 300s"
 
 
 def test_session_policy_excludes_invoke() -> None:
@@ -1611,11 +1701,23 @@ INVOKE_EXCLUDED_SESSION_POLICY: dict[str, Any] = {
 }
 
 _EGRESS_CODE = (
-    "import urllib.request\n"
+    "import urllib.error, urllib.request\n"
     "try:\n"
     "    print('status', urllib.request.urlopen('https://aws.amazon.com', timeout=10).status)\n"
+    "except urllib.error.HTTPError as error:\n"
+    "    print('status', error.code)\n"
     "except Exception as error:\n"
     "    print('blocked', type(error).__name__)\n"
+)
+_BLOCKING_CODES = frozenset(
+    {
+        "AccessDeniedException",
+        "accessDeniedException",
+        "ThrottlingException",
+        "throttlingException",
+        "InternalServerException",
+        "internalServerException",
+    }
 )
 
 
@@ -1624,12 +1726,13 @@ def probe_egress(
 ) -> list[Observation]:
     with factory() as session:
         result = _run(session, _EGRESS_CODE)
-    reachable = "status 200" in result.output
+    reachable = "status " in result.output
+    ran = reachable or "blocked " in result.output
     return [
         Observation(
             "Q1.4",
             "public_internet_egress",
-            _status(reachable == expected_reachable),
+            _classify(ok=reachable == expected_reachable, conclusive=ran),
             f"reachable={expected_reachable}",
             clip(result.output),
             config,
@@ -1705,6 +1808,12 @@ def _attempt(session: Session) -> str:
     return "ok"
 
 
+def _expired(outcome: str) -> Status:
+    if outcome == "ok":
+        return "fail"
+    return "blocked" if outcome.removeprefix("error:") in _BLOCKING_CODES else "pass"
+
+
 def probe_session_ttl(
     open_with_timeout: Callable[[int], AbstractContextManager[Session]],
     config: Config,
@@ -1718,15 +1827,16 @@ def probe_session_ttl(
         sleep(wait)
         idle_after = _attempt(session)
     with open_with_timeout(ttl_seconds) as session:
+        active_before = _attempt(session)
         for _ in range(wait // 15):
-            _attempt(session)
             sleep(15)
+            _attempt(session)
         active_after = _attempt(session)
     return [
         Observation(
             "Q1.5",
             "idle_session_ends_at_ttl",
-            _status(idle_before == "ok" and idle_after != "ok"),
+            _expired(idle_after) if idle_before == "ok" else "blocked",
             f"an idle session is gone {wait}s after start (TTL {ttl_seconds}s)",
             f"before={idle_before} after={idle_after}",
             config,
@@ -1734,11 +1844,42 @@ def probe_session_ttl(
         Observation(
             "Q1.5",
             "active_session_ends_at_ttl",
-            _status(active_after != "ok"),
+            _expired(active_after) if active_before == "ok" else "blocked",
             "sessionTimeoutSeconds is a fixed lifetime: activity does not extend it",
-            f"after={active_after}",
+            f"before={active_before} after={active_after}",
             config,
         ),
+    ]
+
+
+def probe_execution_limit(
+    factory: SessionFactory,
+    config: Config,
+    *,
+    seconds: int = 600,
+    clock: Callable[[], float] = time.monotonic,
+) -> list[Observation]:
+    with factory() as session:
+        started = clock()
+        try:
+            result = _run(session, f"import time\ntime.sleep({seconds})\nprint('slept')")
+            if "slept" in result.output and not result.failed:
+                outcome = "completed"
+            else:
+                outcome = "error:" + (",".join(result.shape) or clip(result.output, 80))
+        except Exception as error:
+            outcome = f"raised:{error_code(error)}"
+        elapsed = clock() - started
+    return [
+        Observation(
+            "Q1.5",
+            "per_execution_limit",
+            "pass",
+            f"record what ends a {seconds}s execution "
+            "(service limit or the SDK's 300s read timeout)",
+            f"outcome={outcome} after {elapsed:.0f}s",
+            config,
+        )
     ]
 
 
@@ -1747,6 +1888,7 @@ def probe_scoped_caller(
 ) -> list[Observation]:
     with allowed() as session:
         allowed_result = _run(session, "print('scoped-ok')")
+        described = session.get_session()
     try:
         with denied() as session:
             _run(session, "print('should-not-run')")
@@ -1757,15 +1899,19 @@ def probe_scoped_caller(
         Observation(
             "Q1.6",
             "scoped_role_can_execute",
-            _status("scoped-ok" in allowed_result.output and not allowed_result.failed),
-            "the scoped caller role (4 session actions only) can start, execute, and stop",
-            clip(allowed_result.output),
+            _status(
+                "scoped-ok" in allowed_result.output
+                and not allowed_result.failed
+                and "status" in described
+            ),
+            "the scoped caller role (4 session actions only) can start, execute, get, and stop",
+            f"output={clip(allowed_result.output, 80)} session_status={described.get('status')}",
             config,
         ),
         Observation(
             "Q1.6",
             "invoke_denied_without_permission",
-            _status("AccessDenied" in denied_outcome),
+            _status("accessdenied" in denied_outcome.lower()),
             "without InvokeCodeInterpreter, execution is denied",
             denied_outcome,
             config,
@@ -1990,14 +2136,33 @@ def test_q1_5_session_ttl(outputs: dict[str, str]) -> None:
     region = outputs["aws_region"]
     _record(
         probes.probe_session_ttl(
-            lambda ttl: open_session(region, identifier=builtin, timeout_seconds=ttl),
+            lambda ttl: open_session(
+                region, identifier=builtin, timeout_seconds=ttl, tolerate_stop_errors=True
+            ),
             _config(outputs, builtin),
         )
     )
 
 
-def test_q1_6_scoped_caller(outputs: dict[str, str]) -> None:
+def test_q1_5_execution_limit(outputs: dict[str, str]) -> None:
+    if "AGENTCORE_POC_SLOW" not in os.environ:
+        pytest.skip("set AGENTCORE_POC_SLOW=1 to run the ~10 minute execution-limit probe")
     builtin = outputs["builtin_code_interpreter_id"]
+    factory = functools.partial(
+        open_session,
+        outputs["aws_region"],
+        identifier=builtin,
+        timeout_seconds=900,
+        tolerate_stop_errors=True,
+    )
+    _record(probes.probe_execution_limit(factory, _config(outputs, builtin)))
+
+
+@pytest.mark.parametrize(
+    "interpreter_output", ["builtin_code_interpreter_id", "public_code_interpreter_id"]
+)
+def test_q1_6_scoped_caller(outputs: dict[str, str], interpreter_output: str) -> None:
+    identifier = outputs[interpreter_output]
     role = outputs["ci_caller_role_arn"]
     region = outputs["aws_region"]
     allowed = assume_role_session(role, region)
@@ -2006,9 +2171,9 @@ def test_q1_6_scoped_caller(outputs: dict[str, str]) -> None:
     )
     _record(
         probes.probe_scoped_caller(
-            _factory(outputs, builtin, allowed),
-            _factory(outputs, builtin, denied),
-            _config(outputs, builtin, caller="ci_caller_role"),
+            _factory(outputs, identifier, allowed),
+            _factory(outputs, identifier, denied),
+            _config(outputs, identifier, caller="ci_caller_role"),
         )
     )
 ```
@@ -2016,7 +2181,7 @@ def test_q1_6_scoped_caller(outputs: dict[str, str]) -> None:
 - [ ] **Step 6: Confirm that the live gate skips cleanly without the flag**
 
 Run: `.venv/bin/python -m pytest tests/integration/test_code_interpreter_live.py -v`
-Expected: 8 skipped.
+Expected: 10 skipped.
 
 - [ ] **Step 7: Update the mypy config and the Phase 0 commands**
 
@@ -2066,11 +2231,13 @@ terraform plan -detailed-exitcode          # TF.2: exit code 0 = no drift
 cd ../../..
 AGENTCORE_POC_LIVE=1 .venv/bin/python -m pytest tests/integration/test_code_interpreter_live.py -m integration -v -s
 AGENTCORE_POC_LIVE=1 AGENTCORE_POC_SLOW=1 .venv/bin/python -m pytest \
-  tests/integration/test_code_interpreter_live.py -m integration -k ttl -v -s
+  tests/integration/test_code_interpreter_live.py -m integration -k "ttl or execution_limit" -v -s
 ```
 
 Observations are appended to `evidence/raw/code-interpreter-observations.jsonl` (ignored).
-A failing probe is a finding, not necessarily a bug: record it. Only fix code when the probe
+A failing probe is a finding, not necessarily a bug: record it. `blocked` means a control
+step or an unrelated error (throttling, access denied, execution failure) prevented a
+conclusion: rerun it before recording a result. Only fix code when the probe
 itself is wrong. If `test_q1_6` fails the *allowed* check with `AccessDeniedException`, the
 built-in interpreter ARN in `infra/terraform/poc/main.tf` is wrong for this account or region.
 Record the ARN form that the service expects (from CloudTrail or the error) as a finding, fix
