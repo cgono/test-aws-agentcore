@@ -4,6 +4,8 @@ import contextlib
 from collections.abc import Callable, Iterator
 from typing import Any
 
+from botocore.exceptions import ClientError
+
 Responder = Callable[["FakeSession", str, str], dict[str, Any]]
 
 
@@ -26,6 +28,15 @@ def err(stderr: str) -> dict[str, Any]:
             }
         ]
     }
+
+
+def event(name: str) -> dict[str, Any]:
+    """A service exception delivered in the response stream (for example, throttling)."""
+    return {"stream": [{name: {"message": "raw service text"}}]}
+
+
+def client_error(code: str) -> ClientError:
+    return ClientError({"Error": {"Code": code, "Message": "raw service text"}}, "Invoke")
 
 
 class FakeSession:
