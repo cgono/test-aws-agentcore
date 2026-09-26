@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 from pathlib import Path
 
@@ -25,9 +26,7 @@ def test_state_persists_within_and_not_across_sessions() -> None:
         return err("NameError: name 'poc_marker' is not defined")
 
     observations = _by_check(
-        probes.probe_state_persistence(
-            factory_of(FakeSession(first), FakeSession(second)), CONFIG
-        )
+        probes.probe_state_persistence(factory_of(FakeSession(first), FakeSession(second)), CONFIG)
     )
 
     assert observations["state_persists_within_session"].status == "pass"
@@ -308,3 +307,193 @@ def test_ambiguous_missing_file_in_first_session_is_blocked_not_fail() -> None:
 
     assert statuses["internal_file_persists_within_session"] == "blocked"
     assert statuses["caller_upload_compute_download"] == "blocked"
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected_reachable", "status"),
+    [
+        ("status 200\n", True, "pass"),
+        ("blocked URLError\n", False, "pass"),
+        ("status 200\n", False, "fail"),
+        ("status 403\n", True, "pass"),
+        ("Traceback (most recent call last)\n", True, "blocked"),
+    ],
+)
+def test_egress_compares_reachability_with_expectation(
+    stdout: str, expected_reachable: bool, status: str
+) -> None:
+    session = FakeSession(lambda s, language, code: ok(stdout))
+
+    [observation] = probes.probe_egress(
+        factory_of(session), CONFIG, expected_reachable=expected_reachable
+    )
+
+    assert observation.question == "Q1.4"
+    assert observation.status == status
+
+
+def test_failure_modes_record_each_behavior() -> None:
+    def respond(session: FakeSession, language: str, code: str) -> dict[str, object]:
+        if "def broken" in code:
+            return err("SyntaxError: invalid syntax")
+        if "poc-boom" in code:
+            return err("ValueError: poc-boom")
+        if "2_000_000" in code:
+            return ok("a" * 1000)
+        if "time.sleep" in code:
+            return ok("slept\n")
+        return ok("allocated 1073741824\n")
+
+    ticks = iter([100.0, 161.5])
+    observations = _by_check(
+        probes.probe_failure_modes(
+            factory_of(FakeSession(respond)), CONFIG, clock=lambda: next(ticks)
+        )
+    )
+
+    assert observations["syntax_error_surfaces"].status == "pass"
+    assert observations["exception_surfaces"].status == "pass"
+    assert observations["large_output"].observed == "returned 1000 of 2000000 chars"
+    assert observations["sixty_second_execution"].status == "pass"
+    assert "61.5s" in observations["sixty_second_execution"].observed
+    assert "allocated" in observations["one_gib_allocation"].observed
+    assert all(o.question == "Q1.5" for o in observations.values())
+
+
+def test_session_ttl_expires_when_idle_and_when_active() -> None:
+    clock = {"now": 0.0}
+
+    def respond(session: FakeSession, language: str, code: str) -> dict[str, object]:
+        if clock["now"] > 60:
+            raise client_error("ResourceNotFoundException")
+        return ok("alive\n")
+
+    def open_with_timeout(ttl: int) -> contextlib.AbstractContextManager[FakeSession]:
+        assert ttl == 60
+        clock["now"] = 0.0
+        return contextlib.nullcontext(FakeSession(respond))
+
+    def sleep(seconds: float) -> None:
+        clock["now"] += seconds
+
+    observations = _by_check(probes.probe_session_ttl(open_with_timeout, CONFIG, sleep=sleep))
+
+    assert observations["idle_session_ends_at_ttl"].status == "pass"
+    assert observations["active_session_ends_at_ttl"].status == "pass"
+    assert "ResourceNotFoundException" in observations["idle_session_ends_at_ttl"].observed
+
+
+def test_session_ttl_throttling_after_wait_is_blocked() -> None:
+    clock = {"now": 0.0}
+
+    def respond(session: FakeSession, language: str, code: str) -> dict[str, object]:
+        if clock["now"] > 60:
+            raise client_error("ThrottlingException")
+        return ok("alive\n")
+
+    def open_with_timeout(ttl: int) -> contextlib.AbstractContextManager[FakeSession]:
+        clock["now"] = 0.0
+        return contextlib.nullcontext(FakeSession(respond))
+
+    def sleep(seconds: float) -> None:
+        clock["now"] += seconds
+
+    observations = _by_check(probes.probe_session_ttl(open_with_timeout, CONFIG, sleep=sleep))
+
+    assert observations["idle_session_ends_at_ttl"].status == "blocked"
+
+
+def test_session_ttl_extended_by_activity_is_reported_as_fail() -> None:
+    def open_with_timeout(ttl: int) -> contextlib.AbstractContextManager[FakeSession]:
+        return contextlib.nullcontext(FakeSession(lambda s, language, code: ok("alive\n")))
+
+    observations = _by_check(
+        probes.probe_session_ttl(open_with_timeout, CONFIG, sleep=lambda seconds: None)
+    )
+
+    assert observations["active_session_ends_at_ttl"].status == "fail"
+
+
+def test_scoped_caller_allowed_runs_and_denied_invoke_is_access_denied() -> None:
+    allowed = FakeSession(lambda s, language, code: ok("scoped-ok\n"))
+
+    def deny(session: FakeSession, language: str, code: str) -> dict[str, object]:
+        raise client_error("accessDeniedException")
+
+    observations = _by_check(
+        probes.probe_scoped_caller(factory_of(allowed), factory_of(FakeSession(deny)), CONFIG)
+    )
+
+    assert observations["scoped_role_can_execute"].status == "pass"
+    assert "session_status=READY" in observations["scoped_role_can_execute"].observed
+    assert ("get_session", "") in allowed.calls
+    assert observations["invoke_denied_without_permission"].status == "pass"
+    assert observations["invoke_denied_without_permission"].observed == "accessDeniedException"
+
+
+def test_scoped_caller_denied_session_that_runs_is_a_failure() -> None:
+    runs = FakeSession(lambda s, language, code: ok("should-not-run\n"))
+
+    observations = _by_check(probes.probe_scoped_caller(factory_of(runs), factory_of(runs), CONFIG))
+
+    assert observations["invoke_denied_without_permission"].status == "fail"
+
+
+def test_execution_limit_records_completion_or_client_timeout() -> None:
+    ticks = iter([0.0, 600.4])
+    done = probes.probe_execution_limit(
+        factory_of(FakeSession(lambda s, language, code: ok("slept\n"))),
+        CONFIG,
+        clock=lambda: next(ticks),
+    )
+    assert done[0].observed == "outcome=completed after 600s"
+
+    def time_out(session: FakeSession, language: str, code: str) -> dict[str, object]:
+        raise TimeoutError("read timeout")
+
+    ticks = iter([0.0, 300.2])
+    timed_out = probes.probe_execution_limit(
+        factory_of(FakeSession(time_out)), CONFIG, clock=lambda: next(ticks)
+    )
+    assert timed_out[0].observed == "outcome=raised:TimeoutError after 300s"
+
+
+def test_session_policy_excludes_invoke() -> None:
+    actions = probes.INVOKE_EXCLUDED_SESSION_POLICY["Statement"][0]["Action"]
+
+    assert "bedrock-agentcore:InvokeCodeInterpreter" not in actions
+    assert "bedrock-agentcore:StartCodeInterpreterSession" in actions
+
+
+def test_egress_sdk_error_is_blocked() -> None:
+    def throttle(session: FakeSession, language: str, code: str) -> dict[str, object]:
+        raise client_error("ThrottlingException")
+
+    [observation] = probes.probe_egress(
+        factory_of(FakeSession(throttle)), CONFIG, expected_reachable=True
+    )
+
+    assert observation.status == "blocked"
+    assert observation.observed == "error:ThrottlingException"
+
+
+def test_failure_modes_service_errors_are_blocked() -> None:
+    session = FakeSession(lambda s, language, code: event("throttlingException"))
+
+    observations = probes.probe_failure_modes(factory_of(session), CONFIG, clock=lambda: 0.0)
+
+    assert {o.status for o in observations} == {"blocked"}
+    assert all("raw service text" not in o.observed for o in observations)
+
+
+def test_scoped_caller_unrelated_denied_error_is_blocked() -> None:
+    allowed = FakeSession(lambda s, language, code: ok("scoped-ok\n"))
+
+    def throttle(session: FakeSession, language: str, code: str) -> dict[str, object]:
+        raise client_error("ThrottlingException")
+
+    observations = _by_check(
+        probes.probe_scoped_caller(factory_of(allowed), factory_of(FakeSession(throttle)), CONFIG)
+    )
+
+    assert observations["invoke_denied_without_permission"].status == "blocked"

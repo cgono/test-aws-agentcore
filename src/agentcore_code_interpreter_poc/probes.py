@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from typing import Any, Protocol
@@ -273,6 +274,257 @@ def probe_files(factory: SessionFactory, config: Config) -> list[Observation]:
             else blob_outcome
             if blob_back is None
             else f"type={type(blob_back).__name__} length={len(blob_back)}",
+            config,
+        ),
+    ]
+
+
+INVOKE_EXCLUDED_SESSION_POLICY: dict[str, Any] = {
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "bedrock-agentcore:StartCodeInterpreterSession",
+                "bedrock-agentcore:StopCodeInterpreterSession",
+                "bedrock-agentcore:GetCodeInterpreterSession",
+            ],
+            "Resource": "*",
+        }
+    ],
+}
+
+_EGRESS_CODE = (
+    "import urllib.error, urllib.request\n"
+    "try:\n"
+    "    print('status', urllib.request.urlopen('https://aws.amazon.com', timeout=10).status)\n"
+    "except urllib.error.HTTPError as error:\n"
+    "    print('status', error.code)\n"
+    "except Exception as error:\n"
+    "    print('blocked', type(error).__name__)\n"
+)
+_BLOCKING_CODES = frozenset(
+    {
+        "AccessDeniedException",
+        "accessDeniedException",
+        "ThrottlingException",
+        "throttlingException",
+        "InternalServerException",
+        "internalServerException",
+    }
+)
+
+
+def _recorded(result: ToolResult) -> Status:
+    """A record-only check passes when it produced a record; service errors block it."""
+    return "blocked" if _service_errors(result) else "pass"
+
+
+def probe_egress(
+    factory: SessionFactory, config: Config, *, expected_reachable: bool
+) -> list[Observation]:
+    with factory() as session:
+        result = _invoke(session.execute_code, _EGRESS_CODE)
+    reachable = "status " in result.output
+    ran = reachable or "blocked " in result.output
+    return [
+        Observation(
+            "Q1.4",
+            "public_internet_egress",
+            _classify(ok=reachable == expected_reachable, conclusive=ran),
+            f"reachable={expected_reachable}",
+            _observed(result),
+            config,
+        )
+    ]
+
+
+def probe_failure_modes(
+    factory: SessionFactory, config: Config, *, clock: Callable[[], float] = time.monotonic
+) -> list[Observation]:
+    with factory() as session:
+        syntax = _invoke(session.execute_code, "def broken(:\n    pass")
+        raised = _invoke(session.execute_code, "raise ValueError('poc-boom')")
+        big = _invoke(session.execute_code, "print('a' * 2_000_000)")
+        started = clock()
+        slow = _invoke(session.execute_code, "import time\ntime.sleep(60)\nprint('slept')")
+        slow_seconds = clock() - started
+        memory = _invoke(
+            session.execute_code,
+            "block = bytearray(1024 * 1024 * 1024)\nprint('allocated', len(block))",
+        )
+    returned = len(big.stdout or big.text)
+    return [
+        Observation(
+            "Q1.5",
+            "syntax_error_surfaces",
+            _classify(
+                ok=syntax.failed and "SyntaxError" in syntax.output,
+                conclusive=not _service_errors(syntax),
+            ),
+            "a syntax error is reported as a failed execution",
+            _observed(syntax),
+            config,
+        ),
+        Observation(
+            "Q1.5",
+            "exception_surfaces",
+            _classify(
+                ok=raised.failed and "poc-boom" in raised.output,
+                conclusive=not _service_errors(raised),
+            ),
+            "an uncaught exception is reported with its message",
+            _observed(raised),
+            config,
+        ),
+        Observation(
+            "Q1.5",
+            "large_output",
+            _recorded(big),
+            "the call returns; record whether 2,000,000 chars are truncated",
+            _observed(big) if _service_errors(big) else f"returned {returned} of 2000000 chars",
+            config,
+        ),
+        Observation(
+            "Q1.5",
+            "sixty_second_execution",
+            _classify(
+                ok="slept" in slow.output and not slow.failed,
+                conclusive=not _service_errors(slow),
+            ),
+            "a 60 s execution completes within the per-execution limit",
+            f"{slow_seconds:.1f}s output={clip(_observed(slow), 80)}",
+            config,
+        ),
+        Observation(
+            "Q1.5",
+            "one_gib_allocation",
+            _recorded(memory),
+            "record whether a 1 GiB allocation fits in the sandbox",
+            _observed(memory),
+            config,
+        ),
+    ]
+
+
+def _attempt(session: Session) -> str:
+    try:
+        result = _run(session, "print('alive')")
+    except ClientError as error:
+        return f"error:{error_code(error)}"
+    if result.failed or "alive" not in result.output:
+        return "error:" + (",".join(result.shape) or "unknown")
+    return "ok"
+
+
+def _expired(outcome: str) -> Status:
+    if outcome == "ok":
+        return "fail"
+    return "blocked" if outcome.removeprefix("error:") in _BLOCKING_CODES else "pass"
+
+
+def probe_session_ttl(
+    open_with_timeout: Callable[[int], AbstractContextManager[Session]],
+    config: Config,
+    *,
+    ttl_seconds: int = 60,
+    sleep: Callable[[float], None] = time.sleep,
+) -> list[Observation]:
+    wait = ttl_seconds + 20
+    with open_with_timeout(ttl_seconds) as session:
+        idle_before = _attempt(session)
+        sleep(wait)
+        idle_after = _attempt(session)
+    with open_with_timeout(ttl_seconds) as session:
+        active_before = _attempt(session)
+        for _ in range(wait // 15):
+            sleep(15)
+            _attempt(session)
+        active_after = _attempt(session)
+    return [
+        Observation(
+            "Q1.5",
+            "idle_session_ends_at_ttl",
+            _expired(idle_after) if idle_before == "ok" else "blocked",
+            f"an idle session is gone {wait}s after start (TTL {ttl_seconds}s)",
+            f"before={idle_before} after={idle_after}",
+            config,
+        ),
+        Observation(
+            "Q1.5",
+            "active_session_ends_at_ttl",
+            _expired(active_after) if active_before == "ok" else "blocked",
+            "sessionTimeoutSeconds is a fixed lifetime: activity does not extend it",
+            f"before={active_before} after={active_after}",
+            config,
+        ),
+    ]
+
+
+def probe_execution_limit(
+    factory: SessionFactory,
+    config: Config,
+    *,
+    seconds: int = 600,
+    clock: Callable[[], float] = time.monotonic,
+) -> list[Observation]:
+    with factory() as session:
+        started = clock()
+        try:
+            result = _run(session, f"import time\ntime.sleep({seconds})\nprint('slept')")
+            if "slept" in result.output and not result.failed:
+                outcome = "completed"
+            else:
+                outcome = "error:" + (",".join(result.shape) or clip(result.output, 80))
+        except Exception as error:
+            outcome = f"raised:{error_code(error)}"
+        elapsed = clock() - started
+    return [
+        Observation(
+            "Q1.5",
+            "per_execution_limit",
+            "pass",
+            f"record what ends a {seconds}s execution "
+            "(service limit or the SDK's 300s read timeout)",
+            f"outcome={outcome} after {elapsed:.0f}s",
+            config,
+        )
+    ]
+
+
+def probe_scoped_caller(
+    allowed: SessionFactory, denied: SessionFactory, config: Config
+) -> list[Observation]:
+    with allowed() as session:
+        allowed_result = _run(session, "print('scoped-ok')")
+        described = session.get_session()
+    try:
+        with denied() as session:
+            _run(session, "print('should-not-run')")
+        denied_outcome = "ran"
+    except ClientError as error:
+        denied_outcome = error_code(error)
+    return [
+        Observation(
+            "Q1.6",
+            "scoped_role_can_execute",
+            _status(
+                "scoped-ok" in allowed_result.output
+                and not allowed_result.failed
+                and "status" in described
+            ),
+            "the scoped caller role (4 session actions only) can start, execute, get, and stop",
+            f"output={clip(allowed_result.output, 80)} session_status={described.get('status')}",
+            config,
+        ),
+        Observation(
+            "Q1.6",
+            "invoke_denied_without_permission",
+            _classify(
+                ok="accessdenied" in denied_outcome.lower(), conclusive=denied_outcome == "ran"
+            ),
+            "without InvokeCodeInterpreter, execution is denied",
+            denied_outcome,
             config,
         ),
     ]
