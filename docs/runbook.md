@@ -663,6 +663,29 @@ Terminal B, the tunnel (keep it running; copy the `https://....trycloudflare.com
 cloudflared tunnel --url http://127.0.0.1:8002
 ```
 
+Wait for a `Registered tunnel connection` log line before you continue. The gateway has no `/`
+route, so a request to the bare tunnel URL returns 404 even when the tunnel works; use `/healthz`
+(Terminal C does this).
+
+**Finding (2026-09-26): Tailscale can block the quick tunnel.** With Tailscale on, the pre-checks
+failed QUIC (UDP 7844) on both regions and HTTP/2 (TCP 7844) on one, and `--protocol http2` did
+not register a connection either. With Tailscale off, QUIC registered at once. The probable cause
+is a Tailscale exit node, which sends all traffic out through a network that blocks port 7844
+(not root-caused). Check with `tailscale status | grep -i "exit node"`; to keep Tailscale on,
+clear only the exit node with `tailscale set --exit-node=`.
+
+Alternative for remote testing (not yet exercised with this POC): Tailscale Funnel instead of
+`cloudflared`. The Runtime runs in AWS outside the tailnet, so a tailnet-only `tailscale serve`
+URL is not reachable from it; Funnel gives a public URL. It needs HTTPS certificates and the
+`funnel` node attribute in the tailnet policy. The hostname stays the same across restarts,
+unlike the trycloudflare one. The gateway is public either way; its app-role authorization
+still protects it.
+
+```bash
+tailscale funnel --bg 8002        # public URL: https://<machine>.<tailnet>.ts.net
+tailscale funnel reset            # stop it after the gate
+```
+
 Terminal C, build, deploy, secret, and live gate:
 
 ```bash
