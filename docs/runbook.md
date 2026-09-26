@@ -42,11 +42,15 @@ This phase is deterministic and must not use AWS, Entra, Google, browser, or pro
 credentials. Each command must exit `0` before a live phase begins:
 
 ```bash
-.venv/bin/python -m pytest -m 'not integration' --cov=agentcore_identity_poc \
+.venv/bin/python -m pytest -m 'not integration' \
+  --cov=agentcore_identity_poc --cov=agentcore_code_interpreter_poc \
   --cov-report=term-missing --cov-fail-under=90
 .venv/bin/ruff check .
 .venv/bin/mypy src
 .venv/bin/python -m pytest tests/test_repository_safety.py -q
+terraform fmt -check -recursive infra/terraform
+(cd infra/terraform/modules/agentcore_code_interpreter && terraform init -backend=false -input=false >/dev/null && terraform test)
+(cd infra/terraform/poc && terraform init -backend=false -input=false >/dev/null && terraform validate && terraform test)
 git diff --check
 ```
 
@@ -604,3 +608,31 @@ installed, not the temporary broad policy. After cleanup, verify that the tagged
 workloads and providers are absent and separately remove or verify absence of any POC Secrets
 Manager entry that the operator created outside this script. The script intentionally does not
 discover or delete unrecorded resources.
+
+## Code Interpreter POC (Phase 1)
+
+Operator-run, interactive terminal, fresh `aws sso login`. Findings go in
+`docs/code-interpreter-findings.md`.
+
+```bash
+set -a; source .env; set +a
+export TF_VAR_aws_region="$AWS_REGION" TF_VAR_aws_budget_name="$AWS_BUDGET_NAME"
+cd infra/terraform/poc
+terraform init -input=false
+terraform plan -out=phase1.tfplan          # TF.1: review; no ECR/CodeBuild resources
+terraform apply phase1.tfplan
+terraform plan -detailed-exitcode          # TF.2: exit code 0 = no drift
+cd ../../..
+AGENTCORE_POC_LIVE=1 .venv/bin/python -m pytest tests/integration/test_code_interpreter_live.py -m integration -v -s
+AGENTCORE_POC_LIVE=1 AGENTCORE_POC_SLOW=1 .venv/bin/python -m pytest \
+  tests/integration/test_code_interpreter_live.py -m integration -k "ttl or execution_limit" -v -s
+```
+
+Observations are appended to `evidence/raw/code-interpreter-observations.jsonl` (ignored).
+A failing probe is a finding, not necessarily a bug: record it. `blocked` means a control
+step or an unrelated error (throttling, access denied, execution failure) prevented a
+conclusion: rerun it before recording a result. Only fix code when the probe
+itself is wrong. If `test_q1_6` fails the *allowed* check with `AccessDeniedException`, the
+built-in interpreter ARN in `infra/terraform/poc/main.tf` is wrong for this account or region.
+Record the ARN form that the service expects (from CloudTrail or the error) as a finding, fix
+the local, and apply again.
