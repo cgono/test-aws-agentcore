@@ -4046,7 +4046,7 @@ Terminal A, the gateway simulation (keep it running):
 ```bash
 set -a; source .env; set +a
 .venv/bin/uvicorn agentcore_runtime_poc.gateway_sim.app:create_production_app --factory \
-  --host 127.0.0.1 --port 8002
+  --host 127.0.0.1 --port 8002 --no-access-log
 ```
 
 Terminal B, the tunnel (keep it running; copy the `https://....trycloudflare.com` URL):

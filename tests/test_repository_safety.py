@@ -34,6 +34,7 @@ _ENTRA_AUTHORITY_UUID_PATTERN = re.compile(
     r"([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})(?:/|\b)"
 )
 _URL_PATTERN = re.compile(r"https?://[^\s\"'`<>]+", re.IGNORECASE)
+_LLM_API_KEY_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{20,}")
 _AUTHORIZATION_QUERY_KEYS = frozenset(
     {"access_token", "code", "id_token", "refresh_token", "session_id", "state", "token"}
 )
@@ -124,6 +125,8 @@ def test_all_tracked_text_files_are_free_of_sensitive_values() -> None:
             "tenant_uuid",
             lambda: "ENTRA_TENANT_ID=" + "12345678" + "-1234-4abc-8def-123456789abc",
         ),
+        ("llm_api_key", lambda: "OPENAI_API_KEY=" + "sk-" + "proj-" + "a1B2" * 8),
+        ("llm_api_key", lambda: "key = '" + "sk-" + "ant-api03-" + "Z9y8" * 8 + "'"),
     ],
 )
 def test_sensitive_values_are_reported(category: str, content: Callable[[], str]) -> None:
@@ -271,6 +274,8 @@ def _scan_string_values(path: Path, content: str) -> list[str]:
     )
     if any(not _is_example_uuid(match.group(1)) for match in tenant_matches):
         findings.append(f"{rendered_path}: tenant_uuid")
+    if _LLM_API_KEY_PATTERN.search(content):
+        findings.append(f"{rendered_path}: llm_api_key")
     return findings
 
 

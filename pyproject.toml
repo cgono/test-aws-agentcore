@@ -54,5 +54,5 @@ select = ["E", "F", "I", "B", "UP", "S"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-packages = ["agentcore_identity_poc", "agentcore_code_interpreter_poc"]
+packages = ["agentcore_identity_poc", "agentcore_code_interpreter_poc", "agentcore_runtime_poc"]
 mypy_path = "src"
