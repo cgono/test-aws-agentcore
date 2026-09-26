@@ -24,7 +24,7 @@ Run this before any cloud action. Every command exits `0` on success and uses no
 
 ```bash
 .venv/bin/python -m pytest -m 'not integration' \
-  --cov=agentcore_identity_poc --cov=agentcore_code_interpreter_poc \
+  --cov=agentcore_identity_poc --cov=agentcore_code_interpreter_poc --cov=agentcore_runtime_poc \
   --cov-report=term-missing --cov-fail-under=90
 .venv/bin/ruff check .
 .venv/bin/mypy src
@@ -32,6 +32,7 @@ Run this before any cloud action. Every command exits `0` on success and uses no
 terraform fmt -check -recursive infra/terraform
 (cd infra/terraform/modules/agentcore_code_interpreter && terraform init -backend=false -input=false >/dev/null && terraform test)
 (cd infra/terraform/poc && terraform init -backend=false -input=false >/dev/null && terraform validate && terraform test)
+(cd infra/terraform/modules/agentcore_agent_runtime && terraform init -backend=false -input=false >/dev/null && terraform test)
 git diff --check
 ```
 

@@ -43,7 +43,7 @@ credentials. Each command must exit `0` before a live phase begins:
 
 ```bash
 .venv/bin/python -m pytest -m 'not integration' \
-  --cov=agentcore_identity_poc --cov=agentcore_code_interpreter_poc \
+  --cov=agentcore_identity_poc --cov=agentcore_code_interpreter_poc --cov=agentcore_runtime_poc \
   --cov-report=term-missing --cov-fail-under=90
 .venv/bin/ruff check .
 .venv/bin/mypy src
@@ -51,6 +51,7 @@ credentials. Each command must exit `0` before a live phase begins:
 terraform fmt -check -recursive infra/terraform
 (cd infra/terraform/modules/agentcore_code_interpreter && terraform init -backend=false -input=false >/dev/null && terraform test)
 (cd infra/terraform/poc && terraform init -backend=false -input=false >/dev/null && terraform validate && terraform test)
+(cd infra/terraform/modules/agentcore_agent_runtime && terraform init -backend=false -input=false >/dev/null && terraform test)
 git diff --check
 ```
 
@@ -643,3 +644,63 @@ the denied action and resource in CloudTrail before you change IAM. Note which i
 failed (built-in, custom, or both). If only the built-in interpreter fails, the built-in ARN
 in `infra/terraform/poc/main.tf` can be wrong for this account or region: record the ARN form
 that the service expects as a finding, fix the local, and apply again.
+
+## Runtime + Gateway POC (Phase 2)
+
+Operator-run, interactive terminal, fresh `aws sso login`. Three terminals.
+
+Terminal A, the gateway simulation (keep it running):
+
+```bash
+set -a; source .env; set +a
+.venv/bin/uvicorn agentcore_runtime_poc.gateway_sim.app:create_production_app --factory \
+  --host 127.0.0.1 --port 8002 --no-access-log
+```
+
+Terminal B, the tunnel (keep it running; copy the `https://....trycloudflare.com` URL):
+
+```bash
+cloudflared tunnel --url http://127.0.0.1:8002
+```
+
+Terminal C, build, deploy, secret, and live gate:
+
+```bash
+set -a; source .env; set +a
+export GATEWAY_BASE_URL=<tunnel URL from terminal B>
+curl -s "$GATEWAY_BASE_URL/healthz"                       # expect {"status":"ok"}
+.venv/bin/python -m scripts.build_agent_zip
+.venv/bin/python -m scripts.container_inventory             # Q2.6 baseline, before any apply
+export TF_VAR_aws_region="$AWS_REGION" TF_VAR_aws_budget_name="$AWS_BUDGET_NAME" \
+  TF_VAR_deploy_runtime=true TF_VAR_entra_tenant_id="$ENTRA_TENANT_ID" \
+  TF_VAR_gateway_app_client_id="$GATEWAY_APP_CLIENT_ID" \
+  TF_VAR_gateway_caller_client_id="$GATEWAY_CALLER_CLIENT_ID" \
+  TF_VAR_gateway_base_url="$GATEWAY_BASE_URL" \
+  TF_VAR_agent_openai_model="$AGENT_OPENAI_MODEL" TF_VAR_agent_anthropic_model="$AGENT_ANTHROPIC_MODEL"
+terraform -chdir=infra/terraform/poc plan -out=phase2.tfplan   # TF.1: no ECR/CodeBuild
+terraform -chdir=infra/terraform/poc apply phase2.tfplan
+terraform -chdir=infra/terraform/poc plan -detailed-exitcode   # TF.2: exit 0
+.venv/bin/python -m scripts.put_gateway_secret
+.venv/bin/python -m scripts.invoke_runtime_agent --action chat --provider anthropic --prompt "Reply ok" --stop
+AGENTCORE_POC_LIVE=1 .venv/bin/python -m pytest tests/integration/test_runtime_live.py -m integration -v -s
+AGENTCORE_POC_LIVE=1 AGENTCORE_POC_SLOW=1 .venv/bin/python -m pytest \
+  tests/integration/test_runtime_live.py -m integration -k idle -v -s
+```
+
+The live gate configures a 120 s idle timeout to keep the probe short. The service default
+(15 minutes, per AWS docs) is not measured; record the configured value in the findings.
+
+A quick tunnel gets a new URL each time it restarts. After a restart, export the new
+`GATEWAY_BASE_URL` and `TF_VAR_gateway_base_url` and apply again (an environment-variable
+change is an in-place runtime update). If `apply` fails on the runtime with an IAM "cannot
+assume role" error right after the role was created, wait 30 s and apply again. Record this
+as an IAM-propagation finding for the work module.
+
+S3 can take a few minutes to apply versioning on a new bucket. After the first apply, check
+that the zip has a version ID:
+`terraform -chdir=infra/terraform/poc state show 'aws_s3_object.agent_zip[0]' | grep version_id`.
+If it is empty or `null`, run
+`terraform -chdir=infra/terraform/poc apply -replace='aws_s3_object.agent_zip[0]'` so that the
+runtime points at a versioned object. Record this as a finding for the work module.
+
+Observations go to `evidence/raw/runtime-observations.jsonl` (ignored).
