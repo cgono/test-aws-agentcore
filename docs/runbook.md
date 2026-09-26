@@ -623,6 +623,12 @@ terraform plan -out=phase1.tfplan          # TF.1: review; no ECR/CodeBuild reso
 terraform apply phase1.tfplan
 terraform plan -detailed-exitcode          # TF.2: exit code 0 = no drift
 cd ../../..
+```
+
+Stop here if `terraform apply` failed or the drift plan did not exit `0` (exit `2` means
+drift): record it as a TF.2 finding, and do not run the live gate. Otherwise:
+
+```bash
 AGENTCORE_POC_LIVE=1 .venv/bin/python -m pytest tests/integration/test_code_interpreter_live.py -m integration -v -s
 AGENTCORE_POC_LIVE=1 AGENTCORE_POC_SLOW=1 .venv/bin/python -m pytest \
   tests/integration/test_code_interpreter_live.py -m integration -k "ttl or execution_limit" -v -s
@@ -632,7 +638,8 @@ Observations are appended to `evidence/raw/code-interpreter-observations.jsonl` 
 A failing probe is a finding, not necessarily a bug: record it. `blocked` means a control
 step or an unrelated error (throttling, access denied, execution failure) prevented a
 conclusion: rerun it before recording a result. Only fix code when the probe
-itself is wrong. If `test_q1_6` fails the *allowed* check with `AccessDeniedException`, the
-built-in interpreter ARN in `infra/terraform/poc/main.tf` is wrong for this account or region.
-Record the ARN form that the service expects (from CloudTrail or the error) as a finding, fix
-the local, and apply again.
+itself is wrong. If `test_q1_6` fails the *allowed* check with `AccessDeniedException`, find
+the denied action and resource in CloudTrail before you change IAM. Note which interpreter
+failed (built-in, custom, or both). If only the built-in interpreter fails, the built-in ARN
+in `infra/terraform/poc/main.tf` can be wrong for this account or region: record the ARN form
+that the service expects as a finding, fix the local, and apply again.
