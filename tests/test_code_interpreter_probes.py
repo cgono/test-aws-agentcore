@@ -252,3 +252,59 @@ def test_run_still_raises_sdk_errors_for_probes_that_expect_them() -> None:
 
     with pytest.raises(ClientError):
         probes._run(Denied(_files_respond), "print('x')")
+
+
+def test_setup_error_blocks_state_checks_even_when_later_output_looks_right() -> None:
+    def setup_throttled(session: FakeSession, language: str, code: str) -> dict[str, object]:
+        return event("throttlingException") if "= 41" in code else ok("42\n")
+
+    def isolated(session: FakeSession, language: str, code: str) -> dict[str, object]:
+        return err("NameError: name 'poc_marker' is not defined")
+
+    observations = _by_check(
+        probes.probe_state_persistence(
+            factory_of(FakeSession(setup_throttled), FakeSession(isolated)), CONFIG
+        )
+    )
+
+    assert observations["state_persists_within_session"].status == "blocked"
+    assert observations["state_isolated_across_sessions"].status == "blocked"
+
+
+def test_successful_output_that_mentions_name_error_is_not_isolation() -> None:
+    def first(session: FakeSession, language: str, code: str) -> dict[str, object]:
+        return ok("42\n") if "print" in code else ok("")
+
+    def printed(session: FakeSession, language: str, code: str) -> dict[str, object]:
+        return ok("NameError poc_marker\n")
+
+    observations = _by_check(
+        probes.probe_state_persistence(factory_of(FakeSession(first), FakeSession(printed)), CONFIG)
+    )
+
+    assert observations["state_isolated_across_sessions"].status != "pass"
+
+
+class UploadThrottled(FakeSession):
+    def upload_file(
+        self, path: str, content: str | bytes, description: str = ""
+    ) -> dict[str, object]:
+        self.files[path] = content
+        return event("throttlingException")
+
+
+def test_upload_stream_error_blocks_upload_checks() -> None:
+    statuses = _file_statuses(UploadThrottled(_files_respond), FakeSession(_files_respond))
+
+    assert statuses["caller_upload_compute_download"] == "blocked"
+    assert statuses["binary_round_trip"] == "blocked"
+
+
+def test_ambiguous_missing_file_in_first_session_is_blocked_not_fail() -> None:
+    def writes_nothing(session: FakeSession, language: str, code: str) -> dict[str, object]:
+        return ok("written\n")
+
+    statuses = _file_statuses(FakeSession(writes_nothing), FakeSession(_files_respond))
+
+    assert statuses["internal_file_persists_within_session"] == "blocked"
+    assert statuses["caller_upload_compute_download"] == "blocked"

@@ -62,12 +62,17 @@ def _run(session: Session, code: str, language: str = "python") -> ToolResult:
     return parse_tool_result(session.execute_code(code, language=language))
 
 
-def _attempt(call: Callable[..., dict[str, Any]], *args: Any, **kwargs: Any) -> ToolResult:
+def _invoke(call: Callable[..., dict[str, Any]], *args: Any, **kwargs: Any) -> ToolResult:
     """Like _run, but an SDK error becomes a result, so the probe can report it as blocked."""
     try:
         return parse_tool_result(call(*args, **kwargs))
     except ClientError as error:
         return _sdk_error(error)
+
+
+def _gated(*, controls: bool, ok: bool, conclusive: bool = True) -> Status:
+    """Report pass or fail only when every control step succeeded; otherwise blocked."""
+    return _classify(ok=controls and ok, conclusive=controls and conclusive)
 
 
 def _service_errors(result: ToolResult) -> list[str]:
@@ -82,26 +87,17 @@ def _observed(result: ToolResult) -> str:
 
 
 def _download(session: Session, path: str) -> tuple[str | bytes | None, str]:
-    """Return the content, or None with "absent:..." or "blocked:<code>".
+    """Return the content, or None with the reason ("FileNotFoundError" or an error code).
 
     The SDK raises FileNotFoundError for any readFiles response without a file resource,
-    including a tool error, so "absent" here is not proof that the file does not exist.
+    including a tool error, so a failed download is never proof that the file is missing.
     """
     try:
         return session.download_file(path), "ok"
     except FileNotFoundError:
-        return None, "absent:FileNotFoundError"
+        return None, "FileNotFoundError"
     except ClientError as error:
-        return None, f"blocked:{error_code(error)}"
-
-
-def _upload(session: Session, path: str, content: str | bytes) -> str | None:
-    """Return None on success, or the error code."""
-    try:
-        session.upload_file(path, content)
-    except ClientError as error:
-        return error_code(error)
-    return None
+        return None, error_code(error)
 
 
 def _as_text(value: str | bytes) -> str:
@@ -110,16 +106,17 @@ def _as_text(value: str | bytes) -> str:
 
 def probe_state_persistence(factory: SessionFactory, config: Config) -> list[Observation]:
     with factory() as session:
-        setup = _attempt(session.execute_code, "poc_marker = 41")
-        same = _attempt(session.execute_code, "print(poc_marker + 1)")
+        setup = _invoke(session.execute_code, "poc_marker = 41")
+        same = _invoke(session.execute_code, "print(poc_marker + 1)")
     with factory() as session:
-        other = _attempt(session.execute_code, "print(poc_marker)")
-    persisted = _classify(
+        other = _invoke(session.execute_code, "print(poc_marker)")
+    persisted = _gated(
+        controls=not setup.failed,
         ok="42" in same.output and not same.failed,
-        conclusive=not setup.failed and not _service_errors(same),
+        conclusive=not _service_errors(same),
     )
-    # Isolation is only shown when the variable existed and the new session names it as missing.
-    missing = "NameError" in other.output and "poc_marker" in other.output
+    # Isolation is shown only when the variable existed and the new session fails naming it.
+    missing = other.failed and "NameError" in other.output and "poc_marker" in other.output
     return [
         Observation(
             "Q1.1",
@@ -132,10 +129,8 @@ def probe_state_persistence(factory: SessionFactory, config: Config) -> list[Obs
         Observation(
             "Q1.1",
             "state_isolated_across_sessions",
-            _classify(
-                ok=persisted == "pass" and missing,
-                conclusive=persisted == "pass" and not other.failed,
-            ),
+            # A successful read in the new session is the leak; other errors are inconclusive.
+            _gated(controls=persisted == "pass", ok=missing, conclusive=not other.failed),
             "a new session cannot see the variable",
             _observed(other),
             config,
@@ -151,7 +146,7 @@ def probe_languages(factory: SessionFactory, config: Config) -> list[Observation
     )
     with factory() as session:
         for language, code in snippets:
-            result = _attempt(session.execute_code, code, language=language)
+            result = _invoke(session.execute_code, code, language=language)
             observations.append(
                 Observation(
                     "Q1.2",
@@ -165,7 +160,7 @@ def probe_languages(factory: SessionFactory, config: Config) -> list[Observation
                     config,
                 )
             )
-        shell = _attempt(session.execute_command, "echo poc-shell-ok && uname -m")
+        shell = _invoke(session.execute_command, "echo poc-shell-ok && uname -m")
         observations.append(
             Observation(
                 "Q1.2",
@@ -179,7 +174,7 @@ def probe_languages(factory: SessionFactory, config: Config) -> list[Observation
                 config,
             )
         )
-        back = _attempt(session.execute_code, "print('python-after-js')")
+        back = _invoke(session.execute_code, "print('python-after-js')")
         observations.append(
             Observation(
                 "Q1.2",
@@ -204,12 +199,12 @@ _ABSENCE_CHECK = (
 def probe_files(factory: SessionFactory, config: Config) -> list[Observation]:
     blob = bytes(range(256))
     with factory() as session:
-        wrote = _attempt(
+        wrote = _invoke(
             session.execute_code, "open('poc_internal.txt', 'w').write('internal-marker')"
         )
         internal, internal_outcome = _download(session, "poc_internal.txt")
-        csv_error = _upload(session, "poc_input.csv", "a,b\n1,2\n3,4\n")
-        computed = _attempt(
+        csv_upload = _invoke(session.upload_file, "poc_input.csv", "a,b\n1,2\n3,4\n")
+        computed = _invoke(
             session.execute_code,
             "import csv, json\n"
             "rows = list(csv.DictReader(open('poc_input.csv')))\n"
@@ -217,16 +212,16 @@ def probe_files(factory: SessionFactory, config: Config) -> list[Observation]:
             "print('written')",
         )
         produced, produced_outcome = _download(session, "poc_output.json")
-        blob_error = _upload(session, "poc_blob.bin", blob)
+        blob_upload = _invoke(session.upload_file, "poc_blob.bin", blob)
         blob_back, blob_outcome = _download(session, "poc_blob.bin")
     with factory() as session:
         # Ask the sandbox directly: a failed download cannot tell "absent" from "read failed".
-        absence = _attempt(session.execute_code, _ABSENCE_CHECK)
+        absence = _invoke(session.execute_code, _ABSENCE_CHECK)
 
     internal_text = internal_outcome if internal is None else _as_text(internal)
-    persisted = _classify(
+    persisted = _gated(
+        controls=not wrote.failed and internal is not None,
         ok=internal_text == "internal-marker",
-        conclusive=not wrote.failed and not internal_outcome.startswith("blocked:"),
     )
     produced_text = produced_outcome if produced is None else _as_text(produced)
     try:
@@ -240,15 +235,16 @@ def probe_files(factory: SessionFactory, config: Config) -> list[Observation]:
             "internal_file_persists_within_session",
             persisted,
             "a file written by code is readable later in the same session",
-            ",".join(_service_errors(wrote)) or clip(internal_text),
+            _observed(wrote) if wrote.failed else clip(internal_text),
             config,
         ),
         Observation(
             "Q1.3",
             "internal_file_absent_in_new_session",
-            _classify(
-                ok=persisted == "pass" and "poc-absent" in absence.output and not absence.failed,
-                conclusive=persisted == "pass" and "poc-present" in absence.output,
+            _gated(
+                controls=persisted == "pass" and not absence.failed,
+                ok="poc-absent" in absence.output,
+                conclusive="poc-present" in absence.output,
             ),
             "a new session does not see the file",
             _observed(absence),
@@ -257,26 +253,23 @@ def probe_files(factory: SessionFactory, config: Config) -> list[Observation]:
         Observation(
             "Q1.3",
             "caller_upload_compute_download",
-            _classify(
-                ok=sum_b == 6,
-                conclusive=csv_error is None
+            _gated(
+                controls=not csv_upload.failed
                 and not _service_errors(computed)
-                and not produced_outcome.startswith("blocked:"),
+                and produced is not None,
+                ok=sum_b == 6 and not computed.failed,
             ),
             "caller uploads a CSV, code writes JSON, caller downloads sum_b == 6",
-            f"upload:{csv_error}" if csv_error else clip(produced_text),
+            _observed(csv_upload) if csv_upload.failed else clip(produced_text),
             config,
         ),
         Observation(
             "Q1.3",
             "binary_round_trip",
-            _classify(
-                ok=blob_back == blob,
-                conclusive=blob_error is None and not blob_outcome.startswith("blocked:"),
-            ),
+            _gated(controls=not blob_upload.failed and blob_back is not None, ok=blob_back == blob),
             "256 raw bytes survive upload then download unchanged",
-            f"upload:{blob_error}"
-            if blob_error
+            _observed(blob_upload)
+            if blob_upload.failed
             else blob_outcome
             if blob_back is None
             else f"type={type(blob_back).__name__} length={len(blob_back)}",
