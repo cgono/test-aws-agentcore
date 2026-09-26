@@ -23,11 +23,15 @@ in command arguments, evidence, or tracked files. `.poc-state.json`, `evidence/*
 Run this before any cloud action. Every command exits `0` on success and uses no live credentials.
 
 ```bash
-.venv/bin/python -m pytest -m 'not integration' --cov=agentcore_identity_poc \
+.venv/bin/python -m pytest -m 'not integration' \
+  --cov=agentcore_identity_poc --cov=agentcore_code_interpreter_poc \
   --cov-report=term-missing --cov-fail-under=90
 .venv/bin/ruff check .
 .venv/bin/mypy src
 .venv/bin/python -m pytest tests/test_repository_safety.py -q
+terraform fmt -check -recursive infra/terraform
+(cd infra/terraform/modules/agentcore_code_interpreter && terraform init -backend=false -input=false >/dev/null && terraform test)
+(cd infra/terraform/poc && terraform init -backend=false -input=false >/dev/null && terraform validate && terraform test)
 git diff --check
 ```
 
@@ -106,3 +110,13 @@ absent after cleanup.
 .venv/bin/python scripts/provision_agentcore.py cleanup
 .venv/bin/python scripts/provision_agentcore.py cleanup --apply --confirm agentcore-identity-poc
 ```
+
+## Code Interpreter POC (Phase 1)
+
+A separate POC checks AgentCore Code Interpreter (questions Q1.1–Q1.6, TF.1–TF.2). Terraform in
+`infra/terraform/poc` creates a custom public-network interpreter and a scoped caller role. The
+probes are in `src/agentcore_code_interpreter_poc`. The live gate
+`tests/integration/test_code_interpreter_live.py` is operator-run and skips unless
+`AGENTCORE_POC_LIVE=1`. See "Code Interpreter POC (Phase 1)" in
+[`docs/runbook.md`](docs/runbook.md) for the apply, run, and record steps. Findings go in
+`docs/code-interpreter-findings.md`.
