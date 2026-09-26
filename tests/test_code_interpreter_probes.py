@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -497,3 +498,124 @@ def test_scoped_caller_unrelated_denied_error_is_blocked() -> None:
     )
 
     assert observations["invoke_denied_without_permission"].status == "blocked"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [{"stream": []}, event("throttlingException")],
+)
+def test_egress_expected_blocked_but_inconclusive_is_blocked(response: dict[str, object]) -> None:
+    [observation] = probes.probe_egress(
+        factory_of(FakeSession(lambda s, language, code: response)),
+        CONFIG,
+        expected_reachable=False,
+    )
+
+    assert observation.status == "blocked"
+
+
+def test_failure_modes_expected_text_with_service_event_is_blocked() -> None:
+    def respond(session: FakeSession, language: str, code: str) -> dict[str, object]:
+        mixed = err("SyntaxError: invalid syntax ValueError: poc-boom")
+        mixed["stream"].append({"throttlingException": {"message": "raw service text"}})  # type: ignore[attr-defined]
+        return mixed
+
+    observations = _by_check(
+        probes.probe_failure_modes(factory_of(FakeSession(respond)), CONFIG, clock=lambda: 0.0)
+    )
+
+    assert observations["syntax_error_surfaces"].status == "blocked"
+    assert observations["exception_surfaces"].status == "blocked"
+
+
+def test_failure_modes_never_record_raw_failed_text() -> None:
+    def respond(session: FakeSession, language: str, code: str) -> dict[str, object]:
+        return {
+            "stream": [
+                {
+                    "result": {
+                        "isError": True,
+                        "content": [{"type": "text", "text": "SyntaxError poc-boom secret-value"}],
+                    }
+                }
+            ]
+        }
+
+    observations = probes.probe_failure_modes(
+        factory_of(FakeSession(respond)), CONFIG, clock=lambda: 0.0
+    )
+
+    assert all("secret-value" not in o.observed for o in observations)
+
+
+def _ttl_run(respond: Callable[[dict[str, float]], dict[str, object]]) -> dict[str, Observation]:
+    clock = {"now": 0.0}
+
+    def open_with_timeout(ttl: int) -> contextlib.AbstractContextManager[FakeSession]:
+        clock["now"] = 0.0
+        return contextlib.nullcontext(FakeSession(lambda s, language, code: respond(clock)))
+
+    def sleep(seconds: float) -> None:
+        clock["now"] += seconds
+
+    return _by_check(probes.probe_session_ttl(open_with_timeout, CONFIG, sleep=sleep))
+
+
+def test_session_ttl_unrecognized_error_after_wait_is_blocked() -> None:
+    def respond(clock: dict[str, float]) -> dict[str, object]:
+        if clock["now"] > 60:
+            raise client_error("ValidationException")
+        return ok("alive\n")
+
+    observations = _ttl_run(respond)
+
+    assert observations["idle_session_ends_at_ttl"].status == "blocked"
+    assert observations["active_session_ends_at_ttl"].status == "blocked"
+
+
+def test_session_ttl_failed_keepalive_before_ttl_is_blocked() -> None:
+    def respond(clock: dict[str, float]) -> dict[str, object]:
+        if clock["now"] > 60 or clock["now"] == 30:
+            raise client_error("ResourceNotFoundException")
+        return ok("alive\n")
+
+    observations = _ttl_run(respond)
+
+    assert observations["active_session_ends_at_ttl"].status == "blocked"
+    assert "keepalives=" in observations["active_session_ends_at_ttl"].observed
+
+
+def test_scoped_caller_denial_as_stream_event_is_pass() -> None:
+    allowed = FakeSession(lambda s, language, code: ok("scoped-ok\n"))
+    denied = FakeSession(lambda s, language, code: event("accessDeniedException"))
+
+    observations = _by_check(
+        probes.probe_scoped_caller(factory_of(allowed), factory_of(denied), CONFIG)
+    )
+
+    assert observations["invoke_denied_without_permission"].status == "pass"
+
+
+def test_scoped_caller_allowed_path_error_is_blocked() -> None:
+    def throttle(session: FakeSession, language: str, code: str) -> dict[str, object]:
+        raise client_error("ThrottlingException")
+
+    denied = FakeSession(lambda s, language, code: event("accessDeniedException"))
+
+    observations = _by_check(
+        probes.probe_scoped_caller(factory_of(FakeSession(throttle)), factory_of(denied), CONFIG)
+    )
+
+    assert observations["scoped_role_can_execute"].status == "blocked"
+
+
+def test_execution_limit_unrelated_error_is_blocked() -> None:
+    def throttle(session: FakeSession, language: str, code: str) -> dict[str, object]:
+        raise client_error("ThrottlingException")
+
+    [observation] = probes.probe_execution_limit(
+        factory_of(FakeSession(throttle)), CONFIG, clock=lambda: 0.0
+    )
+
+    assert observation.status == "blocked"
+    assert "ThrottlingException" in observation.observed
