@@ -40,7 +40,7 @@ run "zip_artifact_passes_through" {
 
   assert {
     condition     = aws_bedrockagentcore_agent_runtime.this.agent_runtime_artifact[0].code_configuration[0].code[0].s3[0].version_id == "example-version-1"
-    error_message = "the zip object version must pass through so new zips redeploy"
+    error_message = "the bootstrap zip object version must pass through on create"
   }
 
   assert {
@@ -176,4 +176,154 @@ run "rejects_max_lifetime_below_idle_timeout" {
   }
 
   expect_failures = [var.max_lifetime_seconds]
+}
+
+run "authorizer_and_headers_render" {
+  command = plan
+
+  variables {
+    authorizer = {
+      discovery_url    = "https://login.microsoftonline.com/example-tenant/v2.0/.well-known/openid-configuration"
+      allowed_audience = ["runtime-app-id"]
+      custom_claims = [
+        { name = "azp", value_type = "STRING", operator = "EQUALS", value = "unified-api-id" },
+        { name = "roles", value_type = "STRING_ARRAY", operator = "CONTAINS", value = "Runtime.Invoke" },
+      ]
+    }
+    request_header_allowlist = ["X-Amzn-Bedrock-AgentCore-Runtime-Custom-Grant"]
+  }
+
+  assert {
+    condition     = aws_bedrockagentcore_agent_runtime.this.authorizer_configuration[0].custom_jwt_authorizer[0].allowed_audience == toset(["runtime-app-id"])
+    error_message = "allowed_audience must pass through"
+  }
+
+  assert {
+    condition     = length(aws_bedrockagentcore_agent_runtime.this.authorizer_configuration[0].custom_jwt_authorizer[0].custom_claim) == 2
+    error_message = "both custom claims must render"
+  }
+
+  assert {
+    condition     = aws_bedrockagentcore_agent_runtime.this.request_header_configuration[0].request_header_allowlist == toset(["X-Amzn-Bedrock-AgentCore-Runtime-Custom-Grant"])
+    error_message = "header allow-list must pass through"
+  }
+}
+
+run "no_authorizer_by_default" {
+  command = plan
+
+  assert {
+    condition     = length(aws_bedrockagentcore_agent_runtime.this.authorizer_configuration) == 0
+    error_message = "without var.authorizer the runtime keeps SigV4 (Phase 2 behavior)"
+  }
+}
+
+run "execution_role_reads_every_listed_code_key" {
+  command = plan
+
+  variables {
+    readable_code_keys = ["bootstrap/research.zip", "releases/research.zip", "releases/probe.zip"]
+  }
+
+  assert {
+    condition     = strcontains(aws_iam_role_policy.execution.policy, "example-bucket/releases/research.zip") && strcontains(aws_iam_role_policy.execution.policy, "example-bucket/bootstrap/research.zip") && strcontains(aws_iam_role_policy.execution.policy, "example-bucket/agent/agent.zip")
+    error_message = "the execution role must read bootstrap and release keys"
+  }
+}
+
+run "empty_readable_code_keys_keeps_bootstrap_access" {
+  command = plan
+
+  variables {
+    readable_code_keys = []
+  }
+
+  assert {
+    condition     = strcontains(aws_iam_role_policy.execution.policy, "example-bucket/agent/agent.zip")
+    error_message = "an empty extra-key list must retain bootstrap access"
+  }
+}
+
+run "different_extra_policy_statement_shapes_are_accepted" {
+  command = plan
+
+  variables {
+    extra_policy_statements = [
+      { Sid = "One", Effect = "Allow", Action = ["kms:Decrypt"], Resource = ["arn:aws:kms:ap-southeast-1:123456789012:key/example"] },
+      { Sid = "Two", Effect = "Allow", Action = ["s3:ListBucket"], Resource = ["arn:aws:s3:::example-bucket"], Condition = { StringEquals = { "s3:prefix" = "users/" } } },
+    ]
+  }
+
+  assert {
+    condition     = strcontains(aws_iam_role_policy.execution.policy, "\"Sid\":\"One\"") && strcontains(aws_iam_role_policy.execution.policy, "\"Sid\":\"Two\"")
+    error_message = "both differently shaped statements must be rendered"
+  }
+}
+
+run "authorizer_requires_a_custom_claim" {
+  command = plan
+
+  variables {
+    authorizer = {
+      discovery_url    = "https://login.microsoftonline.com/example-tenant/v2.0/.well-known/openid-configuration"
+      allowed_audience = ["runtime-app-id"]
+      custom_claims    = []
+    }
+  }
+
+  expect_failures = [var.authorizer]
+}
+
+run "authorizer_claim_needs_exactly_one_match_value" {
+  command = plan
+
+  variables {
+    authorizer = {
+      discovery_url    = "https://login.microsoftonline.com/example-tenant/v2.0/.well-known/openid-configuration"
+      allowed_audience = ["runtime-app-id"]
+      custom_claims = [
+        { name = "azp", value_type = "STRING", operator = "EQUALS" },
+      ]
+    }
+  }
+
+  expect_failures = [var.authorizer]
+}
+
+run "authorizer_requires_an_audience" {
+  command = plan
+
+  variables {
+    authorizer = {
+      discovery_url    = "https://login.microsoftonline.com/example-tenant/v2.0/.well-known/openid-configuration"
+      allowed_audience = []
+      custom_claims    = [{ name = "azp", value_type = "STRING", operator = "EQUALS", value = "unified-api-id" }]
+    }
+  }
+
+  expect_failures = [var.authorizer]
+}
+
+run "authorizer_rejects_mismatched_claim_type" {
+  command = plan
+
+  variables {
+    authorizer = {
+      discovery_url    = "https://login.microsoftonline.com/example-tenant/v2.0/.well-known/openid-configuration"
+      allowed_audience = ["runtime-app-id"]
+      custom_claims    = [{ name = "roles", value_type = "STRING", operator = "CONTAINS", value = "Runtime.Invoke" }]
+    }
+  }
+
+  expect_failures = [var.authorizer]
+}
+
+run "extra_policy_statement_rejects_null_effect" {
+  command = plan
+
+  variables {
+    extra_policy_statements = [{ Effect = null, Action = ["s3:GetObject"], Resource = ["arn:aws:s3:::example-bucket/x"] }]
+  }
+
+  expect_failures = [var.extra_policy_statements]
 }

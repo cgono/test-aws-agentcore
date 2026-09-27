@@ -50,7 +50,7 @@ locals {
       Sid      = "ReadCodePackage"
       Effect   = "Allow"
       Action   = ["s3:GetObject", "s3:GetObjectVersion"]
-      Resource = ["arn:aws:s3:::${var.code_bucket_name}/${var.code_object_key}"]
+      Resource = [for key in distinct(concat([var.code_object_key], var.readable_code_keys == null ? [] : var.readable_code_keys)) : "arn:aws:s3:::${var.code_bucket_name}/${key}"]
     },
   ]
 
@@ -87,7 +87,7 @@ resource "aws_iam_role_policy" "execution" {
   role = aws_iam_role.execution.id
   policy = jsonencode({
     Version   = "2012-10-17"
-    Statement = concat(local.base_statements, local.secret_statements)
+    Statement = concat(local.base_statements, local.secret_statements, var.extra_policy_statements)
   })
 }
 
@@ -133,6 +133,48 @@ resource "aws_bedrockagentcore_agent_runtime" "this" {
 
   protocol_configuration {
     server_protocol = "HTTP"
+  }
+
+  dynamic "authorizer_configuration" {
+    for_each = var.authorizer == null ? [] : [var.authorizer]
+
+    content {
+      custom_jwt_authorizer {
+        discovery_url    = authorizer_configuration.value.discovery_url
+        allowed_audience = authorizer_configuration.value.allowed_audience
+
+        dynamic "custom_claim" {
+          for_each = authorizer_configuration.value.custom_claims
+
+          content {
+            inbound_token_claim_name       = custom_claim.value.name
+            inbound_token_claim_value_type = custom_claim.value.value_type
+
+            authorizing_claim_match_value {
+              claim_match_operator = custom_claim.value.operator
+
+              claim_match_value {
+                match_value_string      = custom_claim.value.value
+                match_value_string_list = custom_claim.value.values
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  dynamic "request_header_configuration" {
+    for_each = length(var.request_header_allowlist) > 0 ? [1] : []
+
+    content {
+      request_header_allowlist = var.request_header_allowlist
+    }
+  }
+
+  # The app CD pipeline owns the code artifact after create.
+  lifecycle {
+    ignore_changes = [agent_runtime_artifact]
   }
 
   depends_on = [aws_iam_role_policy.execution]

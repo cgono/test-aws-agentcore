@@ -14,22 +14,25 @@ variable "description" {
 }
 
 variable "code_bucket_name" {
-  type = string
+  type        = string
+  description = "Bootstrap artifact bucket, used when the runtime is created. Later code is CD-owned."
 }
 
 variable "code_object_key" {
-  type = string
+  type        = string
+  description = "Bootstrap artifact key, used when the runtime is created. Later code is CD-owned."
 }
 
 variable "code_object_version_id" {
   type        = string
   default     = null
-  description = "S3 object version of the zip. Pass it so that a new zip changes the runtime and redeploys it."
+  description = "Bootstrap S3 object version. The app CD pipeline owns later runtime code updates."
 }
 
 variable "python_runtime" {
-  type    = string
-  default = "PYTHON_3_13"
+  type        = string
+  default     = "PYTHON_3_13"
+  description = "Python runtime at create time; later artifact changes are owned by app CD."
 
   validation {
     condition     = contains(["PYTHON_3_10", "PYTHON_3_11", "PYTHON_3_12", "PYTHON_3_13"], var.python_runtime)
@@ -38,8 +41,9 @@ variable "python_runtime" {
 }
 
 variable "entry_point" {
-  type    = list(string)
-  default = ["main.py"]
+  type        = list(string)
+  default     = ["main.py"]
+  description = "Entry point at create time; later artifact changes are owned by app CD."
 
   validation {
     condition     = length(var.entry_point) >= 1 && length(var.entry_point) <= 2
@@ -110,4 +114,61 @@ variable "max_lifetime_seconds" {
 variable "tags" {
   type    = map(string)
   default = {}
+}
+
+variable "authorizer" {
+  type = object({
+    discovery_url    = string
+    allowed_audience = list(string)
+    custom_claims = list(object({
+      name       = string
+      value_type = string
+      operator   = string
+      value      = optional(string)
+      values     = optional(list(string))
+    }))
+  })
+  default     = null
+  description = "Inbound JWT authorizer. null keeps IAM (SigV4) invocation."
+
+  validation {
+    condition = var.authorizer == null ? true : (
+      length(var.authorizer.allowed_audience) > 0 &&
+      length(var.authorizer.custom_claims) > 0 && alltrue([
+        for claim in var.authorizer.custom_claims :
+        contains(["STRING", "STRING_ARRAY"], claim.value_type) &&
+        contains(["EQUALS", "CONTAINS", "CONTAINS_ANY"], claim.operator) &&
+        (claim.operator == "EQUALS" ? claim.value_type == "STRING" : claim.value_type == "STRING_ARRAY") &&
+        (claim.operator == "CONTAINS_ANY"
+          ? claim.values != null && try(length(claim.values), 0) > 0 && claim.value == null
+        : claim.value != null && claim.value != "" && claim.values == null)
+      ])
+    )
+    error_message = "authorizer needs at least one claim; each claim needs a supported type/operator and exactly one matching value."
+  }
+}
+
+variable "request_header_allowlist" {
+  type    = list(string)
+  default = []
+}
+
+variable "readable_code_keys" {
+  type        = list(string)
+  default     = null
+  description = "Additional S3 keys the execution role may read; the bootstrap code_object_key is always included."
+}
+
+variable "extra_policy_statements" {
+  type        = any
+  default     = []
+  description = "Additional IAM statement objects for the execution role."
+
+  validation {
+    condition = try(alltrue([
+      for statement in var.extra_policy_statements :
+      statement.Effect != null && statement.Action != null && statement.Resource != null
+    ]), false)
+    error_message = "extra_policy_statements must be a list of objects with Effect, Action, and Resource."
+  }
 }
