@@ -1942,9 +1942,9 @@ git commit -m "feat(terraform): add Phase 3a platform root (buckets, KMS, Identi
   - `headers` — which request headers the agent sees (names only; for the grant header, only its length).
   - `identity` — for each scope in `HUB_SCOPE`, `GATEWAY_SCOPE`: gets an M2M token through AgentCore Identity and returns only the decoded, non-secret claims `aud`, `azp`, `roles`, `ver`, `exp`.
   - `claude_cli` — starts the bundled Claude Code CLI with `tools=[]` and a one-tool SDK MCP server, asks it to call the tool once, and returns: CLI start ok, tool names the model saw, whether any built-in tool was called, and the `apiKeyHelper` call count after TTL (see Step 3).
-  - `fuse` — `os.path.exists("/dev/fuse")`, `shutil.disk_usage("/tmp")`, and the result of trying a Mirage FUSE mount of an empty RAM resource at `/mnt/probe` (error text truncated to 300 chars).
+  - `fuse` — `os.path.exists("/dev/fuse")`, `shutil.disk_usage("/tmp")`, and a Mirage FUSE mount of a RAM resource with a known file at a temporary mountpoint; report whether it is mounted and the file is visible (error text truncated to 300 chars).
   - `sandbox` — writes a 1×1 PNG into the Code Interpreter, reads it back, compares bytes, and runs `GetObject` and `PutObject` against `WORKSPACE_BUCKET` inside the sandbox, expecting both to fail.
-  - `s3_denied` — with the Runtime execution role, tries `GetObject` and `PutObject` on `users/probe/x` in `WORKSPACE_BUCKET`; expects `AccessDenied` for both (the agent cannot skip the Resource Hub).
+  - `s3_denied` — with the Runtime execution role, tries `GetObject` and `PutObject` on `users/probe/x` in `WORKSPACE_BUCKET`; expects `AccessDenied` for both (the agent cannot skip the Resource Hub). Task 7 seeds this exact object with operator credentials first: a missing object can return `AccessDenied` even if `GetObject` is allowed but `ListBucket` is denied.
 
 - [ ] **Step 1: Write the failing tests (pure helpers only; live behavior is Task 7)**
 
@@ -1985,12 +1985,14 @@ Expected: FAIL (`ModuleNotFoundError`).
 
 ```python
 # src/agentcore_platform_poc/probe_agent/probes.py
-"""Task 0 probes that must run inside AgentCore Runtime. Results never include secrets."""
+"""Checks that run inside AgentCore Runtime. Results must not contain secrets."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import shlex
 import shutil
 import stat
 import tempfile
@@ -2019,12 +2021,17 @@ def safe_claims(token: str) -> dict[str, Any]:
 
 
 async def identity_probe(scopes: list[str]) -> dict[str, Any]:
-    from agentcore_platform_poc.agent_platform.tokens import IdentityTokenSource
+    # Task 13 supplies the token source; Task 7 is the first live invocation.
+    from agentcore_platform_poc.agent_platform.tokens import (  # type: ignore[import-untyped]
+        IdentityTokenSource,
+    )
 
     out: dict[str, Any] = {}
     for scope in scopes:
         source = IdentityTokenSource(
-            provider_name=os.environ["IDENTITY_PROVIDER"], scope=scope, region=os.environ["POC_REGION"]
+            provider_name=os.environ["IDENTITY_PROVIDER"],
+            scope=scope,
+            region=os.environ["POC_REGION"],
         )
         out[scope] = safe_claims(await source.get())
     return out
@@ -2035,81 +2042,131 @@ async def claude_cli_probe(helper_ttl_ms: int = 5000) -> dict[str, Any]:
         AssistantMessage,
         ClaudeAgentOptions,
         ClaudeSDKClient,
+        SystemMessage,
         ToolUseBlock,
         create_sdk_mcp_server,
         tool,
     )
 
     calls: list[str] = []
-    counter = Path(tempfile.mkdtemp()) / "helper-calls"
-    counter.write_text("")
-    helper = counter.with_name("helper.sh")
-    # Counts invocations; prints the real gateway token from the token file.
-    helper.write_text(
-        f"#!/bin/sh\necho x >> {counter}\ncat {os.environ['GATEWAY_TOKEN_FILE']}\n"
-    )
-    helper.chmod(helper.stat().st_mode | stat.S_IEXEC)
+    with tempfile.TemporaryDirectory(prefix="probe-helper-") as directory:
+        counter = Path(directory) / "helper-calls"
+        counter.write_text("")
+        helper = Path(directory) / "helper.sh"
+        helper.write_text(
+            "#!/bin/sh\n"
+            f"echo x >> {shlex.quote(str(counter))}\n"
+            f"cat {shlex.quote(os.environ['GATEWAY_TOKEN_FILE'])}\n"
+        )
+        helper.chmod(helper.stat().st_mode | stat.S_IEXEC)
 
-    @tool("ping", "Returns pong.", {})
-    async def ping(_: dict[str, Any]) -> dict[str, Any]:
-        calls.append("ping")
-        return {"content": [{"type": "text", "text": "pong"}]}
+        # The SDK decorator has no static type information.
+        @tool("ping", "Returns pong.", {})  # type: ignore[misc]
+        async def ping(_: dict[str, Any]) -> dict[str, Any]:
+            calls.append("ping")
+            return {"content": [{"type": "text", "text": "pong"}]}
 
-    options = ClaudeAgentOptions(
-        tools=[],
-        mcp_servers={"probe": create_sdk_mcp_server("probe", tools=[ping])},
-        allowed_tools=["mcp__probe__ping"],
-        setting_sources=[],
-        settings=f'{{"apiKeyHelper": "{helper}"}}',
-        env={
-            "ANTHROPIC_BASE_URL": os.environ["GATEWAY_URL"],
-            "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": str(helper_ttl_ms),
-        },
-        model=os.environ["AGENT_MODEL"],
-        max_turns=4,
-        thinking={"type": "disabled"},
-    )
-    used: list[str] = []
-    async with ClaudeSDKClient(options=options) as client:
-        await client.query("Call the ping tool once, then say done.")
-        async for message in client.receive_response():
-            if isinstance(message, AssistantMessage):
-                used.extend(b.name for b in message.content if isinstance(b, ToolUseBlock))
-        await asyncio.sleep(helper_ttl_ms / 1000 + 1)
-        await client.query("Say done again.")
-        async for _ in client.receive_response():
-            pass
-    return {
-        "tool_calls": used,
-        "builtin_called": [name for name in used if not name.startswith("mcp__")],
-        "ping_ran": calls == ["ping"],
-        "helper_calls": len(counter.read_text().splitlines()),
-    }
+        options = ClaudeAgentOptions(
+            tools=[],
+            mcp_servers={"probe": create_sdk_mcp_server("probe", tools=[ping])},
+            strict_mcp_config=True,
+            allowed_tools=["mcp__probe__ping"],
+            setting_sources=[],
+            settings=json.dumps({"apiKeyHelper": str(helper)}),
+            env={
+                "ANTHROPIC_BASE_URL": os.environ["GATEWAY_URL"],
+                "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": str(helper_ttl_ms),
+            },
+            model=os.environ["AGENT_MODEL"],
+            max_turns=4,
+            thinking={"type": "disabled"},
+        )
+        used: list[str] = []
+        seen_tools: list[str] = []
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query("Call the ping tool once, then say done.")
+            async for message in client.receive_response():
+                if isinstance(message, SystemMessage) and message.subtype == "init":
+                    seen_tools = sorted(str(name) for name in message.data.get("tools", []))
+                if isinstance(message, AssistantMessage):
+                    used.extend(
+                        block.name for block in message.content if isinstance(block, ToolUseBlock)
+                    )
+            helper_calls_before_ttl = len(counter.read_text().splitlines())
+            await asyncio.sleep(helper_ttl_ms / 1000 + 1)
+            await client.query("Say done again.")
+            async for _ in client.receive_response():
+                pass
+        return {
+            "cli_started": True,
+            "tool_names_seen": seen_tools,
+            "tool_calls": used,
+            "builtin_called": [name for name in used if not name.startswith("mcp__")],
+            "ping_ran": calls == ["ping"],
+            "helper_calls_before_ttl": helper_calls_before_ttl,
+            "helper_calls": len(counter.read_text().splitlines()),
+        }
 
 
-async def fuse_probe() -> dict[str, Any]:
-    usage = shutil.disk_usage("/tmp")
+async def fuse_probe(mount_timeout_s: float = 30) -> dict[str, Any]:
+    usage = shutil.disk_usage("/tmp")  # noqa: S108 - Runtime scratch space under test
     result: dict[str, Any] = {
         "dev_fuse": os.path.exists("/dev/fuse"),
         "tmp_total_bytes": usage.total,
         "tmp_free_bytes": usage.free,
     }
+    workspace = None
+    mountpoint = None
+    setup_timed_out = False
     try:
-        from mirage import RAMResource, Workspace
+        from mirage import MountMode, RAMResource, Workspace
 
-        workspace = Workspace({"/data": RAMResource()}, fuse="/mnt/probe")
-        await workspace.execute("echo hi > /data/x.txt")
-        result["mount"] = "ok"
-        result["mounted_listing"] = sorted(os.listdir("/mnt/probe/data"))
-        await workspace.close()
-    except Exception as error:  # noqa: BLE001 - the probe reports any failure as data
+        workspace = Workspace({"/data": RAMResource()}, mode=MountMode.WRITE)
+        await workspace.fs.write("/data/probe.txt", b"probe")
+        mountpoint = await asyncio.wait_for(
+            asyncio.to_thread(workspace.add_fuse_mount, "/data"), timeout=mount_timeout_s
+        )
+        mounted, listing = await asyncio.wait_for(
+            asyncio.to_thread(
+                lambda: (os.path.ismount(mountpoint), sorted(os.listdir(mountpoint)))
+            ),
+            timeout=mount_timeout_s,
+        )
+        result["is_mount"] = mounted
+        result["mounted_listing"] = listing
+        visible = result["is_mount"] and "probe.txt" in result["mounted_listing"]
+        result["mount"] = "ok" if visible else "not_visible"
+    except asyncio.CancelledError:
+        setup_timed_out = mountpoint is None
+        raise
+    except Exception as error:  # noqa: BLE001 - a failed mount is the measurement
+        setup_timed_out = isinstance(error, TimeoutError) and mountpoint is None
         result["mount"] = f"{type(error).__name__}: {str(error)[:300]}"
+    finally:
+        if workspace is not None:
+            if setup_timed_out:
+                # The mount worker may still be inside setup. Leave the last probe's
+                # microVM to reclaim it rather than blocking the Runtime loop.
+                result["cleanup"] = "skipped_unfinished_mount"
+            else:
+                removal_failed = False
+                if mountpoint is not None:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.to_thread(workspace.remove_fuse_mount, "/data"),
+                            timeout=mount_timeout_s,
+                        )
+                    except Exception as error:  # noqa: BLE001 - cleanup is a probe datum
+                        result["cleanup"] = type(error).__name__
+                        removal_failed = True
+                if not removal_failed:
+                    await workspace.close()
     return result
 
 
 def s3_denied_probe() -> dict[str, Any]:
-    import boto3
-    from botocore.exceptions import ClientError
+    import boto3  # type: ignore[import-untyped]
+    from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 
     client = boto3.client("s3", region_name=os.environ["POC_REGION"])
     bucket = os.environ["WORKSPACE_BUCKET"]
@@ -2119,7 +2176,7 @@ def s3_denied_probe() -> dict[str, Any]:
         ("put", lambda: client.put_object(Bucket=bucket, Key="users/probe/x", Body=b"x")),
     ):
         try:
-            call()
+            call()  # type: ignore[no-untyped-call]
             out[op] = "allowed"
         except ClientError as error:
             out[op] = error.response["Error"]["Code"]
@@ -2137,35 +2194,48 @@ def sandbox_probe() -> dict[str, Any]:
         client.upload_file("probe.png", PNG_1X1)
         back = client.download_file("probe.png")
         bucket = os.environ["WORKSPACE_BUCKET"]
-        s3 = parse_tool_result(client.execute_code(
+        script = (
             "import boto3\n"
             "c = boto3.client('s3')\n"
             "results = []\n"
             "for op in ('get', 'put'):\n"
             "    try:\n"
-            f"        c.get_object(Bucket='{bucket}', Key='users/probe/x') if op == 'get' else c.put_object(Bucket='{bucket}', Key='users/probe/x', Body=b'x')\n"
+            "        if op == 'get':\n"
+            f"            c.get_object(Bucket={bucket!r}, Key='users/probe/x')\n"
+            "        else:\n"
+            f"            c.put_object(Bucket={bucket!r}, Key='users/probe/x', Body=b'x')\n"
             "        results.append(op + ':allowed')\n"
             "    except Exception as e:\n"
-            "        results.append(op + ':' + type(e).__name__)\n"
+            "        code = type(e).__name__\n"
+            "        if hasattr(e, 'response'):\n"
+            "            code = e.response['Error']['Code']\n"
+            "        results.append(op + ':' + code)\n"
             "print(results)\n"
-        ))
+        )
+        s3 = parse_tool_result(client.execute_code(script))
         return {
             "png_round_trip": back == PNG_1X1,
-            "s3_call_failed": "allowed" not in s3.output and bool(s3.output.strip()),
+            "s3_call_failed": (
+                not s3.failed
+                and "get:" in s3.output
+                and "put:" in s3.output
+                and ":allowed" not in s3.output
+            ),
             "s3_output_head": s3.output[:300],
         }
     finally:
         client.stop()
 ```
 
-The `fuse` probe uses Mirage's `Workspace(..., fuse=...)` argument. **Before running it, confirm the exact FUSE entry point in the installed source** (`mirage/workspace/workspace/workspace.py`: look for the constructor argument or method that sets `fuse_mountpoint`, and `mirage/workspace/fuse.py`), and adjust these three lines to match. The probe's contract does not change: report `/dev/fuse`, `/tmp` size, and whether a mount of an in-memory resource works.
+The installed Mirage 0.0.6 API mounts with `Workspace.add_fuse_mount()`, not a constructor `fuse` argument. The RAM resource must use `MountMode.WRITE` so the probe can seed a known file; it then requires both `os.path.ismount()` and visibility of that file. The live FUSE result remains a Task 7 check.
 
 ```python
 # src/agentcore_platform_poc/probe_agent/entrypoint.py
-"""Probe agent: Task 0 checks inside Runtime. Deployed into the research runtime slot first."""
+"""Probe agent: Task 0 checks inside Runtime, deployed to the research slot first."""
 
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any
 
@@ -2184,23 +2254,42 @@ async def invoke(payload: dict[str, Any], context: RequestContext) -> dict[str, 
         if name == "headers":
             detail: dict[str, Any] = probes.header_summary(context.request_headers or {})
         elif name == "identity":
-            detail = await probes.identity_probe([os.environ["HUB_SCOPE"], os.environ["GATEWAY_SCOPE"]])
+            detail = await probes.identity_probe(
+                [os.environ["HUB_SCOPE"], os.environ["GATEWAY_SCOPE"]]
+            )
         elif name == "claude_cli":
-            from agentcore_platform_poc.agent_platform.tokens import IdentityTokenSource, write_token_file
+            from agentcore_platform_poc.agent_platform.tokens import (  # type: ignore[import-untyped]
+                IdentityTokenSource,
+                write_token_file,
+            )
 
-            source = IdentityTokenSource(os.environ["IDENTITY_PROVIDER"], os.environ["GATEWAY_SCOPE"], os.environ["POC_REGION"])
+            source = IdentityTokenSource(
+                os.environ["IDENTITY_PROVIDER"],
+                os.environ["GATEWAY_SCOPE"],
+                os.environ["POC_REGION"],
+            )
             os.environ["GATEWAY_TOKEN_FILE"] = str(write_token_file(await source.get()))
             detail = await probes.claude_cli_probe()
         elif name == "fuse":
-            detail = await probes.fuse_probe()
+            detail = await asyncio.wait_for(probes.fuse_probe(), timeout=90)
         elif name == "sandbox":
-            detail = probes.sandbox_probe()
+            detail = await asyncio.to_thread(probes.sandbox_probe)
         elif name == "s3_denied":
-            detail = probes.s3_denied_probe()
+            detail = await asyncio.to_thread(probes.s3_denied_probe)
         else:
-            return {"probe": name, "build_id": build_id(), "ok": False, "detail": {"error": "unknown_probe"}}
-    except Exception as error:  # noqa: BLE001 - reported, never raised to the caller
-        return {"probe": name, "build_id": build_id(), "ok": False, "detail": {"error": type(error).__name__, "message": str(error)[:300]}}
+            return {
+                "probe": name,
+                "build_id": build_id(),
+                "ok": False,
+                "detail": {"error": "unknown_probe"},
+            }
+    except Exception as error:  # noqa: BLE001 - probe failures are returned as data
+        return {
+            "probe": name,
+            "build_id": build_id(),
+            "ok": False,
+            "detail": {"error": type(error).__name__},
+        }
     return {"probe": name, "build_id": build_id(), "ok": True, "detail": detail}
 
 
@@ -2352,7 +2441,7 @@ Start the unified API is not needed yet; invoke directly with the unified API's 
 
 ```bash
 .venv/bin/python - <<'PY'
-import json, os, uuid, urllib.parse, httpx, msal
+import json, os, uuid, urllib.parse, boto3, httpx, msal
 from scripts.terraform_outputs import load_terraform_outputs
 from pathlib import Path
 out = load_terraform_outputs(Path("infra/terraform/platform"))
@@ -2361,12 +2450,23 @@ app = msal.ConfidentialClientApplication(env["POC3_UNIFIED_API_CLIENT_ID"], clie
 token = app.acquire_token_for_client(scopes=[f"api://{env['POC3_RUNTIME_APP_ID']}/.default"])["access_token"]
 arn = urllib.parse.quote(out["research_runtime_arn"], safe="")
 url = f"https://bedrock-agentcore.{out['aws_region']}.amazonaws.com/runtimes/{arn}/invocations?qualifier=DEFAULT"
-for probe in ["headers", "identity", "claude_cli", "fuse", "sandbox", "s3_denied"]:
-    r = httpx.post(url, json={"probe": probe}, timeout=600, headers={
-        "Authorization": f"Bearer {token}", "Content-Type": "application/json",
-        "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": f"poc3-probe-{uuid.uuid4().hex}",
-        "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Grant": "probe.grant.value"})
-    print(probe, r.status_code, json.dumps(r.json(), sort_keys=True))
+s3 = boto3.client("s3", region_name=out["aws_region"])
+bucket = out["workspace_bucket"]
+key = "users/probe/x"
+s3.put_object(Bucket=bucket, Key=key, Body=b"seed")
+try:
+    for probe in ["headers", "identity", "claude_cli", "sandbox", "s3_denied", "fuse"]:
+        try:
+            r = httpx.post(url, json={"probe": probe}, timeout=600, headers={
+                "Authorization": f"Bearer {token}", "Content-Type": "application/json",
+                "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": f"poc3-probe-{uuid.uuid4().hex}",
+                "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Grant": "probe.grant.value"})
+            print(probe, r.status_code, flush=True)
+            print(probe, json.dumps(r.json(), sort_keys=True))
+        except Exception as error:
+            print(probe, "probe_failed", type(error).__name__)
+finally:
+    s3.delete_object(Bucket=bucket, Key=key)
 PY
 ```
 
@@ -2378,7 +2478,7 @@ Expected and gate:
 |---|---|---|
 | headers | `grant_length` = 17 | stop: grant transport does not work |
 | identity | hub and gateway rows each show the right `aud`, `roles`, `azp`, `ver` 2.0 | stop |
-| claude_cli | `ping_ran` true, `builtin_called` empty, `helper_calls` ≥ 2 | stop (research demo depends on it). If the gateway rejects a field, read the gateway log (field names only), add the field in Task 15, redeploy the gateway, rerun |
+| claude_cli | `ping_ran` true, `tool_names_seen` contains `mcp__probe__ping` and no built-in names, `builtin_called` empty, `helper_calls` ≥ 2 and greater than `helper_calls_before_ttl` | stop (research demo depends on it). If the gateway rejects a field, read the gateway log (field names only), add the field in Task 15, redeploy the gateway, rerun |
 | fuse | any result recorded | continue; methods 3–4 may be "not feasible" |
 | sandbox | `png_round_trip` true and `s3_call_failed` true | stop if S3 succeeds (isolation broken) |
 | s3_denied | `get` and `put` are both `AccessDenied` | stop (the agent could skip the Resource Hub) |
