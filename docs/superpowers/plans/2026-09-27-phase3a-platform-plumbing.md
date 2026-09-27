@@ -237,7 +237,7 @@ build/
 evidence/bench/
 ```
 
-Install: `.venv/bin/pip install -e '.[dev,platform]'`
+Install: `uv pip install --python .venv/bin/python -e '.[dev,platform]'` (this venv has no pip).
 
 - [ ] **Step 4: Run the test to verify it passes**
 
@@ -362,11 +362,9 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'agentcore_platform_po
 
 - [ ] **Step 3: Refactor the Phase 2 packager to take a `ZipSpec`**
 
-In `src/agentcore_runtime_poc/packaging.py`, add after the constants:
+In `src/agentcore_runtime_poc/packaging.py`, add `from dataclasses import dataclass, field` to the existing import block (Ruff `E402` rejects imports below code), then add after the constants:
 
 ```python
-from dataclasses import dataclass, field
-
 ExtraFiles = Callable[[Path], dict[str, tuple[bytes, bool]]]
 
 
@@ -660,7 +658,7 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
-Create placeholder `entrypoint.py` files (`def main() -> None: raise NotImplementedError`) in `research_agent`, `bench_agent`, `probe_agent`, and a placeholder `resource_hub/handler.py` (`def handler(event, context): raise NotImplementedError`) so the specs can build; later tasks replace them.
+Create placeholder `entrypoint.py` files (`def main() -> None: raise NotImplementedError`) in `research_agent`, `bench_agent`, `probe_agent`; a placeholder `resource_hub/handler.py` (`def handler(event, context): raise NotImplementedError`); and docstring-only placeholders `src/agentcore_platform_poc/grant.py` and `src/agentcore_platform_poc/entra.py` (the Resource Hub spec packages them, and the packager fails on missing files). Tasks 8, 9, 12, 16, 20 replace them.
 
 - [ ] **Step 5: Run the tests**
 
@@ -1250,7 +1248,7 @@ git commit -m "feat(terraform): runtime module gets JWT authorizer, header allow
 
 **Interfaces:**
 - Consumes: modules `agentcore_agent_runtime` (Task 4) and `agentcore_code_interpreter` (Phase 1); bootstrap zips at `build/probe/probe.zip` and `build/resource-hub/resource-hub.zip` (built in Task 7 before apply).
-- Produces outputs (read by `scripts.terraform_outputs`): `aws_region`, `code_bucket`, `workspace_bucket`, `research_runtime_id`, `research_runtime_arn`, `bench_runtime_id`, `bench_runtime_arn`, `resource_hub_function_name`, `resource_hub_url`, `grant_kms_key_id`, `grant_public_key_pem`, `code_interpreter_id`, `research_provider_name`, `bench_provider_name`, `research_execution_role_arn`.
+- Produces outputs (read by `scripts.terraform_outputs`): `aws_region`, `code_bucket`, `workspace_bucket`, `research_runtime_id`, `research_runtime_arn`, `bench_runtime_id`, `bench_runtime_arn`, `resource_hub_function_name`, `resource_hub_url`, `grant_kms_key_id`, `grant_signer_role_arn`, `grant_public_key_pem`, `code_interpreter_id`, `research_provider_name`, `bench_provider_name`, `research_execution_role_arn`.
 
 - [ ] **Step 1: Write the failing Terraform test**
 
@@ -1527,11 +1525,50 @@ resource "aws_s3_object" "bootstrap" {
 
 ```hcl
 # kms.tf
+# Only the unified API's signer role may kms:Sign. The account root keeps key administration
+# (and GetPublicKey for Terraform) but not Sign, so an operator or agent cannot mint grants directly.
+resource "aws_iam_role" "grant_signer" {
+  name                 = "${var.name_prefix}_grant_signer"
+  max_session_duration = 3600
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Action    = "sts:AssumeRole"
+      Principal = { AWS = "arn:aws:iam::${local.account_id}:root" }
+      Condition = { ArnLike = { "aws:PrincipalArn" = "arn:aws:iam::${local.account_id}:role/aws-reserved/sso.amazonaws.com/*" } }
+    }]
+  })
+}
+
 resource "aws_kms_key" "grant" {
   description              = "Phase 3a session-grant signing key (ES256)"
   customer_master_key_spec = "ECC_NIST_P256"
   key_usage                = "SIGN_VERIFY"
   deletion_window_in_days  = 7
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "KeyAdministration"
+        Effect    = "Allow"
+        Principal = { AWS = "arn:aws:iam::${local.account_id}:root" }
+        Action = [
+          "kms:Create*", "kms:Describe*", "kms:Enable*", "kms:List*", "kms:Put*", "kms:Update*",
+          "kms:Revoke*", "kms:Disable*", "kms:Get*", "kms:Delete*", "kms:TagResource",
+          "kms:UntagResource", "kms:ScheduleKeyDeletion", "kms:CancelKeyDeletion",
+        ]
+        Resource = "*"
+      },
+      {
+        Sid       = "OnlyTheSignerRoleSigns"
+        Effect    = "Allow"
+        Principal = { AWS = aws_iam_role.grant_signer.arn }
+        Action    = ["kms:Sign", "kms:GetPublicKey", "kms:DescribeKey"]
+        Resource  = "*"
+      },
+    ]
+  })
 }
 
 data "aws_kms_public_key" "grant" {
@@ -1754,6 +1791,7 @@ module "research_runtime" {
     IDENTITY_PROVIDER   = aws_bedrockagentcore_oauth2_credential_provider.agent["research"].name
     CODE_INTERPRETER_ID = module.code_interpreter.code_interpreter_id
     AGENT_MODEL         = var.agent_model
+    WORKSPACE_BUCKET    = aws_s3_bucket.workspace.id # name only, for the negative probes; the role has no access
   }
   extra_policy_statements = concat(local.identity_statements["research"], [{
     Sid    = "UseSandbox"
@@ -1813,6 +1851,7 @@ output "bench_runtime_arn" { value = module.bench_runtime.agent_runtime_arn }
 output "resource_hub_function_name" { value = aws_lambda_function.resource_hub.function_name }
 output "resource_hub_url" { value = local.hub_url }
 output "grant_kms_key_id" { value = aws_kms_key.grant.key_id }
+output "grant_signer_role_arn" { value = aws_iam_role.grant_signer.arn }
 output "grant_public_key_pem" { value = data.aws_kms_public_key.grant.public_key_pem }
 output "code_interpreter_id" { value = module.code_interpreter.code_interpreter_id }
 output "research_provider_name" { value = aws_bedrockagentcore_oauth2_credential_provider.agent["research"].name }
@@ -1850,7 +1889,8 @@ git commit -m "feat(terraform): add Phase 3a platform root (buckets, KMS, Identi
   - `identity` — for each scope in `HUB_SCOPE`, `GATEWAY_SCOPE`: gets an M2M token through AgentCore Identity and returns only the decoded, non-secret claims `aud`, `azp`, `roles`, `ver`, `exp`.
   - `claude_cli` — starts the bundled Claude Code CLI with `tools=[]` and a one-tool SDK MCP server, asks it to call the tool once, and returns: CLI start ok, tool names the model saw, whether any built-in tool was called, and the `apiKeyHelper` call count after TTL (see Step 3).
   - `fuse` — `os.path.exists("/dev/fuse")`, `shutil.disk_usage("/tmp")`, and the result of trying a Mirage FUSE mount of an empty RAM resource at `/mnt/probe` (error text truncated to 300 chars).
-  - `sandbox` — writes a 1×1 PNG into the Code Interpreter, reads it back, compares bytes, and runs `import boto3; boto3.client("s3").list_buckets()` inside the sandbox, expecting failure.
+  - `sandbox` — writes a 1×1 PNG into the Code Interpreter, reads it back, compares bytes, and runs `GetObject` and `PutObject` against `WORKSPACE_BUCKET` inside the sandbox, expecting both to fail.
+  - `s3_denied` — with the Runtime execution role, tries `GetObject` and `PutObject` on `users/probe/x` in `WORKSPACE_BUCKET`; expects `AccessDenied` for both (the agent cannot skip the Resource Hub).
 
 - [ ] **Step 1: Write the failing tests (pure helpers only; live behavior is Task 7)**
 
@@ -2013,6 +2053,25 @@ async def fuse_probe() -> dict[str, Any]:
     return result
 
 
+def s3_denied_probe() -> dict[str, Any]:
+    import boto3
+    from botocore.exceptions import ClientError
+
+    client = boto3.client("s3", region_name=os.environ["POC_REGION"])
+    bucket = os.environ["WORKSPACE_BUCKET"]
+    out: dict[str, Any] = {}
+    for op, call in (
+        ("get", lambda: client.get_object(Bucket=bucket, Key="users/probe/x")),
+        ("put", lambda: client.put_object(Bucket=bucket, Key="users/probe/x", Body=b"x")),
+    ):
+        try:
+            call()
+            out[op] = "allowed"
+        except ClientError as error:
+            out[op] = error.response["Error"]["Code"]
+    return out
+
+
 def sandbox_probe() -> dict[str, Any]:
     from bedrock_agentcore.tools.code_interpreter_client import CodeInterpreter
 
@@ -2023,12 +2082,22 @@ def sandbox_probe() -> dict[str, Any]:
     try:
         client.upload_file("probe.png", PNG_1X1)
         back = client.download_file("probe.png")
-        s3 = parse_tool_result(
-            client.execute_code("import boto3\nprint(boto3.client('s3').list_buckets()['Buckets'][:1])")
-        )
+        bucket = os.environ["WORKSPACE_BUCKET"]
+        s3 = parse_tool_result(client.execute_code(
+            "import boto3\n"
+            "c = boto3.client('s3')\n"
+            "results = []\n"
+            "for op in ('get', 'put'):\n"
+            "    try:\n"
+            f"        c.get_object(Bucket='{bucket}', Key='users/probe/x') if op == 'get' else c.put_object(Bucket='{bucket}', Key='users/probe/x', Body=b'x')\n"
+            "        results.append(op + ':allowed')\n"
+            "    except Exception as e:\n"
+            "        results.append(op + ':' + type(e).__name__)\n"
+            "print(results)\n"
+        ))
         return {
             "png_round_trip": back == PNG_1X1,
-            "s3_call_failed": s3.failed,
+            "s3_call_failed": "allowed" not in s3.output and bool(s3.output.strip()),
             "s3_output_head": s3.output[:300],
         }
     finally:
@@ -2072,6 +2141,8 @@ async def invoke(payload: dict[str, Any], context: RequestContext) -> dict[str, 
             detail = await probes.fuse_probe()
         elif name == "sandbox":
             detail = probes.sandbox_probe()
+        elif name == "s3_denied":
+            detail = probes.s3_denied_probe()
         else:
             return {"probe": name, "build_id": build_id(), "ok": False, "detail": {"error": "unknown_probe"}}
     except Exception as error:  # noqa: BLE001 - reported, never raised to the caller
@@ -2150,16 +2221,39 @@ def main() -> int:
         [f"api://{env['POC3_UNIFIED_API_CLIENT_ID']}/Research.Run"],
     ).acquire(print)
     rows["user->unified_api"] = user
+    rows["user->hub"] = EntraDeviceAuth.for_tenant(
+        env["POC3_CLI_CLIENT_ID"], env["POC3_TENANT_ID"], [f"api://{env['POC3_HUB_APP_ID']}/Workspace.ReadWrite"],
+    ).acquire(print)
+    expected = {
+        "unified_api->runtime": (env["POC3_RUNTIME_APP_ID"], env["POC3_UNIFIED_API_CLIENT_ID"], "roles", "Runtime.Invoke"),
+        "research->hub": (env["POC3_HUB_APP_ID"], env["POC3_RESEARCH_AGENT_CLIENT_ID"], "roles", "Workspace.Agent"),
+        "research->gateway": (env["POC3_GATEWAY_APP_ID"], env["POC3_RESEARCH_AGENT_CLIENT_ID"], "roles", "Gateway.Invoke"),
+        "bench->hub": (env["POC3_HUB_APP_ID"], env["POC3_BENCH_AGENT_CLIENT_ID"], "roles", "Workspace.Agent"),
+        "user->unified_api": (env["POC3_UNIFIED_API_CLIENT_ID"], env["POC3_CLI_CLIENT_ID"], "scp", "Research.Run"),
+        "user->hub": (env["POC3_HUB_APP_ID"], env["POC3_CLI_CLIENT_ID"], "scp", "Workspace.ReadWrite"),
+    }
+    issuer = f"https://login.microsoftonline.com/{env['POC3_TENANT_ID']}/v2.0"
+    failures = []
     for name, token in rows.items():
-        print(name, json.dumps(safe_claims(token) | {k: v for k, v in _extra(token).items()}, sort_keys=True))
-    return 0
+        claims = safe_claims(token) | _extra(token)
+        aud, azp, kind, value = expected[name]
+        granted = claims.get(kind) or []
+        ok = (
+            claims.get("ver") == "2.0" and claims.get("iss") == issuer and claims.get("aud") == aud
+            and claims.get("azp") == azp and value in (granted.split() if isinstance(granted, str) else granted)
+            and (kind == "roles") == (claims.get("idtyp") == "app")
+        )
+        print("PASS" if ok else "FAIL", name, json.dumps(claims, sort_keys=True))
+        if not ok:
+            failures.append(name)
+    return 1 if failures else 0
 
 
 def _extra(token: str) -> dict[str, object]:
     import jwt
 
     claims = jwt.decode(token, options={"verify_signature": False})
-    return {k: claims[k] for k in ("scp", "idtyp") if k in claims}
+    return {k: claims[k] for k in ("scp", "idtyp", "iss") if k in claims}
 
 
 if __name__ == "__main__":
@@ -2171,7 +2265,7 @@ if __name__ == "__main__":
 - [ ] **Step 2: Run probe 2**
 
 Run: `set -a; source .env; set +a; .venv/bin/python -m scripts.probe_entra_tokens`
-Expected: every row has `"ver": "2.0"`; app rows have `roles` with the expected role and `azp` = the calling app; `user->unified_api` has `scp` containing `Research.Run` and no `idtyp: app`. **If any row shows `ver` 1.0 or lacks `azp`, fix the app manifest (Task 0 Step 2) and rerun. Stop until this passes.**
+Expected: six `PASS` lines and exit code 0 (the script asserts `ver`, `iss`, `aud`, `azp`, the role or scope, and `idtyp` for every receiver). **On any `FAIL`, fix the app manifest or permission (Task 0 Step 2) and rerun. Stop until this passes.** (App rows need the optional `idtyp` claim from Task 0 Step 2.)
 
 - [ ] **Step 3: Build bootstrap zips and apply**
 
@@ -2213,7 +2307,7 @@ app = msal.ConfidentialClientApplication(env["POC3_UNIFIED_API_CLIENT_ID"], clie
 token = app.acquire_token_for_client(scopes=[f"api://{env['POC3_RUNTIME_APP_ID']}/.default"])["access_token"]
 arn = urllib.parse.quote(out["research_runtime_arn"], safe="")
 url = f"https://bedrock-agentcore.{out['aws_region']}.amazonaws.com/runtimes/{arn}/invocations?qualifier=DEFAULT"
-for probe in ["headers", "identity", "claude_cli", "fuse", "sandbox"]:
+for probe in ["headers", "identity", "claude_cli", "fuse", "sandbox", "s3_denied"]:
     r = httpx.post(url, json={"probe": probe}, timeout=600, headers={
         "Authorization": f"Bearer {token}", "Content-Type": "application/json",
         "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": f"poc3-probe-{uuid.uuid4().hex}",
@@ -2233,6 +2327,9 @@ Expected and gate:
 | claude_cli | `ping_ran` true, `builtin_called` empty, `helper_calls` ≥ 2 | stop (research demo depends on it). If the gateway rejects a field, read the gateway log (field names only), add the field in Task 15, redeploy the gateway, rerun |
 | fuse | any result recorded | continue; methods 3–4 may be "not feasible" |
 | sandbox | `png_round_trip` true and `s3_call_failed` true | stop if S3 succeeds (isolation broken) |
+| s3_denied | `get` and `put` are both `AccessDenied` | stop (the agent could skip the Resource Hub) |
+
+Probes 4 (KMS sign → deployed Lambda verify) and 6 (Mirage over the Resource Hub) need code from later tasks. Probe 4 is the hard gate at Task 23 Step 2; probe 6 is Task 21's test (run against real Mirage 0.0.6) plus the first Mirage cases of the benchmark, where a failure is recorded, not a stop.
 
 Record every row in `evidence/raw/task7-notes.md`.
 
@@ -2241,7 +2338,7 @@ Record every row in `evidence/raw/task7-notes.md`.
 ### Task 8: Session grant (issue, verify, KMS DER → raw)
 
 **Files:**
-- Create: `src/agentcore_platform_poc/grant.py`
+- Replace placeholder: `src/agentcore_platform_poc/grant.py`
 - Test: `tests/test_platform_grant.py`
 
 **Interfaces:**
@@ -2497,7 +2594,7 @@ git commit -m "feat: add session grant issue/verify with KMS DER-to-raw signing"
 ### Task 9: Entra receiver rules
 
 **Files:**
-- Create: `src/agentcore_platform_poc/entra.py`
+- Replace placeholder: `src/agentcore_platform_poc/entra.py`
 - Test: `tests/test_platform_entra.py`
 
 **Interfaces:**
@@ -2931,7 +3028,7 @@ git commit -m "feat(resource-hub): add the canonical path routine"
 - Produces:
   - `MAX_CHUNK = 4 * 1024 * 1024`, `MAX_UPLOAD = 4 * 1024 * 1024`
   - `@dataclass(frozen=True) class Entry: path: str; size: int; modified: str`
-  - `@dataclass(frozen=True) class SearchLimits: max_bytes: int = 6 * 1024**3; max_objects: int = 2000; concurrency: int = 16; max_seconds: float = 300.0; max_matches: int = 200; max_line_chars: int = 500`
+  - `@dataclass(frozen=True) class SearchLimits: max_bytes: int = 6 * 1024**3; max_objects: int = 2000; concurrency: int = 16; max_seconds: float = 300.0; max_matches: int = 200; max_line_chars: int = 500; max_line_bytes: int = 1024 * 1024`
   - `@dataclass(frozen=True) class Match: path: str; line_no: int; line: str`
   - `@dataclass(frozen=True) class SearchResult: matches: list[Match]; truncated: str | None; bytes_scanned: int; objects_scanned: int`
   - `class NotFound(Exception)`, `class TooLarge(Exception)`
@@ -3138,6 +3235,23 @@ def test_long_lines_are_cut() -> None:
     assert len(match.line) == 500
 
 
+def test_listing_stops_at_cap() -> None:
+    s3 = FakeS3()
+    s3.objects.update({f"users/{A}/{i:04d}.txt": b"NEEDLE\n" for i in range(50)})
+    store = WorkspaceStore(s3, "bucket")
+    result = store.search(A, "NEEDLE", glob=None, ignore_case=False, limits=SearchLimits(max_objects=3))
+    assert result.truncated == "max_objects" and result.objects_scanned == 3
+    assert len(store._keys(A, "", limit=12)) <= 14  # stopped paginating (fake pages hold 2 keys)
+
+
+def test_line_without_newline_is_bounded() -> None:
+    from agentcore_platform_poc.resource_hub.store import _lines
+    from tests.fake_s3 import _Body
+
+    pieces = list(_lines(_Body(b"x" * 5000 + b"NEEDLE"), max_line_bytes=1000, chunk=700))
+    assert all(len(p) <= 1000 for p in pieces) and b"".join(pieces) == b"x" * 5000 + b"NEEDLE"
+
+
 def test_empty_search_text_rejected() -> None:
     store, _ = _store()
     with pytest.raises(ValueError):
@@ -3160,7 +3274,7 @@ from __future__ import annotations
 import fnmatch
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
@@ -3194,6 +3308,7 @@ class SearchLimits:
     max_seconds: float = 300.0
     max_matches: int = 200
     max_line_chars: int = 500
+    max_line_bytes: int = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -3243,17 +3358,36 @@ class _Budget:
             return True
 
 
+def _lines(body: Any, max_line_bytes: int, chunk: int = 1024 * 1024) -> Iterator[bytes]:
+    """Split a streaming body into lines with bounded memory; an over-long line is cut into pieces."""
+    carry = b""
+    while True:
+        part = body.read(chunk)
+        if not part:
+            break
+        pieces = (carry + part).split(b"\n")
+        carry = pieces.pop()
+        yield from pieces
+        while len(carry) > max_line_bytes:
+            yield carry[:max_line_bytes]
+            carry = carry[max_line_bytes:]
+    if carry:
+        yield carry
+
+
 class WorkspaceStore:
     def __init__(self, s3: Any, bucket: str, clock: Callable[[], float] = time.monotonic) -> None:
         self._s3 = s3
         self._bucket = bucket
         self._clock = clock
 
-    def _keys(self, oid: str, path: str) -> list[dict[str, Any]]:
+    def _keys(self, oid: str, path: str, limit: int | None = None) -> list[dict[str, Any]]:
         prefix = user_prefix(oid) + (f"{path}/" if path else "")
         out: list[dict[str, Any]] = []
         for page in self._s3.get_paginator("list_objects_v2").paginate(Bucket=self._bucket, Prefix=prefix):
             out.extend(page.get("Contents", []))
+            if limit is not None and len(out) > limit:
+                break  # stop paginating as soon as the cap is exceeded
         return out
 
     def list(self, oid: str, path: str) -> list[Entry]:
@@ -3295,8 +3429,10 @@ class WorkspaceStore:
         if not text:
             raise ValueError("search text must not be empty")
         needle = text.lower() if ignore_case else text
-        items = [i for i in self._keys(oid, "") if glob is None or fnmatch.fnmatchcase(relative(oid, i["Key"]), glob)]
         budget = _Budget(limits, self._clock)
+        # Cap the listing itself; the glob then filters what was listed.
+        listed = self._keys(oid, "", limit=limits.max_objects * 4)
+        items = [i for i in listed if glob is None or fnmatch.fnmatchcase(relative(oid, i["Key"]), glob)]
         capped = len(items) > limits.max_objects
         items = items[: limits.max_objects]
 
@@ -3306,7 +3442,7 @@ class WorkspaceStore:
             body = self._s3.get_object(Bucket=self._bucket, Key=item["Key"])["Body"]
             path = relative(oid, item["Key"])
             try:
-                for number, raw in enumerate(body.iter_lines(chunk_size=1024 * 1024), start=1):
+                for number, raw in enumerate(_lines(body, limits.max_line_bytes), start=1):
                     if not budget.add_bytes(len(raw) + 1) or budget.stop():
                         return
                     line = raw.decode("utf-8", errors="replace")
@@ -4343,14 +4479,17 @@ async def fetch_url(url: str, *, http: httpx.AsyncClient) -> str:
         raise FetchRejected("https_only")
     if parts.username or parts.password or parts.hostname not in ALLOWED_HOSTS or parts.port not in (None, 443):
         raise FetchRejected("host_not_allowed")
-    response = await http.get(url, follow_redirects=False, timeout=30.0)
-    if 300 <= response.status_code < 400:
-        raise FetchRejected("redirect_not_followed")
-    if len(response.content) > MAX_FETCH_BYTES:
-        raise FetchRejected("too_large")
-    if response.status_code >= 400:
-        raise FetchRejected(f"http_{response.status_code}")
-    return response.text
+    async with http.stream("GET", url, follow_redirects=False, timeout=30.0) as response:
+        if 300 <= response.status_code < 400:
+            raise FetchRejected("redirect_not_followed")
+        if response.status_code >= 400:
+            raise FetchRejected(f"http_{response.status_code}")
+        body = bytearray()
+        async for chunk in response.aiter_bytes():
+            body.extend(chunk)
+            if len(body) > MAX_FETCH_BYTES:
+                raise FetchRejected("too_large")  # stop reading as soon as the cap is passed
+        return body.decode(response.encoding or "utf-8", errors="replace")
 ```
 
 - [ ] **Step 6: Run the tests**
@@ -5191,6 +5330,16 @@ async def test_grant_run_returns_result_and_stops_sandbox(patched: dict[str, Any
     assert patched["stopped"] and patched["token_file"] == "tok-api://gw/.default"
 
 
+async def test_sdk_failure_returns_error_json_and_stops_sandbox(patched: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    async def boom(prompt: str, options: Any) -> AgentRun:
+        raise RuntimeError("secret text must not leak")
+
+    monkeypatch.setattr(entrypoint, "run_agent", boom)
+    result = await entrypoint.invoke({"prompt": "x"}, Ctx({"X-Amzn-Bedrock-AgentCore-Runtime-Custom-Grant": "G"}))  # type: ignore[arg-type]
+    assert result["error"] == "internal:RuntimeError" and "secret" not in str(result)
+    assert patched["stopped"]
+
+
 async def test_prompt_validation(patched: dict[str, Any]) -> None:
     headers = {"X-Amzn-Bedrock-AgentCore-Runtime-Custom-Grant": "G"}
     for payload in ({}, {"prompt": ""}, {"prompt": "x" * 4001}, {"prompt": 5}):
@@ -5427,6 +5576,9 @@ async def invoke(payload: dict[str, Any], context: RequestContext) -> dict[str, 
             run = await run_agent(prompt, build_options(config, build_tools(ctx), helper_command=HELPER))
     except TokenUnavailable as error:
         return base | {"error": f"token_unavailable:{error}"}
+    except Exception as error:  # noqa: BLE001 - the Runtime result must stay JSON; the type name only
+        logger.info("research failed session=%s error=%s", context.session_id, type(error).__name__)
+        return base | {"error": f"internal:{type(error).__name__}"}
     finally:
         if refresher is not None:
             refresher.cancel()
@@ -5476,7 +5628,7 @@ git commit -m "feat(research-agent): add Claude Agent SDK adapter and Runtime en
 **Interfaces:**
 - Consumes: Task 8 `issue_grant`, `verify_grant`, `KmsSigner`, `Signer`; Task 9 `EntraVerifier`, `require_user`, `build_verifier`.
 - Produces:
-  - `UnifiedApiSettings(tenant_id, client_id, client_secret, cli_client_id, runtime_app_id, region, research_runtime_arn, bench_runtime_arn, research_agent_id, bench_agent_id, kms_key_id, grant_public_key_pem: bytes, max_grant_ttl_s: int = 3600, expiry_test_mode: bool = False)` with `from_env(env: Mapping[str, str], outputs: Mapping[str, str]) -> UnifiedApiSettings` (`outputs` = platform Terraform outputs; `POC3_EXPIRY_TEST_MODE=true` and `POC3_MAX_GRANT_TTL_S` optional)
+  - `UnifiedApiSettings(tenant_id, client_id, client_secret, cli_client_id, runtime_app_id, region, research_runtime_arn, bench_runtime_arn, research_agent_id, bench_agent_id, kms_key_id, grant_public_key_pem: bytes, max_grant_ttl_s: int = 3600, expiry_test_mode: bool = False, signer_role_arn: str = "")` (the unified API signs after assuming `signer_role_arn`; the assumed-role credentials last 1 hour, so restart the unified API if it runs longer) with `from_env(env: Mapping[str, str], outputs: Mapping[str, str]) -> UnifiedApiSettings` (`outputs` = platform Terraform outputs; `POC3_EXPIRY_TEST_MODE=true` and `POC3_MAX_GRANT_TTL_S` optional)
   - `invocation_url(region: str, arn: str) -> str`
   - `RuntimeClient(http: httpx.AsyncClient, token: Callable[[], str])` with `async invoke(arn: str, region: str, payload: dict, *, session_id: str, grant: str | None, user_token: str | None) -> tuple[int, dict[str, Any]]`
   - `msal_runtime_token(settings) -> Callable[[], str]` (client credentials for `api://<runtime app>/.default`)
@@ -5650,6 +5802,7 @@ class UnifiedApiSettings:
     grant_public_key_pem: bytes = field(repr=False)
     max_grant_ttl_s: int = 3600
     expiry_test_mode: bool = False
+    signer_role_arn: str = ""
 
     @classmethod
     def from_env(cls, env: Mapping[str, str], outputs: Mapping[str, str]) -> UnifiedApiSettings:
@@ -5674,6 +5827,7 @@ class UnifiedApiSettings:
             grant_public_key_pem=need(outputs, "grant_public_key_pem").encode(),
             max_grant_ttl_s=int(env.get("POC3_MAX_GRANT_TTL_S", "3600")),
             expiry_test_mode=env.get("POC3_EXPIRY_TEST_MODE", "false").lower() == "true",
+            signer_role_arn=need(outputs, "grant_signer_role_arn"),
         )
 ```
 
@@ -5863,7 +6017,13 @@ def create_production_app() -> FastAPI:
     from scripts.terraform_outputs import load_terraform_outputs
 
     settings = UnifiedApiSettings.from_env(os.environ, load_terraform_outputs(Path("infra/terraform/platform")))
-    signer = KmsSigner(boto3.client("kms", region_name=settings.region), settings.kms_key_id)
+    # Sign as the dedicated signer role (the key policy lets no other principal sign).
+    creds = boto3.client("sts").assume_role(RoleArn=settings.signer_role_arn, RoleSessionName="poc3-unified-api")["Credentials"]
+    kms = boto3.client(
+        "kms", region_name=settings.region, aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretAccessKey"], aws_session_token=creds["SessionToken"],
+    )
+    signer = KmsSigner(kms, settings.kms_key_id)
     runtime = RuntimeClient(httpx.AsyncClient(), msal_runtime_token(settings))
     verifier = build_verifier(settings.tenant_id, settings.client_id)
     return create_app(settings, verifier=verifier, signer=signer, runtime=runtime)
@@ -6135,7 +6295,7 @@ git commit -m "feat: add caller CLI (sign-in, briefs, research, expiry-test gran
 
 **Interfaces:**
 - Produces:
-  - `NEEDLE = "POC3-NEEDLE-7f3a"`, `LINE_BYTES = 100`, `BLOCK_BYTES = 104_857_600`, `HEAD_PART_BYTES = 5_242_800`
+  - `NEEDLE = "POC3-NEEDLE-7f3a"`, `LINE_BYTES = 100`, `BLOCK_BYTES = 104_857_600`, `HEAD_PART_BYTES = 5_243_000`
   - `@dataclass(frozen=True) class FileSpec: path: str; size: int; needle_lines: tuple[int, ...]` (paths relative to the user prefix, under `bench/`)
   - `small_workspace() -> list[FileSpec]` — `bench/small/f00.txt` … `f19.txt`, 10,000 bytes each; needles in `f03` line 5 and `f11` line 42
   - `large_workspace() -> list[FileSpec]` — `bench/large/small/f000.txt`…`f949.txt` (10,000 B; needle at line 50 in every 25th file: 38 matches); `bench/large/medium/m00.txt`…`m44.txt` (1,000,000 B; needle line 777 in `m00`, `m22`); `bench/large/medium/n0.txt`…`n4.txt` (5,000,000 B; needle line 49,999 in `n4`); `bench/large/huge/h050_0..2.txt` (50,000,000 B), `h200_0..1.txt` (200,000,000 B), `h1g_0.txt` (1,000,000,000 B), `h5g_0.txt` (5,000,000,000 B); every huge file has needles at lines 10 and 20,000 (inside the head part)
@@ -6190,7 +6350,8 @@ def test_workspaces() -> None:
 def test_huge_parts_sum_and_alignment() -> None:
     for size in (50_000_000, 200_000_000, 1_000_000_000, 5_000_000_000):
         parts = huge_parts(size)
-        assert parts[0] == ("head", HEAD_PART_BYTES)
+        assert parts[0] == ("head", HEAD_PART_BYTES) and HEAD_PART_BYTES >= 5 * 1024 * 1024
+        assert all(n >= 5 * 1024 * 1024 for _, n in parts[:-1])  # S3 minimum for every non-final part
         assert sum(n for _, n in parts) == size
         assert all(n % 100 == 0 and n <= BLOCK_BYTES for _, n in parts[1:])
         assert len(parts) <= 10_000
@@ -6222,7 +6383,7 @@ from typing import Any
 NEEDLE = "POC3-NEEDLE-7f3a"
 LINE_BYTES = 100
 BLOCK_BYTES = 104_857_600  # 100 MiB, a multiple of 100
-HEAD_PART_BYTES = 5_242_800  # >= the 5 MiB S3 multipart minimum, a multiple of 100
+HEAD_PART_BYTES = 5_243_000  # the smallest multiple of 100 >= 5 MiB (5,242,880), the S3 non-final part minimum
 _ALPHABET = "abcdefghijklmnopqrstuvwxyz     "
 
 
@@ -6775,28 +6936,42 @@ git commit -m "feat(bench): add direct, Hub-search, and copy-in mirror methods a
 
 **Files:**
 - Create: `src/agentcore_platform_poc/bench_agent/mirage_resource.py`
+- Modify: `tests/test_bench_methods.py` (add `read` to `FakeHub`)
 - Test: `tests/test_bench_mirage.py`
 
 **Interfaces:**
-- Consumes: Task 13 `ResourceHubClient`; Task 20 `Method` protocol, `DirectMethod`; `mirage-ai==0.0.6` (`mirage.GenericResource`, `mirage.Workspace`, `CommandIO`).
+- Consumes: Task 13 `ResourceHubClient`; Task 20 `DirectMethod`, `RG`; `mirage-ai==0.0.6`.
 - Produces:
-  - `hub_resource(hub: ResourceHubClient) -> GenericResource` — a Mirage resource whose readdir / stat / read_bytes / read_range / write call the Hub (so Mirage never touches S3 directly)
-  - `MirageMethod(hub, *, fuse: bool, mountpoint: str = "/mnt/ws")` implementing `Method`:
-    - SDK mode: `list` → `find /ws/<folder> -type f`, `read` → `wc -c /ws/<path>`, `write` → Hub write through the resource, `search` → `grep -rnF <text> /ws/<folder>` filtered by glob
-    - FUSE mode: mounts the same workspace at `mountpoint`; `search` runs the zip's `bin/rg -F -n`; `list`/`read` use `os` calls on the mount
+  - `hub_resource(hub: ResourceHubClient) -> GenericResource` — a Mirage resource whose ops call the Hub (Mirage never touches S3)
+  - `MAX_READ_BYTES_OP = 1024**3` — `read_bytes` (which Mirage uses for `grep` and `wc`) refuses larger files with `ResourceTooLarge`, so a 5 GB whole-file load becomes a recorded finding instead of an out-of-memory crash
+  - `MirageMethod(hub, *, fuse: bool, mountpoint: str = "/mnt/ws")` implementing the Task 20 `Method` protocol, with **every op going through Mirage**:
+    - SDK mode: `list` → `find /ws/<folder> -type f`; `read` → `cat /ws/<path> > /dev/null` (Mirage streams this through `read_stream`) and returns the size from `stat`; `write` → `tee /ws/<path>` with the data on stdin; `search` → `grep -rnF <text> /ws/<folder>`
+    - FUSE mode: `workspace.add_fuse_mount("/ws", mountpoint)`; `list`/`read`/`write` use `os`/file calls on the mount; `search` runs the zip's `bin/rg -F -n`
 
-Mirage 0.0.6 is a preview library, and its extension API is not documented at a stable URL. **Step 1 reads the installed source; the code in Step 3 follows what 0.0.6 ships and must be matched to it exactly.** The test in Step 2 is the proof that the adapter is right.
+**Mirage 0.0.6 facts this task relies on (verified by running Mirage 0.0.6 against a fake Hub while writing this plan):**
+- Op signatures (`mirage/commands/builtin/generic_bind/adapter.py`): `readdir(accessor, path, /, index=...) -> list[str]`; `read_bytes(accessor, path, /, index=...) -> bytes`; `read_stream(accessor, path, /, index=...) -> AsyncIterator[bytes]`; `stat(accessor, path, /, index=...) -> FileStat`; `read_range(accessor, path, /, index=..., offset=..., size=None) -> bytes`; `write(accessor, path, data, /) -> None`; `is_mounted(accessor, /) -> bool` (**sync**).
+- `readdir` must return **full virtual paths** (mount prefix + resource path), for example `/ws/bench/small/f00.txt`; compute the prefix with `mirage.utils.key_prefix.mount_prefix_of(path.virtual, path.resource_path)`. Returning bare names makes `find` print basenames and `grep -r` find nothing.
+- `Workspace(resources, mode=MountMode.WRITE)` is needed for writes; `execute(command, stdin=bytes)` returns an `IOResult` whose `stdout` is `bytes` and which has `exit_code`.
+- `find` uses readdir+stat; `wc -c` and `grep -r` use `read_bytes` (whole file); `cat` uses `read_stream`; `tee` uses `write`.
+- FUSE is `Workspace.add_fuse_mount(prefix, mountpoint=None, session_id=None, backend="fuse") -> str`; `remove_fuse_mount(prefix)` and `close()` tear it down. It needs the `fuse` extra (`mfusepy`) and `/dev/fuse`.
 
-- [ ] **Step 1: Read the Mirage extension API in the installed package**
+- [ ] **Step 1: Add `read` to the shared fake Hub**
 
-Run: `.venv/bin/python -c "import mirage, pathlib; print(pathlib.Path(mirage.__file__).parent)"` and read:
-- `resource/generic.py` — `GenericResource(name=, accessor=, io=CommandIO(...))`
-- `commands/builtin/generic_bind/adapter.py` — `CommandIO` fields and the op type aliases (`ReaddirOp`, `ReadBytesOp`, `ReadStreamOp`, `StatOp`, `IsMountedOp`, `ReadRangeOp`, `WriteOp`); note each alias's exact parameter list (they take `(accessor, path: PathSpec, index, ...)`)
-- `resource/ram/ram.py` — a complete small backend to copy shapes from
-- `types.py` — `FileStat`, `FileType`, `PathSpec.resource_path`
-- `workspace/workspace/workspace.py` and `workspace/fuse.py` — how a `Workspace` is mounted over FUSE, and `execute`/`close`
+In `tests/test_bench_methods.py`, make `FakeHub.stat` raise the Hub's real error for a missing file or a folder (the real Hub answers `404`), and add `read`:
 
-Write the exact signatures you found as a comment block at the top of `mirage_resource.py`.
+```python
+    async def stat(self, path: str) -> int:
+        from agentcore_platform_poc.agent_platform.hub_client import HubError
+
+        if path not in self.files:
+            raise HubError(404, "not_found")
+        return len(self.files[path])
+
+    async def read(self, path: str, offset: int = 0, length: int | None = None) -> bytes:
+        self.requests_made += 1
+        data = self.files[path][offset:]
+        return data if length is None else data[:length]
+```
 
 - [ ] **Step 2: Write the failing test**
 
@@ -6804,62 +6979,76 @@ Write the exact signatures you found as a comment block at the top of `mirage_re
 # tests/test_bench_mirage.py
 from __future__ import annotations
 
-from typing import Any
+import pytest
 
-from agentcore_platform_poc.bench_agent.mirage_resource import MirageMethod
-from agentcore_platform_poc.bench_fixtures import NEEDLE, text
+from agentcore_platform_poc.bench_agent.mirage_resource import MAX_READ_BYTES_OP, MirageMethod, ResourceTooLarge, _read_bytes, HubAccessor
+from agentcore_platform_poc.bench_fixtures import NEEDLE
 from tests.test_bench_methods import EXPECTED, FakeHub
 
 
-async def test_mirage_sdk_list_read_search_write() -> None:
+async def test_mirage_sdk_ops_all_go_through_mirage_and_the_hub() -> None:
     hub = FakeHub()
     method = MirageMethod(hub, fuse=False)  # type: ignore[arg-type]
     try:
         assert await method.list("bench/small") == ["bench/small/big.txt", "bench/small/f00.txt", "bench/small/f03.txt"]
         assert await method.read("bench/small/f00.txt") == 10_000
         assert await method.search("bench/small", "bench/small/*", NEEDLE) == EXPECTED
+        before = hub.requests_made
         await method.write("bench/small/w.txt", b"hello")
         assert hub.files["bench/small/w.txt"] == b"hello"
+        assert await method.list("bench/small") == ["bench/small/big.txt", "bench/small/f00.txt", "bench/small/f03.txt", "bench/small/w.txt"]
+        assert hub.requests_made > before
     finally:
         await method.close()
 
 
-async def test_mirage_reads_go_through_the_hub() -> None:
-    hub = FakeHub()
-    method = MirageMethod(hub, fuse=False)  # type: ignore[arg-type]
-    try:
-        await method.read("bench/small/big.txt")
-        assert hub.requests_made >= 1
-    finally:
-        await method.close()
+async def test_read_bytes_refuses_huge_files() -> None:
+    class HugeHub(FakeHub):
+        async def stat(self, path: str) -> int:
+            return MAX_READ_BYTES_OP + 1
+
+    class P:
+        virtual = "/ws/x"
+        resource_path = "x"
+
+    with pytest.raises(ResourceTooLarge):
+        await _read_bytes(HubAccessor(HugeHub()), P())  # type: ignore[arg-type]
 ```
 
-- [ ] **Step 3: Implement the adapter (match Step 1's signatures)**
+- [ ] **Step 3: Run to verify failure**
+
+Run: `.venv/bin/python -m pytest tests/test_bench_mirage.py -q`
+Expected: FAIL (`ModuleNotFoundError`).
+
+- [ ] **Step 4: Implement**
 
 ```python
 # src/agentcore_platform_poc/bench_agent/mirage_resource.py
-"""Mirage over the Resource Hub: a GenericResource whose IO calls the Hub, never S3.
-
-Signatures confirmed against mirage-ai==0.0.6 (Step 1 of Task 21):
-  <paste the op aliases you read here>
-"""
+"""Mirage over the Resource Hub: a GenericResource whose IO calls the Hub, never S3."""
 
 from __future__ import annotations
 
 import asyncio
 import fnmatch
 import os
-import re
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
 from mirage import GenericResource, Workspace
 from mirage.accessor.base import Accessor
 from mirage.commands.builtin.generic_bind.adapter import CommandIO
-from mirage.types import FileStat, FileType
+from mirage.types import FileStat, FileType, MountMode
+from mirage.utils.key_prefix import mount_prefix_of
 
 from agentcore_platform_poc.agent_platform.hub_client import HubError, ResourceHubClient
 from agentcore_platform_poc.bench_agent.methods import RG, DirectMethod
+
+MAX_READ_BYTES_OP = 1024**3
+
+
+class ResourceTooLarge(Exception):
+    """Mirage asked for a whole file larger than MAX_READ_BYTES_OP (recorded as a finding)."""
 
 
 class HubAccessor(Accessor):
@@ -6869,48 +7058,54 @@ class HubAccessor(Accessor):
 
 
 def _rel(path: Any) -> str:
-    return str(getattr(path, "resource_path", path)).strip("/")
+    return str(path.resource_path).strip("/")
 
 
-async def _readdir(accessor: HubAccessor, path: Any, index: Any) -> list[str]:
+async def _readdir(accessor: HubAccessor, path: Any, /, index: Any = None) -> list[str]:
     folder = _rel(path)
-    entries = await accessor.hub.list(folder)
-    names = set()
-    for entry in entries:
-        rest = entry["path"][len(folder) + 1 :] if folder else entry["path"]
-        names.add(rest.split("/", 1)[0])
-    return sorted(names)
+    prefix = f"{folder}/" if folder else ""
+    children = sorted({e["path"][len(prefix):].split("/", 1)[0] for e in await accessor.hub.list(folder)})
+    mount = mount_prefix_of(path.virtual, path.resource_path).rstrip("/")
+    return [f"{mount}/{prefix}{child}" for child in children]
 
 
-async def _stat(accessor: HubAccessor, path: Any, index: Any) -> FileStat:
+async def _stat(accessor: HubAccessor, path: Any, /, index: Any = None) -> FileStat:
     rel = _rel(path)
-    try:
-        size = await accessor.hub.stat(rel)
-        return FileStat(name=os.path.basename(rel), size=size, type=FileType.FILE)
-    except HubError:
-        if await accessor.hub.list(rel):
-            return FileStat(name=os.path.basename(rel) or "/", type=FileType.DIRECTORY)
-        raise FileNotFoundError(rel) from None
+    name = os.path.basename(rel) or "/"
+    if rel:
+        try:
+            return FileStat(name=name, size=await accessor.hub.stat(rel), type=FileType.FILE)
+        except HubError as error:
+            if error.status not in (400, 404):
+                raise
+    if not rel or await accessor.hub.list(rel):
+        return FileStat(name=name, type=FileType.DIRECTORY)
+    raise FileNotFoundError(rel)
 
 
-async def _read_bytes(accessor: HubAccessor, path: Any, index: Any) -> bytes:
-    return b"".join([part async for part in accessor.hub.iter_chunks(_rel(path))])
+async def _read_bytes(accessor: HubAccessor, path: Any, /, index: Any = None) -> bytes:
+    rel = _rel(path)
+    if await accessor.hub.stat(rel) > MAX_READ_BYTES_OP:
+        raise ResourceTooLarge(rel)
+    return b"".join([part async for part in accessor.hub.iter_chunks(rel)])
 
 
-async def _read_stream(accessor: HubAccessor, path: Any, index: Any) -> Any:
+async def _read_stream(accessor: HubAccessor, path: Any, /, index: Any = None) -> AsyncIterator[bytes]:
     async for part in accessor.hub.iter_chunks(_rel(path)):
         yield part
 
 
-async def _read_range(accessor: HubAccessor, path: Any, index: Any, offset: int, size: int) -> bytes:
-    return await accessor.hub.read(_rel(path), offset, size)
+async def _read_range(accessor: HubAccessor, path: Any, /, index: Any = None, offset: int = 0, size: int | None = None) -> bytes:
+    rel = _rel(path)
+    length = size if size is not None else await accessor.hub.stat(rel) - offset
+    return await accessor.hub.read(rel, offset, length)
 
 
-async def _write(accessor: HubAccessor, path: Any, data: bytes, *args: Any, **kwargs: Any) -> None:
-    await accessor.hub.write(_rel(path), data)
+async def _write(accessor: HubAccessor, path: Any, data: bytes, /) -> None:
+    await accessor.hub.write(_rel(path), bytes(data))
 
 
-async def _is_mounted(accessor: HubAccessor, path: Any, index: Any) -> bool:
+def _is_mounted(accessor: HubAccessor, /) -> bool:
     return True
 
 
@@ -6922,31 +7117,35 @@ def hub_resource(hub: ResourceHubClient) -> GenericResource:
     return GenericResource(name="hub", accessor=HubAccessor(hub), io=io, sizes_always_known=True)
 
 
-_GREP = re.compile(r"^/ws/(?P<path>[^:]+):(?P<line>\d+):")
-
-
 class MirageMethod(DirectMethod):
     def __init__(self, hub: ResourceHubClient, *, fuse: bool, mountpoint: str = "/mnt/ws") -> None:
         super().__init__(hub)
         self.fuse = fuse
         self.mountpoint = mountpoint
         self._workspace: Workspace | None = None
+        self._mounted: str | None = None
 
     async def _ws(self) -> Workspace:
         if self._workspace is None:
-            resources = {"/ws": hub_resource(self.hub)}
-            self._workspace = Workspace(resources, fuse=self.mountpoint) if self.fuse else Workspace(resources)
+            self._workspace = Workspace({"/ws": hub_resource(self.hub)}, mode=MountMode.WRITE)
+            if self.fuse:
+                self._mounted = self._workspace.add_fuse_mount("/ws", self.mountpoint)
         return self._workspace
 
-    async def _run(self, command: str) -> str:
-        result = await (await self._ws()).execute(command)
-        return str(getattr(result, "stdout", result) or "")
+    async def _run(self, command: str, stdin: bytes | None = None) -> str:
+        result = await (await self._ws()).execute(command, stdin=stdin)
+        if result.exit_code not in (0, 1):  # grep exits 1 when nothing matches
+            raise RuntimeError(f"mirage exit {result.exit_code}: {(result.stderr or b'')[:200]!r}")
+        out = result.stdout or b""
+        return out.decode() if isinstance(out, bytes) else str(out)
+
+    def _mount(self) -> Path:
+        return Path(self._mounted or self.mountpoint)
 
     async def list(self, folder: str) -> list[str]:
         await self._ws()
         if self.fuse:
-            base = Path(self.mountpoint) / "ws"
-            return sorted(str(p.relative_to(base)) for p in (base / folder).rglob("*") if p.is_file())
+            return sorted(str(p.relative_to(self._mount())) for p in (self._mount() / folder).rglob("*") if p.is_file())
         out = await self._run(f"find /ws/{folder} -type f")
         return sorted(line.removeprefix("/ws/") for line in out.splitlines() if line)
 
@@ -6954,43 +7153,56 @@ class MirageMethod(DirectMethod):
         await self._ws()
         if self.fuse:
             total = 0
-            with open(Path(self.mountpoint) / "ws" / path, "rb") as handle:  # noqa: ASYNC230 - benchmark measures the mount
+            with open(self._mount() / path, "rb") as handle:  # noqa: ASYNC230 - the benchmark measures the mount
                 while chunk := handle.read(4 * 1024 * 1024):
                     total += len(chunk)
             return total
-        return int((await self._run(f"wc -c < /ws/{path}")).strip().split()[0])
+        await self._run(f"cat /ws/{path} > /dev/null")  # streams through read_stream
+        return await self.hub.stat(path)
+
+    async def write(self, path: str, data: bytes) -> None:
+        await self._ws()
+        if self.fuse:
+            (self._mount() / path).write_bytes(data)  # noqa: ASYNC240 - the benchmark measures the mount
+        else:
+            await self._run(f"tee /ws/{path} > /dev/null", stdin=data)
 
     async def search(self, folder: str, glob: str, text: str) -> list[tuple[str, int]]:
         await self._ws()
         if self.fuse:
             process = await asyncio.create_subprocess_exec(
-                str(RG), "-F", "-n", "--no-heading", "--with-filename", text, f"ws/{folder}",
-                cwd=self.mountpoint, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                str(RG), "-F", "-n", "--no-heading", "--with-filename", text, folder,
+                cwd=self._mount(), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
             out = (await process.communicate())[0].decode()
-            pairs = [(p.removeprefix("ws/"), int(n)) for p, n, _ in (line.split(":", 2) for line in out.splitlines())]
         else:
-            out = await self._run(f"grep -rnF '{text}' /ws/{folder}")
-            pairs = [(m["path"], int(m["line"])) for m in map(_GREP.match, out.splitlines()) if m]
+            out = await self._run(f"grep -rnF {text} /ws/{folder}")
+        pairs = []
+        for line in out.splitlines():
+            path, number, _rest = line.split(":", 2)
+            pairs.append((path.removeprefix("/ws/"), int(number)))
         return sorted(p for p in pairs if fnmatch.fnmatchcase(p[0], glob))
 
     async def close(self) -> None:
         if self._workspace is not None:
+            if self._mounted:
+                self._workspace.remove_fuse_mount("/ws")
             await self._workspace.close()
             self._workspace = None
+            self._mounted = None
 ```
 
-If Step 1 shows different names (for example `Workspace(..., fuse=...)` is a method, or `execute` returns a result object with another field), change only those call sites. The `NEEDLE` text contains no shell-special characters, so single-quoting it in `grep` is safe for this benchmark.
+`NEEDLE` (`POC3-NEEDLE-7f3a`) has no shell-special characters, so passing it unquoted to Mirage's `grep` is safe for this benchmark. If the test fails inside Mirage, compare against the facts above (they were checked against 0.0.6); do not weaken the test.
 
-- [ ] **Step 4: Run the tests**
+- [ ] **Step 5: Run the tests**
 
-Run: `.venv/bin/python -m pytest tests/test_bench_mirage.py -q`
-Expected: PASS. If it fails inside Mirage, the adapter does not match 0.0.6: return to Step 1. Do not weaken the test.
+Run: `.venv/bin/python -m pytest tests/test_bench_mirage.py tests/test_bench_methods.py -q`
+Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add src/agentcore_platform_poc/bench_agent/mirage_resource.py tests/test_bench_mirage.py
+git add src/agentcore_platform_poc/bench_agent/mirage_resource.py tests/test_bench_mirage.py tests/test_bench_methods.py
 git commit -m "feat(bench): add Mirage resource over the Resource Hub (SDK and FUSE modes)"
 ```
 
@@ -7009,7 +7221,7 @@ git commit -m "feat(bench): add Mirage resource over the Resource Hub (SDK and F
   - `percentile(values: list[float], q: float) -> float` (nearest rank)
   - `summarize(rows: list[dict], expected: dict[str, str]) -> list[dict]` — per `(method, op, target)`: `n`, `cold_ms`, `p50`, `p95` (only when n ≥ 20), `median`, `max`, `mb_per_s` (reads), `correct` (every row's digest equals `expected[target]` when present), `verdict` (`pass`/`fail`/`recorded`/`invalid`)
   - `render_markdown(summary) -> str`
-  - `.venv/bin/python -m scripts.run_bench --user a --plan evidence/bench/plan.json` — builds the randomized case list (30 reps for small ops, 5 for large reads/search), calls `/bench` one case per request (new session ID for each cold case), appends rows to `evidence/bench/rows.jsonl`, skips rows already present (key `method|op|target|rep`), then writes `evidence/bench/summary.md`
+  - `.venv/bin/python -m scripts.run_bench --user a` — builds the randomized case list (30 warm reps for small ops, 5 for large reads/search, plus one cold rep 0 each), calls `/bench` one case per request, uses one Runtime session per `(method, op, target)` (rep 0 cold in a new session, warm reps in the same session), appends rows to `evidence/bench/rows.jsonl`, skips only successful rows on rerun, stops with a message on a `401` from the unified API, then writes `evidence/bench/summary.md`
   - Live gate (`POC3_LIVE=1 .venv/bin/python -m pytest tests/integration/test_platform_live.py -m integration -s`)
 
 - [ ] **Step 1: Write the failing report tests**
@@ -7211,19 +7423,28 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=7)
     args = parser.parse_args(argv)
     api = os.environ.get("POC3_UNIFIED_API_URL", "http://127.0.0.1:8300")
-    token = TokenStore().load(args.user, "api")
     ROWS.parent.mkdir(parents=True, exist_ok=True)
-    done = {json.loads(line)["key"] for line in ROWS.read_text().splitlines()} if ROWS.exists() else set()
-    session = f"poc3-{uuid.uuid4().hex}"
+    rows_so_far = [json.loads(line) for line in ROWS.read_text().splitlines()] if ROWS.exists() else []
+    done = {r["key"] for r in rows_so_far if r.get("ok")}  # failed cases are retried on rerun
+    # One Runtime session per (method, op, target): rep 0 is the cold case in a new session; its
+    # warm repetitions reuse that session, so they hit the same microVM and method instance.
+    sessions = {r["key"].rsplit("|", 1)[0]: r["session_id"] for r in rows_so_far if r.get("ok")}
     for case in plan(args.seed):
         key = f"{case['method']}|{case['op']}|{case['target']}|{case['rep']}"
+        group = key.rsplit("|", 1)[0]
         if key in done:
             continue
-        if case["fresh"]:
-            session = f"poc3-{uuid.uuid4().hex}"  # cold = new Runtime session and new method instance
-        body = {"case": {k: case[k] for k in ("method", "op", "target", "text", "fresh")}, "session_id": session}
-        response = httpx.post(f"{api}/bench", json=body, headers={"authorization": f"Bearer {token}"}, timeout=960).json()
-        row = response.get("result", {}) | {"key": key, "rep": case["rep"], "session_id": session}
+        if case["fresh"] or group not in sessions:
+            sessions[group] = f"poc3-{uuid.uuid4().hex}"
+            case = case | {"fresh": True}
+        token = TokenStore().load(args.user, "api")  # re-read: the user may have signed in again
+        body = {"case": {k: case[k] for k in ("method", "op", "target", "text", "fresh")}, "session_id": sessions[group]}
+        http_response = httpx.post(f"{api}/bench", json=body, headers={"authorization": f"Bearer {token}"}, timeout=960)
+        if http_response.status_code == 401:
+            print("caller token expired: run `-m scripts.platform_cli login --user a`, then rerun this command")
+            return 2
+        response = http_response.json()
+        row = response.get("result", {}) | {"key": key, "rep": case["rep"], "session_id": sessions[group]}
         with ROWS.open("a") as handle:
             handle.write(json.dumps(row) + "\n")
         print(key, row.get("ok"), row.get("ms"), row.get("error") or "")
@@ -7234,7 +7455,11 @@ def main(argv: list[str] | None = None) -> int:
         from agentcore_platform_poc.bench_agent.methods import digest
 
         expected[f"{prefix}|{prefix}/*"] = digest([tuple(m) for m in matches])
-    rows = [json.loads(line) for line in ROWS.read_text().splitlines()]
+    latest: dict[str, dict[str, object]] = {}
+    for line in ROWS.read_text().splitlines():
+        row = json.loads(line)
+        latest[str(row["key"])] = row  # a retried case replaces its earlier failure
+    rows = list(latest.values())
     Path("evidence/bench/summary.md").write_text(render_markdown(summarize(rows, expected)))
     print("wrote evidence/bench/summary.md")
     return 0
@@ -7311,6 +7536,18 @@ def _keys(out: dict[str, str], prefix: str) -> set[str]:
     return {item["Key"] for page in pages for item in page.get("Contents", [])}
 
 
+def _png_chunks(data: bytes, kind: bytes) -> list[int]:
+    import struct
+
+    offsets, i = [], 8
+    while i + 8 <= len(data):
+        length = struct.unpack(">I", data[i : i + 4])[0]
+        if data[i + 4 : i + 8] == kind:
+            offsets.append(i)
+        i += 12 + length
+    return offsets
+
+
 def _world_bank(codes: list[str]) -> dict[str, tuple[int, float]]:
     url = f"https://api.worldbank.org/v2/country/{';'.join(codes)}/indicator/NY.GDP.PCAP.PP.CD?format=json&mrnev=1&per_page=100"
     rows = httpx.get(url, timeout=60).json()[1] or []
@@ -7332,11 +7569,19 @@ def test_q5_research_run(out: dict[str, str], user: str, region: str) -> None:
     got = {r["iso3"]: (int(r["year"]), float(r["value"])) for r in data}
     ok_data = set(got) == set(expected) and all(got[k][0] == expected[k][0] and abs(got[k][1] - expected[k][1]) <= max(1.0, 0.001 * expected[k][1]) for k in expected)
     chart = _hub_get(out, user, "chart.png").content
+    import struct
+    import zlib
+
+    width, height = struct.unpack(">II", chart[16:24]) if len(chart) > 24 else (0, 0)
+    idat = b"".join(chart[i + 8 : i + 8 + struct.unpack(">I", chart[i : i + 4])[0]] for i in _png_chunks(chart, b"IDAT"))
+    pixels = zlib.decompress(idat) if idat else b""
     report = _hub_get(out, user, "report.md")
     after_other = _keys(out, f"users/{other}/")
     _note("Q5", ok_data, user=user, countries=len(got), files=body.get("files_written"), turns=body.get("turns"))
     assert ok_data, (got, expected)
-    assert chart.startswith(b"\x89PNG\r\n\x1a\n")
+    assert chart.startswith(b"\x89PNG\r\n\x1a\n") and chart[12:16] == b"IHDR"
+    assert width >= 300 and height >= 200, (width, height)
+    assert len(set(pixels)) > 8, "chart image looks blank"
     assert report.status_code == 200 and report.text.strip()
     assert after_other == before_other, "a run must never write to the other user's prefix"
 
@@ -7363,7 +7608,9 @@ def test_q6_hub_isolation_direct(out: dict[str, str]) -> None:
     hub = out["resource_hub_url"]
     research = _app_token(env["POC3_RESEARCH_AGENT_CLIENT_ID"], env["TF_VAR_research_agent_client_secret"], f"api://{env['POC3_HUB_APP_ID']}/.default")
     bench = _app_token(env["POC3_BENCH_AGENT_CLIENT_ID"], env["TF_VAR_bench_agent_client_secret"], f"api://{env['POC3_HUB_APP_ID']}/.default")
-    signer = KmsSigner(boto3.client("kms", region_name=out["aws_region"]), out["grant_kms_key_id"])
+    creds = boto3.client("sts").assume_role(RoleArn=out["grant_signer_role_arn"], RoleSessionName="poc3-live")["Credentials"]
+    kms = boto3.client("kms", region_name=out["aws_region"], aws_access_key_id=creds["AccessKeyId"], aws_secret_access_key=creds["SecretAccessKey"], aws_session_token=creds["SessionToken"])
+    signer = KmsSigner(kms, out["grant_kms_key_id"])
     now = int(time.time())
     grant_a = issue_grant(signer, sub=env["POC3_USER_A_OID"], agent=env["POC3_RESEARCH_AGENT_CLIENT_ID"], sid="live", ttl_seconds=300, now=now)
     short = issue_grant(signer, sub=env["POC3_USER_A_OID"], agent=env["POC3_RESEARCH_AGENT_CLIENT_ID"], sid="live", ttl_seconds=1, now=now)
@@ -7384,6 +7631,19 @@ def test_q6_hub_isolation_direct(out: dict[str, str]) -> None:
     }
     _note("Q6.hub_direct", all(checks.values()), **checks)
     assert all(checks.values()), checks
+
+
+def test_q6_only_signer_role_can_sign(out: dict[str, str]) -> None:
+    from botocore.exceptions import ClientError
+
+    kms = boto3.client("kms", region_name=out["aws_region"])  # operator credentials, not the signer role
+    try:
+        kms.sign(KeyId=out["grant_kms_key_id"], Message=b"x", MessageType="RAW", SigningAlgorithm="ECDSA_SHA_256")
+        denied = False
+    except ClientError as error:
+        denied = error.response["Error"]["Code"] == "AccessDeniedException"
+    _note("Q6.kms_sign_restricted", denied)
+    assert denied
 
 
 def test_q6_runtime_roles_cannot_reach_workspace_bucket(out: dict[str, str]) -> None:
@@ -7407,12 +7667,19 @@ def test_q6_sandbox_has_no_s3(out: dict[str, str]) -> None:
 
     client = CodeInterpreter(out["aws_region"])
     client.start(identifier=out["code_interpreter_id"])
+    bucket = out["workspace_bucket"]
+    code = (
+        "import boto3\nc = boto3.client('s3')\nr = []\n"
+        f"for f in (lambda: c.get_object(Bucket='{bucket}', Key='users/probe/x'), lambda: c.put_object(Bucket='{bucket}', Key='users/probe/x', Body=b'x')):\n"
+        "    try:\n        f(); r.append('allowed')\n    except Exception as e:\n        r.append(type(e).__name__)\nprint(r)\n"
+    )
     try:
-        result = parse_tool_result(client.execute_code("import boto3\nprint(boto3.client('s3').list_buckets()['Buckets'][:1])"))
+        result = parse_tool_result(client.execute_code(code))
     finally:
         client.stop()
-    _note("Q6.sandbox_no_s3", result.failed, output=result.output[:200])
-    assert result.failed
+    denied = "allowed" not in result.output and bool(result.output.strip())
+    _note("Q6.sandbox_no_s3", denied, output=result.output[:200])
+    assert denied
 
 
 def test_q2_runtime_rejects_wrong_audience(out: dict[str, str]) -> None:
@@ -7439,7 +7706,7 @@ def test_q1_deploy_no_drift_new_session_runs_new_build(out: dict[str, str]) -> N
     assert body.get("build_id") == expected_build
 ```
 
-Add to `.env` (Task 23 Step 3 gets the values from the CLI tokens): `POC3_USER_A_OID`, `POC3_USER_B_OID`.
+Add to `.env` (Task 23 Step 4 gets the values from the CLI tokens): `POC3_USER_A_OID`, `POC3_USER_B_OID`.
 
 - [ ] **Step 6: Run the local tests and confirm the live gate skips**
 
@@ -7448,7 +7715,7 @@ Expected: report tests PASS; live gate `SKIPPED` (no `POC3_LIVE`).
 
 - [ ] **Step 7: Write the runbook section**
 
-Add a "Phase 3a platform plumbing" section to `docs/runbook.md` that lists, in order, the commands of Task 23 Steps 1–9 (copy them verbatim), plus: "If `apply` or any live call fails with an auth error, run `aws sso login` first."
+Add a "Phase 3a platform plumbing" section to `docs/runbook.md` that lists, in order, the commands of Task 23 Steps 1–10 (copy them verbatim), plus: "If `apply` or any live call fails with an auth error, run `aws sso login` first."
 
 - [ ] **Step 8: Run the full local gate and commit**
 
@@ -7464,7 +7731,7 @@ git commit -m "feat: add Phase 3a live gate, benchmark runner, and report"
 
 ### Task 23: Deploy and run the live gate, expiry test, and benchmark (OPERATOR-RUN)
 
-Prerequisites: Task 7 passed; Tasks 8–22 committed; `aws sso login` fresh; gateway sim and tunnel running with `GATEWAY_MAX_OUTPUT_TOKENS=8192`, `GATEWAY_MAX_BODY_BYTES=2000000`, `GATEWAY_ALLOWED_CALLER_IDS=$POC3_RESEARCH_AGENT_CLIENT_ID`, `GATEWAY_APP_CLIENT_ID=$POC3_GATEWAY_APP_ID`, and the agent model on `GATEWAY_ANTHROPIC_MODELS`.
+Prerequisites: Task 7 passed; Tasks 8–22 committed; `aws sso login` fresh; gateway sim and tunnel running with the Task 7 settings.
 
 - [ ] **Step 1: Deploy all components through the CD path**
 
@@ -7478,14 +7745,37 @@ set -a; source .env; set +a
 
 Expected: three successful deploys; `plan` exits 0. Record the three S3 version IDs (needed for rollback) in `evidence/raw/task23-notes.md`.
 
-- [ ] **Step 2: Start the unified API (separate terminal)**
+- [ ] **Step 2: Probe 4 — KMS-signed grant verified by the deployed Resource Hub (hard gate)**
+
+```bash
+.venv/bin/python - <<'PY'
+import os, time, boto3, httpx, msal
+from pathlib import Path
+from agentcore_platform_poc.grant import KmsSigner, issue_grant
+from scripts.terraform_outputs import load_terraform_outputs
+out, env = load_terraform_outputs(Path("infra/terraform/platform")), os.environ
+creds = boto3.client("sts").assume_role(RoleArn=out["grant_signer_role_arn"], RoleSessionName="poc3-probe4")["Credentials"]
+kms = boto3.client("kms", region_name=out["aws_region"], aws_access_key_id=creds["AccessKeyId"], aws_secret_access_key=creds["SecretAccessKey"], aws_session_token=creds["SessionToken"])
+grant = issue_grant(KmsSigner(kms, out["grant_kms_key_id"]), sub="00000000-0000-0000-0000-00000000000a", agent=env["POC3_RESEARCH_AGENT_CLIENT_ID"], sid="probe4", ttl_seconds=300, now=int(time.time()))
+app = msal.ConfidentialClientApplication(env["POC3_RESEARCH_AGENT_CLIENT_ID"], client_credential=env["TF_VAR_research_agent_client_secret"], authority=f"https://login.microsoftonline.com/{env['POC3_TENANT_ID']}")
+token = app.acquire_token_for_client(scopes=[f"api://{env['POC3_HUB_APP_ID']}/.default"])["access_token"]
+r = httpx.get(f"{out['resource_hub_url']}/v1/list/", headers={"authorization": f"Bearer {token}", "x-resource-grant": grant}, timeout=30)
+print("probe4", r.status_code, r.text[:200])
+PY
+```
+
+Expected: `probe4 200 {"entries": []}` (a fake user with an empty prefix). **A `401 grant_invalid` means the DER → raw conversion or the public key wiring is wrong: stop and fix before continuing.**
+
+- [ ] **Step 3: Start the unified API (separate terminal)**
 
 ```bash
 set -a; source .env; set +a
 .venv/bin/uvicorn --factory agentcore_platform_poc.unified_api.app:create_production_app --port 8300
 ```
 
-- [ ] **Step 3: Sign in both users and upload briefs**
+The signer role's assumed credentials last 1 hour; restart the unified API if a later step reports a KMS `ExpiredToken`.
+
+- [ ] **Step 4: Sign in both users and upload briefs**
 
 ```bash
 .venv/bin/python -m scripts.platform_cli login --user a   # sign in as User A
@@ -7496,7 +7786,7 @@ set -a; source .env; set +a
 
 Get each user's `oid` from their hub token (`python -c "import jwt,json;print(jwt.decode(json.load(open('.poc3-tokens.json'))['a']['hub'],options={'verify_signature':False})['oid'])"`), and add `POC3_USER_A_OID` / `POC3_USER_B_OID` to `.env`.
 
-- [ ] **Step 4: Start the raw-token expiry test clock (Q7)**
+- [ ] **Step 5: Start the raw-token expiry test clock (Q7)**
 
 ```bash
 mkdir -p .poc3-expiry && chmod 700 .poc3-expiry
@@ -7507,45 +7797,35 @@ Restart the unified API with `POC3_EXPIRY_TEST_MODE=true POC3_MAX_GRANT_TTL_S=72
 
 ```bash
 .venv/bin/python -m scripts.platform_cli grant --user a --ttl 7200 --out .poc3-expiry/grant
-python3 -c "import jwt;print(jwt.decode(open('.poc3-expiry/hub-token').read(),options={'verify_signature':False})['exp'])"
+python3 -c "import jwt;print('user token exp', jwt.decode(open('.poc3-expiry/hub-token').read(),options={'verify_signature':False})['exp'])"
 ```
 
-Record the token `exp` (Unix time). Restart the unified API without expiry mode for Steps 5–7.
+Record the token `exp` (Unix time). Restart the unified API without expiry mode for Steps 6–7.
 
-- [ ] **Step 5: Run the live gate**
+- [ ] **Step 6: Run the live gate**
 
 ```bash
-POC3_LIVE=1 .venv/bin/python -m pytest tests/integration/test_platform_live.py -m integration -s
+POC3_LIVE=1 .venv/bin/python -m pytest tests/integration/test_platform_live.py -m integration -s -k "not q1"
 ```
 
-Expected: all pass. Results are appended to `evidence/raw/phase3-live.jsonl`. After the run, download each user's chart for the findings: `.venv/bin/python -m scripts.platform_cli get --user a --path chart.png --out evidence/raw/chart-a.png` (and `b`).
-
-- [ ] **Step 6: Seed fixtures and run the benchmark**
-
-```bash
-.venv/bin/python -m scripts.seed_bench_fixtures --user-oid "$POC3_USER_A_OID" --workspace small
-.venv/bin/python -m scripts.seed_bench_fixtures --user-oid "$POC3_USER_A_OID" --workspace large
-.venv/bin/python -m scripts.run_bench --user a
-```
-
-Expected: `evidence/bench/summary.md` exists. The run is resumable: if it stops (SSO expiry, network), run `aws sso login` and rerun the same command.
+Expected: all pass. Results are appended to `evidence/raw/phase3-live.jsonl`. Download each user's chart for the findings: `.venv/bin/python -m scripts.platform_cli get --user a --path chart.png --out evidence/raw/chart-a.png` (and `b`).
 
 - [ ] **Step 7: Redeploy and roll back (Q1)**
 
 ```bash
-.venv/bin/python -m scripts.deploy_agent research          # new build_id (timestamped)
-POC3_LIVE=1 .venv/bin/python -m pytest tests/integration/test_platform_live.py -m integration -k q1 -s
+POC3_LIVE=1 .venv/bin/python -m pytest tests/integration/test_platform_live.py -m integration -k q1 -s   # deploys a new build, checks no drift and build_id
 .venv/bin/python -m scripts.deploy_agent research --version-id <Step 1 research version>
 .venv/bin/python -m scripts.platform_cli research --user a --prompt "Reply with the single word ok. Do not use tools."
 ```
 
-Expected: after rollback, a new session reports the Step 1 `build_id` (the CLI prints a new session each call).
+Expected: after rollback, the new session (the CLI creates one per call) reports the Step 1 `build_id`.
 
-- [ ] **Step 8: Finish the expiry test after the token's `exp` has passed**
+- [ ] **Step 8: Finish the expiry test as soon as the token's `exp` has passed — before the benchmark**
 
-Enable raw mode on the Hub and expiry mode on the unified API:
+Wait until `date +%s` is past the recorded `exp`. Then check the control grant still has time left, enable raw mode, and run the pair:
 
 ```bash
+python3 -c "import jwt,time;left=jwt.decode(open('.poc3-expiry/grant').read(),options={'verify_signature':False})['exp']-time.time();print('grant seconds left',int(left));assert left>600, 'control grant too close to expiry: redo Step 5'"
 (cd infra/terraform/platform && terraform apply -var allow_raw_user_token=true)
 # restart the unified API with POC3_EXPIRY_TEST_MODE=true POC3_MAX_GRANT_TTL_S=7200
 .venv/bin/python -m scripts.platform_cli login --user a    # fresh api token (the old one expired too)
@@ -7554,11 +7834,21 @@ Enable raw mode on the Hub and expiry mode on the unified API:
 (cd infra/terraform/platform && terraform apply -var allow_raw_user_token=false)
 ```
 
-Expected: the raw run's `tool_calls` include `ws_list` and its summary reports `token_expired` (the Hub returned `401 token_expired`); the grant run lists the files. Record both in `evidence/raw/task23-notes.md`. Confirm with the Lambda log: `aws logs filter-log-events --log-group-name /aws/lambda/poc3-resource-hub --filter-pattern '"agent_raw"'`.
+Expected: the raw run's `tool_calls` include `mcp__platform__ws_list` and its summary reports `token_expired` (the Hub returned `401 token_expired`); the grant run lists the files. Confirm with the Lambda log: `aws logs filter-log-events --log-group-name /aws/lambda/poc3-resource-hub --filter-pattern '"agent_raw"'`. Record both runs in `evidence/raw/task23-notes.md`. Restart the unified API without expiry mode.
 
-- [ ] **Step 9: Record limits observed**
+- [ ] **Step 9: Seed fixtures and run the benchmark**
 
-In `evidence/raw/task23-notes.md` record: Lambda max memory and duration for the 5 GB search (from the `REPORT` log lines), Runtime `/tmp` size (Task 7 fuse probe), and any benchmark method that failed with its error.
+```bash
+.venv/bin/python -m scripts.seed_bench_fixtures --user-oid "$POC3_USER_A_OID" --workspace small
+.venv/bin/python -m scripts.seed_bench_fixtures --user-oid "$POC3_USER_A_OID" --workspace large
+.venv/bin/python -m scripts.run_bench --user a
+```
+
+Expected: `evidence/bench/summary.md` exists. The run can take hours and is resumable: if it stops (caller token `401`, SSO expiry, network), run `platform_cli login --user a` and/or `aws sso login`, restart the unified API if needed, and rerun the same command. Only successful rows are skipped.
+
+- [ ] **Step 10: Record limits observed**
+
+In `evidence/raw/task23-notes.md` record: Lambda max memory and duration for the 5 GB search (from the `REPORT` log lines), Runtime `/tmp` size (Task 7 fuse probe), any Mirage `ResourceTooLarge` rows, and any benchmark method that failed with its error.
 
 ---
 
@@ -7576,7 +7866,7 @@ In `evidence/raw/task23-notes.md` record: Lambda max memory and duration for the
 2. **Results table** — Q1–Q8 rows: check, expected, observed, status.
 3. **Benchmark** — the `summary.md` table with an estimated cost column (per operation: Hub requests × Lambda request price + 2 GB × median duration from the Lambda `REPORT` lines × GB-second price + S3 GET/LIST request prices), and a list-correctness check (`result_count` equals the manifest file count), then the answers: Is the Mirage SDK fast enough (against the thresholds)? Is a Mirage FUSE mount feasible on Runtime, and if so fast enough? Should search be a Resource Hub tool? What each method caches.
 4. **Implications for work** — CD-owned artifact (`ignore_changes`), bootstrap vs release keys, CD role permission list (from the spec's security notes), Entra `requestedAccessTokenVersion = 2`, one M2M request per audience, KMS DER → raw, `tools=[]` in the Claude Agent SDK, gateway must pass SSE + custom tools + `anthropic-beta`, Code Interpreter `SANDBOX` still needs a role without S3.
-5. **Limits and residual risks** — grant replay (stolen grant + service token until `exp`), no revocation, `sid` not enforced, no WAF/rate limit on the public function URL, large uploads not supported through a buffered Lambda (6 MB), `force_destroy` needed on the code bucket, Runtime log groups outside Terraform.
+5. **Limits and residual risks** — grant replay (stolen grant + service token until `exp`), no revocation, `sid` not enforced, no WAF/rate limit on the public function URL, large uploads not supported through a buffered Lambda (6 MB), `force_destroy` needed on the code bucket, and any Runtime log group the service creates beyond the two Terraform pre-creates (record which groups existed at destroy time).
 6. **What this does not show** — Deep Agents and DeepSeek Harness (3b/3c), Temporal/Databricks callers.
 
 - [ ] **Step 2: Commit the findings**
