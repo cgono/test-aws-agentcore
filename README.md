@@ -8,8 +8,8 @@ operator procedure is in [the runbook](docs/runbook.md).
 ## Setup
 
 ```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install -e '.[dev]'
+uv venv .venv --python 3.13
+uv pip install --python .venv/bin/python -e '.[dev,platform]'
 ```
 
 Copy values into an untracked environment file or export them in the terminal. Never put secrets
@@ -24,7 +24,7 @@ Run this before any cloud action. Every command exits `0` on success and uses no
 
 ```bash
 .venv/bin/python -m pytest -m 'not integration' \
-  --cov=agentcore_identity_poc --cov=agentcore_code_interpreter_poc --cov=agentcore_runtime_poc \
+  --cov=agentcore_identity_poc --cov=agentcore_code_interpreter_poc --cov=agentcore_runtime_poc --cov=agentcore_platform_poc \
   --cov-report=term-missing --cov-fail-under=90
 .venv/bin/ruff check .
 .venv/bin/mypy src
@@ -33,8 +33,11 @@ terraform fmt -check -recursive infra/terraform
 (cd infra/terraform/modules/agentcore_code_interpreter && terraform init -backend=false -input=false >/dev/null && terraform test)
 (cd infra/terraform/poc && terraform init -backend=false -input=false >/dev/null && terraform validate && terraform test)
 (cd infra/terraform/modules/agentcore_agent_runtime && terraform init -backend=false -input=false >/dev/null && terraform test)
+(cd infra/terraform/platform && terraform init -backend=false -input=false >/dev/null && terraform validate && terraform test)
 git diff --check
 ```
+
+During Tasks 1–4 of Phase 3a, omit the platform Terraform command; Task 5 creates that root.
 
 The repository safety test scans tracked UTF-8 text files for credential-shaped values, identity
 data, and unsafe JSONL evidence keys. It ignores only Git metadata, the virtual environment, and

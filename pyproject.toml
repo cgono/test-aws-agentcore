@@ -26,6 +26,10 @@ dev = [
   "respx==0.22.0",
   "ruff==0.12.10",
 ]
+platform = [
+  "claude-agent-sdk==0.2.160",
+  "mirage-ai[fuse]==0.0.6",
+]
 
 [project.scripts]
 agentcore-identity-poc = "agentcore_identity_poc.cli:app"
@@ -54,5 +58,10 @@ select = ["E", "F", "I", "B", "UP", "S"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-packages = ["agentcore_identity_poc", "agentcore_code_interpreter_poc", "agentcore_runtime_poc"]
+packages = ["agentcore_identity_poc", "agentcore_code_interpreter_poc", "agentcore_runtime_poc", "agentcore_platform_poc"]
 mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = ["mirage", "mirage.*", "claude_agent_sdk", "claude_agent_sdk.*"]
+ignore_missing_imports = true
+follow_imports = "skip"

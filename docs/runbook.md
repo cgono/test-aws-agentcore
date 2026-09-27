@@ -43,7 +43,7 @@ credentials. Each command must exit `0` before a live phase begins:
 
 ```bash
 .venv/bin/python -m pytest -m 'not integration' \
-  --cov=agentcore_identity_poc --cov=agentcore_code_interpreter_poc --cov=agentcore_runtime_poc \
+  --cov=agentcore_identity_poc --cov=agentcore_code_interpreter_poc --cov=agentcore_runtime_poc --cov=agentcore_platform_poc \
   --cov-report=term-missing --cov-fail-under=90
 .venv/bin/ruff check .
 .venv/bin/mypy src
@@ -52,8 +52,11 @@ terraform fmt -check -recursive infra/terraform
 (cd infra/terraform/modules/agentcore_code_interpreter && terraform init -backend=false -input=false >/dev/null && terraform test)
 (cd infra/terraform/poc && terraform init -backend=false -input=false >/dev/null && terraform validate && terraform test)
 (cd infra/terraform/modules/agentcore_agent_runtime && terraform init -backend=false -input=false >/dev/null && terraform test)
+(cd infra/terraform/platform && terraform init -backend=false -input=false >/dev/null && terraform validate && terraform test)
 git diff --check
 ```
+
+During Tasks 1–4 of Phase 3a, omit the platform Terraform command; Task 5 creates that root.
 
 The safety test scans tracked UTF-8 text files. It rejects credential-shaped JWTs,
 authorization-header values, OAuth callback query values, private keys, email addresses,
