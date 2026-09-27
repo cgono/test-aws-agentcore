@@ -1,0 +1,16 @@
+output "aws_region" { value = var.aws_region }
+output "code_bucket" { value = aws_s3_bucket.code.id }
+output "workspace_bucket" { value = aws_s3_bucket.workspace.id }
+output "research_runtime_id" { value = module.research_runtime.agent_runtime_id }
+output "research_runtime_arn" { value = module.research_runtime.agent_runtime_arn }
+output "research_execution_role_arn" { value = module.research_runtime.execution_role_arn }
+output "bench_runtime_id" { value = module.bench_runtime.agent_runtime_id }
+output "bench_runtime_arn" { value = module.bench_runtime.agent_runtime_arn }
+output "resource_hub_function_name" { value = aws_lambda_function.resource_hub.function_name }
+output "resource_hub_url" { value = local.hub_url }
+output "grant_kms_key_id" { value = aws_kms_key.grant.key_id }
+output "grant_signer_role_arn" { value = aws_iam_role.grant_signer.arn }
+output "grant_public_key_pem" { value = data.aws_kms_public_key.grant.public_key_pem }
+output "code_interpreter_id" { value = module.code_interpreter.code_interpreter_id }
+output "research_provider_name" { value = aws_bedrockagentcore_oauth2_credential_provider.agent["research"].name }
+output "bench_provider_name" { value = aws_bedrockagentcore_oauth2_credential_provider.agent["bench"].name }
