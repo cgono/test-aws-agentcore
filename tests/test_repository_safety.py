@@ -8,7 +8,7 @@ import shutil
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl
 
 import pytest
 
@@ -33,7 +33,7 @@ _ENTRA_AUTHORITY_UUID_PATTERN = re.compile(
     r"(?i)login\.microsoftonline\.com/"
     r"([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})(?:/|\b)"
 )
-_URL_PATTERN = re.compile(r"https?://[^\s\"'`<>]+", re.IGNORECASE)
+_URL_PATTERN = re.compile(r"https?://(?:\{[^}]*\}|[^\s\"'`<>])+", re.IGNORECASE)
 _LLM_API_KEY_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{20,}")
 _AUTHORIZATION_QUERY_KEYS = frozenset(
     {"access_token", "code", "id_token", "refresh_token", "session_id", "state", "token"}
@@ -168,6 +168,18 @@ def test_substantive_callback_query_on_example_domain_is_reported() -> None:
     assert _scan_text_file(Path("fixture.txt"), content) == ["fixture.txt: oauth_callback_query"]
 
 
+def test_template_url_with_bracketed_expression_does_not_crash_scan() -> None:
+    content = "https://bedrock-agentcore.{out['aws_region']}.amazonaws.com/path?qualifier=DEFAULT"
+
+    assert _scan_text_file(Path("docs/example.md"), content) == []
+
+
+def test_template_url_with_sensitive_query_is_reported() -> None:
+    content = "https://bedrock-agentcore.{out['aws_region']}.amazonaws.com/path?code=" + "a" * 24
+
+    assert _scan_text_file(Path("fixture.txt"), content) == ["fixture.txt: oauth_callback_query"]
+
+
 @pytest.mark.parametrize(
     "value", ["%3Ccallback-code%3E", "example", "redacted", "short-example"]
 )
@@ -281,12 +293,12 @@ def _scan_string_values(path: Path, content: str) -> list[str]:
 
 def _contains_authorization_query_value(content: str) -> bool:
     for candidate in _URL_PATTERN.findall(content):
-        parsed = urlsplit(candidate.rstrip(".,;)"))
+        query = candidate.rstrip(".,;)").partition("?")[2].split("#", 1)[0]
         if any(
             key.casefold() in _AUTHORIZATION_QUERY_KEYS
             and value
             and not _is_authorization_query_placeholder(value)
-            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+            for key, value in parse_qsl(query, keep_blank_values=True)
         ):
             return True
     return False
