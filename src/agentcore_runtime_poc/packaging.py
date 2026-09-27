@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import zipfile
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 AGENT_REQUIREMENTS = Path(__file__).resolve().parent / "runtime_agent" / "requirements.txt"
@@ -29,6 +30,22 @@ _AMBIENT_INDEX_VARIABLES = frozenset({"UV_INDEX", "UV_INDEX_URL", "UV_EXTRA_INDE
 _FIXED_TIME = (1980, 1, 1, 0, 0, 0)
 
 Installer = Callable[[Path, str], None]
+ExtraFiles = Callable[[Path], dict[str, tuple[bytes, bool]]]
+
+
+def _no_extra_files(_: Path) -> dict[str, tuple[bytes, bool]]:
+    return {}
+
+
+@dataclass(frozen=True)
+class ZipSpec:
+    name: str
+    source_files: Callable[[Path], list[Path]]
+    entry_script: str
+    required_members: frozenset[str]
+    forbidden_parts: frozenset[str]
+    requirements: Path
+    extra_files: ExtraFiles = field(default=_no_extra_files)
 
 
 class PackagingError(RuntimeError):
@@ -37,6 +54,15 @@ class PackagingError(RuntimeError):
 
 def uv_installer(
     requirements: Path = AGENT_REQUIREMENTS,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> Installer:
+    return uv_installer_for_platform(requirements, platform=PLATFORM, run=run)
+
+
+def uv_installer_for_platform(
+    requirements: Path,
+    *,
+    platform: str,
     run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> Installer:
     def install(target: Path, index_url: str) -> None:
@@ -50,7 +76,7 @@ def uv_installer(
                 "install",
                 "--no-config",
                 "--python-platform",
-                PLATFORM,
+                platform,
                 "--python-version",
                 PYTHON_VERSION,
                 "--target",
@@ -76,6 +102,16 @@ def agent_source_files(source_root: Path) -> list[Path]:
     return [path.relative_to(source_root) for path in files]
 
 
+PHASE2_SPEC = ZipSpec(
+    name="phase2-agent",
+    source_files=agent_source_files,
+    entry_script=ENTRY_SCRIPT,
+    required_members=REQUIRED_MEMBERS,
+    forbidden_parts=frozenset({"gateway_sim"}),
+    requirements=AGENT_REQUIREMENTS,
+)
+
+
 def _read_regular(path: Path) -> bytes:
     # A symlink could pull a file from outside the intended inputs (a secret) into the zip.
     if path.is_symlink():
@@ -96,8 +132,15 @@ def _write(archive: zipfile.ZipFile, name: str, data: bytes, *, executable: bool
 
 
 def build_agent_zip(
-    output: Path, *, source_root: Path, index_url: str, installer: Installer, workdir: Path
+    output: Path,
+    *,
+    source_root: Path,
+    index_url: str,
+    installer: Installer,
+    workdir: Path,
+    spec: ZipSpec | None = None,
 ) -> Path:
+    spec = spec or PHASE2_SPEC
     deps = workdir / "deps"
     if deps.exists() and any(deps.iterdir()):
         raise PackagingError("workdir deps directory must be empty")
@@ -114,35 +157,50 @@ def build_agent_zip(
                     _read_regular(path),
                     executable=os.access(path, os.X_OK),
                 )
-        for relative in agent_source_files(source_root):
+        for relative in spec.source_files(source_root):
             _write(
                 archive,
                 relative.as_posix(),
                 _read_regular(source_root / relative),
                 executable=False,
             )
-        _write(archive, "main.py", ENTRY_SCRIPT.encode(), executable=False)
-    verify_agent_zip(output)
+        if spec.entry_script:
+            _write(archive, "main.py", spec.entry_script.encode(), executable=False)
+        for name, (data, executable) in spec.extra_files(workdir).items():
+            _write(archive, name, data, executable=executable)
+    verify_agent_zip(output, spec=spec)
     return output
 
 
-def verify_agent_zip(path: Path, *, max_bytes: int = MAX_ZIP_BYTES) -> None:
+def verify_agent_zip(
+    path: Path, *, max_bytes: int = MAX_ZIP_BYTES, spec: ZipSpec | None = None
+) -> None:
+    spec = spec or PHASE2_SPEC
     size = path.stat().st_size
     if size > max_bytes:
         raise PackagingError(f"zip is {size} bytes; limit is {max_bytes}")
     with zipfile.ZipFile(path) as archive:
         names = archive.namelist()
-    missing = REQUIRED_MEMBERS - set(names)
+    missing = spec.required_members - set(names)
     if missing:
         raise PackagingError(f"zip is missing {sorted(missing)}")
     for name in names:
         parts = PurePosixPath(name).parts
         if name.startswith("/") or "\\" in name or ".." in parts:
             raise PackagingError(f"zip has unsafe member path {name}")
+        forbidden_component = any(
+            part in spec.forbidden_parts and part != "tests" for part in parts
+        )
+        first_party_tests = (
+            "tests" in spec.forbidden_parts
+            and "tests" in parts
+            and (parts[0] == "tests" or parts[0].startswith("agentcore_"))
+        )
         if (
             parts[-1] in FORBIDDEN_BASENAMES
             or "__pycache__" in parts
             or name.endswith(".pyc")
-            or "gateway_sim" in parts
+            or forbidden_component
+            or first_party_tests
         ):
             raise PackagingError(f"zip must not contain {name}")
