@@ -48,6 +48,14 @@ def _header(headers: dict[str, str] | None, name: str) -> str | None:
     return None
 
 
+async def _stop_sandbox(sandbox: Sandbox, session_id: str | None) -> None:
+    # A cleanup failure must not replace the run's result; stop() is blocking network I/O.
+    try:
+        await asyncio.to_thread(sandbox.stop)
+    except Exception as error:  # noqa: BLE001 - logged by type name only
+        logger.warning("sandbox stop failed session=%s error=%s", session_id, type(error).__name__)
+
+
 async def invoke(payload: dict[str, Any], context: RequestContext) -> dict[str, Any]:
     base = {"build_id": build_id(), "session_id": context.session_id}
     grant = _header(context.request_headers, GRANT_HEADER)
@@ -57,12 +65,19 @@ async def invoke(payload: dict[str, Any], context: RequestContext) -> dict[str, 
     prompt = payload.get("prompt")
     if not isinstance(prompt, str) or not prompt or len(prompt) > MAX_PROMPT:
         return base | {"error": "bad_prompt"}
-    config = ResearchConfig.from_env(os.environ)
-    hub_tokens = IdentityTokenSource(config.provider_name, config.hub_scope, config.region)
-    gateway_tokens = IdentityTokenSource(config.provider_name, config.gateway_scope, config.region)
-    sandbox = Sandbox(config.region, config.code_interpreter_id)
+    try:
+        config = ResearchConfig.from_env(os.environ)
+    except ValueError as error:
+        logger.error("research config invalid session=%s: %s", context.session_id, error)
+        return base | {"error": "bad_config"}
+    sandbox: Sandbox | None = None
     refresher: asyncio.Task[None] | None = None
     try:
+        hub_tokens = IdentityTokenSource(config.provider_name, config.hub_scope, config.region)
+        gateway_tokens = IdentityTokenSource(
+            config.provider_name, config.gateway_scope, config.region
+        )
+        sandbox = Sandbox(config.region, config.code_interpreter_id)
         write_token_file(await gateway_tokens.get())
         refresher = asyncio.create_task(refresh_token_file(gateway_tokens))
         async with httpx.AsyncClient(timeout=120.0) as http:
@@ -88,7 +103,8 @@ async def invoke(payload: dict[str, Any], context: RequestContext) -> dict[str, 
             refresher.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await refresher
-        sandbox.stop()
+        if sandbox is not None:
+            await _stop_sandbox(sandbox, context.session_id)
     logger.info(
         "research done session=%s turns=%s tools=%s error=%s",
         context.session_id,

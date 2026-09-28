@@ -10,6 +10,7 @@ from typing import Any
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
+    ResultError,
     ResultMessage,
     ToolUseBlock,
     create_sdk_mcp_server,
@@ -27,6 +28,22 @@ SYSTEM_PROMPT = (
     "workspace files in 'inputs' and name files to save in 'outputs'. Save results to the "
     "workspace, then reply with a short summary that names the files you wrote. If a tool returns "
     "an error, say which error; do not guess."
+)
+# The SDK merges options.env over the whole process environment and cannot remove a key, so
+# ambient model and AWS credentials are set to "" for the CLI: the apiKeyHelper is its only key.
+_BLANKED_ENV = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
 )
 
 
@@ -73,10 +90,12 @@ def build_options(
     return ClaudeAgentOptions(
         tools=[],  # removes every built-in tool; allowed_tools alone would only auto-approve
         mcp_servers={SERVER_NAME: to_sdk_server(specs)},
+        strict_mcp_config=True,  # no MCP server from .mcp.json or any other config
         allowed_tools=allowed_tool_names(specs),
         setting_sources=[],
         settings=json.dumps({"apiKeyHelper": helper_command}),
         env={
+            **dict.fromkeys(_BLANKED_ENV, ""),
             "ANTHROPIC_BASE_URL": config.gateway_url,
             "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": str(helper_ttl_ms),
         },
@@ -90,13 +109,21 @@ def build_options(
 async def run_agent(prompt: str, options: ClaudeAgentOptions) -> AgentRun:
     calls: list[str] = []
     final: ResultMessage | None = None
-    async for message in query(prompt=prompt, options=options):
-        if isinstance(message, AssistantMessage):
-            calls.extend(block.name for block in message.content if isinstance(block, ToolUseBlock))
-        elif isinstance(message, ResultMessage):
-            final = message
+    failure: str | None = None
+    try:
+        async for message in query(prompt=prompt, options=options):
+            if isinstance(message, AssistantMessage):
+                calls.extend(
+                    block.name for block in message.content if isinstance(block, ToolUseBlock)
+                )
+            elif isinstance(message, ResultMessage):
+                final = message
+    except ResultError as error:
+        # The CLI reports a terminal error result, then exits non-zero; keep what the run did.
+        # Only the subtype is kept: the message and errors may carry upstream text.
+        failure = error.subtype or "result_error"
     if final is None:
-        return AgentRun("", 0, 0, 0, calls, "no_result")
+        return AgentRun("", 0, 0, 0, calls, failure or "no_result")
     usage = final.usage or {}
     return AgentRun(
         summary=str(final.result or ""),
@@ -104,5 +131,5 @@ async def run_agent(prompt: str, options: ClaudeAgentOptions) -> AgentRun:
         input_tokens=int(usage.get("input_tokens", 0)),
         output_tokens=int(usage.get("output_tokens", 0)),
         tool_calls=calls,
-        error=None if not final.is_error else str(final.subtype),
+        error=str(final.subtype) if final.is_error else failure,
     )

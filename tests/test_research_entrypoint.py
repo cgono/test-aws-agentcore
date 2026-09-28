@@ -94,3 +94,27 @@ async def test_prompt_validation(patched: dict[str, Any]) -> None:
     headers = {"X-Amzn-Bedrock-AgentCore-Runtime-Custom-Grant": "G"}
     for payload in ({}, {"prompt": ""}, {"prompt": "x" * 4001}, {"prompt": 5}):
         assert (await entrypoint.invoke(payload, Ctx(headers)))["error"] == "bad_prompt"  # type: ignore[arg-type]
+
+
+GRANT = {"X-Amzn-Bedrock-AgentCore-Runtime-Custom-Grant": "G"}
+
+
+async def test_failed_sandbox_stop_keeps_the_result(
+    patched: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def bad_stop(self: Any) -> None:
+        raise RuntimeError("stop failed secret")
+
+    monkeypatch.setattr(
+        entrypoint, "Sandbox", lambda region, identifier: type("S", (), {"stop": bad_stop})()
+    )
+    result = await entrypoint.invoke({"prompt": "x"}, Ctx(GRANT))  # type: ignore[arg-type]
+    assert result["summary"] == "done" and result["error"] is None
+
+
+async def test_missing_config_is_error_json(
+    patched: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("HUB_URL")
+    result = await entrypoint.invoke({"prompt": "x"}, Ctx(GRANT))  # type: ignore[arg-type]
+    assert result["error"] == "bad_config" and "prompt" not in patched
