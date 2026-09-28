@@ -730,3 +730,138 @@ If it is empty or `null`, run
 runtime points at a versioned object. Record this as a finding for the work module.
 
 Observations go to `evidence/raw/runtime-observations.jsonl` (ignored).
+
+## Phase 3a platform plumbing
+
+Operator-run, interactive terminal. Prerequisites: Task 7 passed; `aws sso login` is fresh; the
+gateway sim and the tunnel run with the Task 7 settings. If `apply` or any live call fails with
+an auth error, run `aws sso login` first.
+
+1. Deploy all components through the CD path. Record the three S3 version IDs (needed for
+   rollback) in `evidence/raw/task23-notes.md`; `plan` must exit 0.
+
+```bash
+set -a; source .env; set +a
+.venv/bin/python -m scripts.deploy_agent resource-hub
+.venv/bin/python -m scripts.deploy_agent research
+.venv/bin/python -m scripts.deploy_agent bench
+(cd infra/terraform/platform && terraform plan -detailed-exitcode)
+```
+
+2. Probe 4 — a KMS-signed grant verified by the deployed Resource Hub (hard gate). Expect
+   `probe4 200 {"entries": []}`. A `401 grant_invalid` means the DER → raw conversion or the
+   public key wiring is wrong: stop and fix before you continue.
+
+```bash
+.venv/bin/python - <<'PY'
+import os, time, boto3, httpx, msal
+from pathlib import Path
+from agentcore_platform_poc.grant import KmsSigner, issue_grant
+from scripts.terraform_outputs import load_terraform_outputs
+out, env = load_terraform_outputs(Path("infra/terraform/platform")), os.environ
+creds = boto3.client("sts").assume_role(RoleArn=out["grant_signer_role_arn"], RoleSessionName="poc3-probe4")["Credentials"]
+kms = boto3.client("kms", region_name=out["aws_region"], aws_access_key_id=creds["AccessKeyId"], aws_secret_access_key=creds["SecretAccessKey"], aws_session_token=creds["SessionToken"])
+grant = issue_grant(KmsSigner(kms, out["grant_kms_key_id"]), sub="00000000-0000-0000-0000-00000000000a", agent=env["POC3_RESEARCH_AGENT_CLIENT_ID"], sid="probe4", ttl_seconds=300, now=int(time.time()))
+app = msal.ConfidentialClientApplication(env["POC3_RESEARCH_AGENT_CLIENT_ID"], client_credential=env["TF_VAR_research_agent_client_secret"], authority=f"https://login.microsoftonline.com/{env['POC3_TENANT_ID']}")
+token = app.acquire_token_for_client(scopes=[f"api://{env['POC3_HUB_APP_ID']}/.default"])["access_token"]
+r = httpx.get(f"{out['resource_hub_url']}/v1/list/", headers={"authorization": f"Bearer {token}", "x-resource-grant": grant}, timeout=30)
+print("probe4", r.status_code, r.text[:200])
+PY
+```
+
+3. Start the unified API in a separate terminal. The signer role's assumed credentials last
+   1 hour; restart the unified API if a later step reports a KMS `ExpiredToken`.
+
+```bash
+set -a; source .env; set +a
+.venv/bin/uvicorn --factory agentcore_platform_poc.unified_api.app:create_production_app --port 8300
+```
+
+4. Sign in both users (User B in a private browser window) and upload the briefs.
+
+```bash
+.venv/bin/python -m scripts.platform_cli login --user a   # sign in as User A
+.venv/bin/python -m scripts.platform_cli login --user b   # sign in as User B (private browser window)
+.venv/bin/python -m scripts.platform_cli brief --user a --region sea
+.venv/bin/python -m scripts.platform_cli brief --user b --region ca
+```
+
+Get each user's `oid` from their hub token
+(`python -c "import jwt,json;print(jwt.decode(json.load(open('.poc3-tokens.json'))['a']['hub'],options={'verify_signature':False})['oid'])"`),
+and add `POC3_USER_A_OID` / `POC3_USER_B_OID` to `.env`.
+
+5. Start the raw-token expiry test clock (Q7).
+
+```bash
+mkdir -p .poc3-expiry && chmod 700 .poc3-expiry
+python3 -c "import json;print(json.load(open('.poc3-tokens.json'))['a']['hub'])" > .poc3-expiry/hub-token && chmod 600 .poc3-expiry/hub-token
+```
+
+Restart the unified API with `POC3_EXPIRY_TEST_MODE=true POC3_MAX_GRANT_TTL_S=7200`, then:
+
+```bash
+.venv/bin/python -m scripts.platform_cli grant --user a --ttl 7200 --out .poc3-expiry/grant
+python3 -c "import jwt;print('user token exp', jwt.decode(open('.poc3-expiry/hub-token').read(),options={'verify_signature':False})['exp'])"
+```
+
+Record the token `exp` (Unix time). Restart the unified API without expiry mode for Steps 6–7.
+
+6. Run the live gate. Results are appended to `evidence/raw/phase3-live.jsonl`. Then download
+   each user's chart for the findings.
+
+```bash
+POC3_LIVE=1 .venv/bin/python -m pytest tests/integration/test_platform_live.py -m integration -s -k "not q1"
+.venv/bin/python -m scripts.platform_cli get --user a --path chart.png --out evidence/raw/chart-a.png
+.venv/bin/python -m scripts.platform_cli get --user b --path chart.png --out evidence/raw/chart-b.png
+```
+
+7. Redeploy and roll back (Q1). After the rollback, the new session (the CLI creates one per
+   call) must report the Step 1 `build_id`.
+
+```bash
+POC3_LIVE=1 .venv/bin/python -m pytest tests/integration/test_platform_live.py -m integration -k q1 -s   # deploys a new build, checks no drift and build_id
+.venv/bin/python -m scripts.deploy_agent research --version-id <Step 1 research version>
+.venv/bin/python -m scripts.platform_cli research --user a --prompt "Reply with the single word ok. Do not use tools."
+```
+
+8. Finish the expiry test as soon as the token's `exp` has passed — before the benchmark. Wait
+   until `date +%s` is past the recorded `exp`. Then check that the control grant still has time
+   left, enable raw mode, and run the pair:
+
+```bash
+python3 -c "import jwt,time;left=jwt.decode(open('.poc3-expiry/grant').read(),options={'verify_signature':False})['exp']-time.time();print('grant seconds left',int(left));assert left>600, 'control grant too close to expiry: redo Step 5'"
+(cd infra/terraform/platform && terraform apply -var allow_raw_user_token=true)
+# restart the unified API with POC3_EXPIRY_TEST_MODE=true POC3_MAX_GRANT_TTL_S=7200
+.venv/bin/python -m scripts.platform_cli login --user a    # fresh api token (the old one expired too)
+.venv/bin/python -m scripts.platform_cli research --user a --mode raw --hub-token-file .poc3-expiry/hub-token --prompt "List my workspace files."
+.venv/bin/python -m scripts.platform_cli research --user a --grant-file .poc3-expiry/grant --prompt "List my workspace files."
+(cd infra/terraform/platform && terraform apply -var allow_raw_user_token=false)
+```
+
+Expected: the raw run's `tool_calls` include `mcp__platform__ws_list` and its summary reports
+`token_expired` (the Hub returned `401 token_expired`); the grant run lists the files. Confirm
+with the Lambda log:
+`aws logs filter-log-events --log-group-name /aws/lambda/poc3-resource-hub --filter-pattern '"agent_raw"'`.
+Record both runs in `evidence/raw/task23-notes.md`. Restart the unified API without expiry mode.
+
+9. Seed the fixtures and run the benchmark.
+
+```bash
+.venv/bin/python -m scripts.seed_bench_fixtures --user-oid "$POC3_USER_A_OID" --workspace small
+.venv/bin/python -m scripts.seed_bench_fixtures --user-oid "$POC3_USER_A_OID" --workspace large
+.venv/bin/python -m scripts.run_bench --user a
+```
+
+Expected: `evidence/bench/summary.md` exists. The run can take hours and is resumable: if it stops
+(caller token `401`, SSO expiry, network), run `platform_cli login --user a` and/or
+`aws sso login`, restart the unified API if needed, and rerun the same command. Only successful
+rows are skipped. The runner keeps one Runtime session per (method, op, target) and runs the reps
+of one (op, target) back to back, because the bench Runtime ends a session after 900 s idle or
+3,600 s in total. A warm rep that still ran in a new microVM prints
+`(warm rep ran cold: the session ended)`; the report counts it as cold, not warm (`n_warm`).
+Writes go to `bench/scratch/`, so list and search results stay equal to the manifests.
+
+10. Record the limits observed. In `evidence/raw/task23-notes.md` record: the Lambda max memory
+    and duration for the 5 GB search (from the `REPORT` log lines), the Runtime `/tmp` size
+    (Task 7 fuse probe), any Mirage `ResourceTooLarge` rows, and any benchmark method that
+    failed, with its error.

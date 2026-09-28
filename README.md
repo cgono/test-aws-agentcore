@@ -124,3 +124,13 @@ probes are in `src/agentcore_code_interpreter_poc`. The live gate
 `AGENTCORE_POC_LIVE=1`. See "Code Interpreter POC (Phase 1)" in
 [`docs/runbook.md`](docs/runbook.md) for the apply, run, and record steps. Findings go in
 `docs/code-interpreter-findings.md`.
+
+## Platform Plumbing POC (Phase 3a)
+
+Phase 3a builds a miniature of the work platform: caller CLI → local unified API → Claude Agent
+SDK agent on AgentCore Runtime → Code Interpreter, with user files behind a Resource Hub on
+Lambda (package `src/agentcore_platform_poc`, Terraform root `infra/terraform/platform`). It also
+benchmarks five file-access methods (`scripts/run_bench.py`, report in `evidence/bench/`). The
+live gate `tests/integration/test_platform_live.py` is operator-run and skips unless
+`POC3_LIVE=1`. See "Phase 3a platform plumbing" in [`docs/runbook.md`](docs/runbook.md) for the
+deploy, gate, expiry test, and benchmark steps.
