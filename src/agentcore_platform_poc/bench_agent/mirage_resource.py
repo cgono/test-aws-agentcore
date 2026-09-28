@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import asyncio
-import fnmatch
 import os
+import shlex
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -16,7 +15,15 @@ from mirage.types import FileStat, FileType, MountMode
 from mirage.utils.key_prefix import mount_prefix_of
 
 from agentcore_platform_poc.agent_platform.hub_client import HubError, ResourceHubClient
-from agentcore_platform_poc.bench_agent.methods import RG, Data, DirectMethod, Matches, Paths
+from agentcore_platform_poc.bench_agent.methods import (
+    RG,
+    Data,
+    DirectMethod,
+    Matches,
+    Paths,
+    rg_search,
+)
+from agentcore_platform_poc.resource_hub.paths import glob_matches
 
 MAX_READ_BYTES_OP = 1024**3
 
@@ -113,15 +120,24 @@ class MirageMethod(DirectMethod):
 
     async def _ws(self) -> Workspace:
         if self._workspace is None:
-            self._workspace = Workspace({"/ws": hub_resource(self.hub)}, mode=MountMode.WRITE)
+            workspace = Workspace({"/ws": hub_resource(self.hub)}, mode=MountMode.WRITE)
             if self.fuse:
-                self._mounted = self._workspace.add_fuse_mount("/ws", self.mountpoint)
+                try:
+                    self._mounted = workspace.add_fuse_mount("/ws", self.mountpoint)
+                except BaseException:
+                    await workspace.close()  # never keep a workspace whose mount failed
+                    raise
+            self._workspace = workspace
         return self._workspace
 
-    async def _run(self, command: str, stdin: Data | None = None) -> str:
+    async def _run(
+        self, command: str, stdin: Data | None = None, *, allow_no_match: bool = False
+    ) -> str:
         result = await (await self._ws()).execute(command, stdin=stdin)
-        if result.exit_code not in (0, 1):  # grep exits 1 when nothing matches
-            raise RuntimeError(f"mirage exit {result.exit_code}: {(result.stderr or b'')[:200]!r}")
+        ok = {0, 1} if allow_no_match else {0}  # grep exits 1 when nothing matches
+        stderr = result.stderr or b""
+        if result.exit_code not in ok or (result.exit_code == 1 and stderr):
+            raise RuntimeError(f"mirage exit {result.exit_code}: {stderr[:200]!r}")
         out = result.stdout or b""
         return out.decode() if isinstance(out, bytes) else str(out)
 
@@ -136,55 +152,59 @@ class MirageMethod(DirectMethod):
                 for p in (self._mount() / folder).rglob("*")
                 if p.is_file()
             )
-        out = await self._run(f"find /ws/{folder} -type f")
+        out = await self._run(f"find {_ws_path(folder)} -type f")
         return sorted(line.removeprefix("/ws/") for line in out.splitlines() if line)
 
     async def read(self, path: str) -> int:
         await self._ws()
         if self.fuse:
             total = 0
-            with open(self._mount() / path, "rb") as handle:  # noqa: ASYNC230 - the benchmark measures the mount
+            with open(self._mount() / path, "rb") as handle:  # noqa: ASYNC230 - measures the mount
                 while chunk := handle.read(4 * 1024 * 1024):
                     total += len(chunk)
             return total
-        await self._run(f"cat /ws/{path} > /dev/null")  # streams through read_stream
-        return await self.hub.stat(path)
+        size = await self.hub.stat(path)
+        if size > MAX_READ_BYTES_OP:
+            # Mirage's execute() returns stdout as bytes: a redirected cat still holds the file.
+            raise ResourceTooLarge(f"{path}: mirage cat buffers {size} bytes")
+        await self._run(f"cat -- {_ws_path(path)} > /dev/null")
+        return size
 
     async def write(self, path: str, data: Data) -> None:
         await self._ws()
         if self.fuse:
-            (self._mount() / path).write_bytes(data)  # noqa: ASYNC240 - the benchmark measures the mount
+            (self._mount() / path).write_bytes(data)  # noqa: ASYNC240 - measures the mount
         else:
-            await self._run(f"tee /ws/{path} > /dev/null", stdin=data)
+            await self._run(f"tee -- {_ws_path(path)} > /dev/null", stdin=data)
 
     async def search(self, folder: str, glob: str, text: str) -> Matches:
         await self._ws()
         if self.fuse:
-            process = await asyncio.create_subprocess_exec(
-                str(RG),
-                "-F",
-                "-n",
-                "--no-heading",
-                "--with-filename",
-                text,
-                folder,
-                cwd=self._mount(),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            out = (await process.communicate())[0].decode()
-        else:
-            out = await self._run(f"grep -rnF {text} /ws/{folder}")
-        pairs = []
-        for line in out.splitlines():
-            path, number, _rest = line.split(":", 2)
-            pairs.append((path.removeprefix("/ws/"), int(number)))
-        return sorted(p for p in pairs if fnmatch.fnmatchcase(p[0], glob))
+            return await rg_search(RG, self._mount(), folder, glob, text)
+        # Select files with the Hub's glob first, then grep each: no out-of-glob file is read,
+        # and single-file output ("line:text") never has to split a file name.
+        found: Matches = []
+        for path in await self.list(folder):
+            if not glob_matches(glob, path):
+                continue
+            command = f"grep -nF -e {shlex.quote(text)} -- {_ws_path(path)}"
+            for line in (await self._run(command, allow_no_match=True)).splitlines():
+                number = line.partition(":")[0]
+                if number.isdigit():
+                    found.append((path, int(number)))
+        return sorted(found)
 
     async def close(self) -> None:
         if self._workspace is not None:
-            if self._mounted:
-                self._workspace.remove_fuse_mount("/ws")
-            await self._workspace.close()
-            self._workspace = None
-            self._mounted = None
+            try:
+                if self._mounted:
+                    self._workspace.remove_fuse_mount("/ws")
+            finally:
+                await self._workspace.close()
+                self._workspace = None
+                self._mounted = None
+
+
+def _ws_path(path: str) -> str:
+    """A quoted /ws path: Mirage parses a shell line, so operands are never left bare."""
+    return shlex.quote(f"/ws/{path}")
