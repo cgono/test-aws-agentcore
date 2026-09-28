@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from typing import Any
+
+import pytest
+
 from agentcore_platform_poc.bench_fixtures import (
     BLOCK_BYTES,
     HEAD_PART_BYTES,
@@ -50,6 +54,30 @@ def test_huge_parts_sum_and_alignment() -> None:
         assert sum(n for _, n in parts) == size
         assert all(n % 100 == 0 and n <= BLOCK_BYTES for _, n in parts[1:])
         assert len(parts) <= 10_000
+
+
+def test_failed_huge_upload_is_aborted(monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts import seed_bench_fixtures
+
+    monkeypatch.setattr(seed_bench_fixtures, "text", lambda seed, size, needles=(): b"x")
+    calls: list[str] = []
+
+    class FailingS3:
+        def create_multipart_upload(self, **kwargs: Any) -> dict[str, str]:
+            return {"UploadId": "u1"}
+
+        def upload_part(self, **kwargs: Any) -> dict[str, str]:
+            return {"ETag": "e1"}
+
+        def upload_part_copy(self, **kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError("copy failed")
+
+        def abort_multipart_upload(self, **kwargs: Any) -> None:
+            calls.append(kwargs["UploadId"])
+
+    with pytest.raises(RuntimeError, match="copy failed"):
+        seed_bench_fixtures._huge(FailingS3(), "b", "k", "seed", 50_000_000, (10,))
+    assert calls == ["u1"]
 
 
 def test_manifest_digest_is_stable() -> None:
