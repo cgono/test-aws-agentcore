@@ -24,3 +24,4 @@ evidence/bench/
 terraform.tfvars
 infra/terraform/modules/**/.terraform.lock.hcl
 .poc3-expiry/
+.poc3-tokens.json.lock
