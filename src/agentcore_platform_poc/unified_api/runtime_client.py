@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from typing import Any
 from urllib.parse import quote
@@ -23,6 +24,10 @@ def invocation_url(region: str, arn: str) -> str:
     )
 
 
+class RuntimeTokenError(RuntimeError):
+    """The unified API could not get its token for the Runtime; the text is a code only."""
+
+
 def msal_runtime_token(settings: UnifiedApiSettings) -> Callable[[], str]:
     app = msal.ConfidentialClientApplication(
         settings.client_id,
@@ -31,9 +36,14 @@ def msal_runtime_token(settings: UnifiedApiSettings) -> Callable[[], str]:
     )
 
     def token() -> str:
-        result = app.acquire_token_for_client(scopes=[f"api://{settings.runtime_app_id}/.default"])
+        try:
+            result = app.acquire_token_for_client(
+                scopes=[f"api://{settings.runtime_app_id}/.default"]
+            )
+        except Exception as error:  # noqa: BLE001 - MSAL/requests errors carry URLs and text
+            raise RuntimeTokenError(f"runtime token failed: {type(error).__name__}") from None
         if "access_token" not in result:
-            raise RuntimeError(f"runtime token failed: {result.get('error', 'unknown')}")
+            raise RuntimeTokenError(f"runtime token failed: {result.get('error', 'unknown')}")
         return str(result["access_token"])
 
     return token
@@ -54,8 +64,9 @@ class RuntimeClient:
         grant: str | None,
         user_token: str | None,
     ) -> tuple[int, dict[str, Any]]:
+        token = await asyncio.to_thread(self._token)  # MSAL is blocking network I/O
         headers = {
-            "authorization": f"Bearer {self._token()}",
+            "authorization": f"Bearer {token}",
             "content-type": "application/json",
             SESSION_HEADER: session_id,
         }

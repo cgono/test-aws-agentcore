@@ -1,17 +1,26 @@
 from __future__ import annotations
 
 import dataclasses
+import threading
+from datetime import UTC, datetime
 from typing import Any
 
+import httpx
 import pytest
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
 
 from agentcore_platform_poc.entra import AuthError
 from agentcore_platform_poc.grant import LocalSigner, issue_grant, verify_grant
-from agentcore_platform_poc.unified_api.app import create_app
-from agentcore_platform_poc.unified_api.runtime_client import invocation_url
+from agentcore_platform_poc.unified_api import runtime_client
+from agentcore_platform_poc.unified_api.app import AssumedRoleKmsSigner, create_app
+from agentcore_platform_poc.unified_api.runtime_client import (
+    RuntimeClient,
+    RuntimeTokenError,
+    invocation_url,
+    msal_runtime_token,
+)
 from agentcore_platform_poc.unified_api.settings import UnifiedApiSettings
 
 A = "00000000-0000-0000-0000-00000000000a"
@@ -217,3 +226,153 @@ def test_grant_ttl_setting_above_the_research_runtime_lifetime_is_refused() -> N
     assert UnifiedApiSettings.from_env(env, outputs).max_grant_ttl_s == 3600
     with pytest.raises(ValueError, match="POC3_MAX_GRANT_TTL_S"):
         UnifiedApiSettings.from_env(env | {"POC3_MAX_GRANT_TTL_S": "10801"}, outputs)
+
+
+@pytest.mark.parametrize("route", ["/research", "/bench", "/grants"])
+@pytest.mark.parametrize("raw", [b"not json", b"null", b"[1]"])
+def test_body_must_be_a_json_object(route: str, raw: bytes) -> None:
+    client, runtime = _client(expiry=True)
+    response = client.post(route, content=raw, headers=AUTH | {"content-type": "application/json"})
+    assert response.status_code == 400 and response.json() == {"error": "bad_json"}
+    assert not runtime.calls
+
+
+def test_prompt_over_the_runtime_limit_is_refused() -> None:
+    client, runtime = _client()
+    assert client.post("/research", json={"prompt": "x" * 4001}, headers=AUTH).status_code == 400
+    assert client.post("/research", json={"prompt": "x" * 4000}, headers=AUTH).status_code == 200
+    assert len(runtime.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"prompt": "x", "mode": "Raw", "user_hub_token": "u"},
+        {"prompt": "x", "mode": 5},
+        {"prompt": "x", "mode": "raw", "user_hub_token": "u", "grant": "g"},
+        {"prompt": "x", "mode": "grant", "user_hub_token": "u"},
+    ],
+)
+def test_unknown_mode_or_conflicting_inputs_are_refused(body: dict[str, Any]) -> None:
+    client, runtime = _client(expiry=True)
+    assert client.post("/research", json=body, headers=AUTH).status_code == 400
+    assert not runtime.calls
+
+
+def test_supplied_grant_runs_in_its_own_session() -> None:
+    client, runtime = _client(expiry=True)
+    issued = client.post("/grants", json={"ttl_seconds": 600}, headers=AUTH).json()["grant"]
+    sid = verify_grant(issued, PEM, now=1001).sid
+    response = client.post("/research", json={"prompt": "x", "grant": issued}, headers=AUTH)
+    assert response.json()["session_id"] == runtime.calls[-1]["session_id"] == sid
+    other = "poc3-" + "0" * 32
+    body = {"prompt": "x", "grant": issued, "session_id": other}
+    assert client.post("/research", json=body, headers=AUTH).status_code == 400
+    assert len(runtime.calls) == 1
+
+
+@pytest.mark.parametrize("token", ["a\r\nX-Evil: 1", "a b", "é"])
+def test_raw_token_with_unsafe_characters_is_refused(token: str) -> None:
+    client, runtime = _client(expiry=True)
+    body = {"prompt": "x", "mode": "raw", "user_hub_token": token}
+    assert client.post("/research", json=body, headers=AUTH).status_code == 400
+    assert not runtime.calls
+
+
+class FailingRuntime(FakeRuntime):
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self.error = error
+
+    async def invoke(self, *args: Any, **kwargs: Any) -> tuple[int, dict[str, Any]]:
+        raise self.error
+
+
+@pytest.mark.parametrize(
+    ("error", "status", "code"),
+    [
+        (httpx.ConnectTimeout("secret-host"), 504, "runtime_timeout"),
+        (httpx.ConnectError("secret-host"), 502, "runtime_unavailable"),
+        (RuntimeTokenError("secret tenant"), 502, "runtime_unavailable"),
+    ],
+)
+def test_runtime_failures_are_sanitized(error: Exception, status: int, code: str) -> None:
+    app = create_app(
+        _settings(),
+        verifier=FakeVerifier(),
+        signer=LocalSigner(KEY),
+        runtime=FailingRuntime(error),  # type: ignore[arg-type]
+        clock=lambda: 1000.0,
+    )  # type: ignore[arg-type]
+    response = TestClient(app).post("/research", json={"prompt": "x"}, headers=AUTH)
+    assert (response.status_code, response.json()) == (status, {"error": code})
+
+
+async def test_runtime_token_is_fetched_off_the_event_loop() -> None:
+    loop_thread = threading.get_ident()
+    seen: list[int] = []
+
+    def token() -> str:
+        seen.append(threading.get_ident())
+        return "t"
+
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json={"ok": True}))
+    async with httpx.AsyncClient(transport=transport) as http:
+        status, body = await RuntimeClient(http, token).invoke(
+            "arn:x", "ap-southeast-1", {}, session_id="s", grant="g", user_token=None
+        )
+    assert (status, body) == (200, {"ok": True}) and seen and seen[0] != loop_thread
+
+
+def test_msal_failure_is_a_runtime_token_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Boom:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def acquire_token_for_client(self, scopes: list[str]) -> dict[str, Any]:
+            raise OSError("network secret")
+
+    monkeypatch.setattr(runtime_client.msal, "ConfidentialClientApplication", Boom)
+    with pytest.raises(RuntimeTokenError) as caught:
+        msal_runtime_token(_settings())()
+    assert "secret" not in str(caught.value) and caught.value.__cause__ is None
+
+
+class FakeSts:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def assume_role(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls += 1
+        expires = datetime.fromtimestamp(1000 + 3600, tz=UTC)
+        creds = {"AccessKeyId": f"k{self.calls}", "SecretAccessKey": "s", "SessionToken": "t"}
+        return {"Credentials": creds | {"Expiration": expires}}
+
+
+def test_signer_refreshes_assumed_role_credentials_before_they_expire() -> None:
+    now = [1000.0]
+    made: list[str] = []
+
+    class FakeKms:
+        def __init__(self, key: str) -> None:
+            self.key = key
+
+        def sign(self, **kwargs: Any) -> dict[str, Any]:
+            der = KEY.sign(kwargs["Message"], ec.ECDSA(hashes.SHA256()))
+            return {"Signature": der}
+
+    def kms_factory(creds: dict[str, Any]) -> FakeKms:
+        made.append(creds["AccessKeyId"])
+        return FakeKms(creds["AccessKeyId"])
+
+    sts = FakeSts()
+    signer = AssumedRoleKmsSigner(
+        sts, "arn:role", "key-1", kms_factory=kms_factory, clock=lambda: now[0]
+    )
+    signer.sign(b"m")
+    now[0] = 1000 + 3000  # still more than 5 minutes left
+    signer.sign(b"m")
+    assert made == ["k1"]
+    now[0] = 1000 + 3400  # inside the refresh margin
+    signer.sign(b"m")
+    assert made == ["k1", "k2"] and sts.calls == 2
