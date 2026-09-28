@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 import httpx
+import jwt
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from bedrock_agentcore.runtime.context import RequestContext
 
@@ -26,10 +27,30 @@ GRANT_HEADER = "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Grant"
 app = BedrockAgentCoreApp()
 _methods: dict[str, Method] = {}
 _tokens: IdentityTokenSource | None = None
+_owner: str | None = None  # the grant subject the cached methods were built for
 
 
 def _grant(headers: dict[str, str] | None) -> str | None:
     return next((v for k, v in (headers or {}).items() if k.lower() == GRANT_HEADER.lower()), None)
+
+
+def _subject(grant: str) -> str | None:
+    # Not verified here: only the unified API can call this Runtime (inbound Entra JWT) and it
+    # always signs the grant itself; the Hub verifies the signature on every call.
+    try:
+        sub = jwt.decode(grant, options={"verify_signature": False}).get("sub")
+    except jwt.PyJWTError:
+        return None
+    return sub if isinstance(sub, str) and sub else None
+
+
+async def _claim_for(owner: str) -> None:
+    """Cached methods (a mirror copy, a Mirage workspace) belong to one user; drop on change."""
+    global _owner
+    if _owner != owner:
+        while _methods:
+            await _methods.popitem()[1].close()
+        _owner = owner
 
 
 def _build(name: str, hub: ResourceHubClient) -> Method:
@@ -53,6 +74,10 @@ async def invoke(payload: dict[str, Any], context: RequestContext) -> dict[str, 
         return {"build_id": build_id(), "ok": False, "error": f"bad_case:{error}"}
     if not grant:
         return {"build_id": build_id(), "ok": False, "error": "missing_grant"}
+    owner = _subject(grant)
+    if owner is None:
+        return {"build_id": build_id(), "ok": False, "error": "bad_grant"}
+    await _claim_for(owner)
     if _tokens is None:
         _tokens = IdentityTokenSource(
             os.environ["IDENTITY_PROVIDER"], os.environ["HUB_SCOPE"], os.environ["POC_REGION"]

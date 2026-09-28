@@ -11,6 +11,7 @@ from agentcore_platform_poc.bench_agent.methods import (
     DirectMethod,
     HubSearchMethod,
     MirrorMethod,
+    SearchIncomplete,
     digest,
 )
 from agentcore_platform_poc.bench_fixtures import NEEDLE, text
@@ -132,3 +133,62 @@ async def test_mirror_write_back(tmp_path: Path) -> None:
 
 def test_digest_is_order_independent() -> None:
     assert digest([("b", 1), ("a", 2)]) == digest([("a", 2), ("b", 1)])
+
+
+async def test_truncated_hub_search_is_an_error() -> None:
+    class TruncatingHub(FakeHub):
+        async def search(
+            self, text: str, glob: str | None = None, ignore_case: bool = False
+        ) -> Any:
+            return {"matches": [], "truncated": "bytes"}
+
+    with pytest.raises(SearchIncomplete, match="bytes"):
+        await HubSearchMethod(TruncatingHub()).search("bench/small", "bench/small/*", NEEDLE)  # type: ignore[arg-type]
+
+
+NESTED = {**FILES, "bench/small/sub/n.txt": text("n", 10_000, (3,))}
+
+
+async def test_direct_glob_stays_inside_one_folder_level() -> None:
+    hub = FakeHub()
+    hub.files = dict(NESTED)
+    assert await DirectMethod(hub).search("bench/small", "bench/small/*", NEEDLE) == EXPECTED  # type: ignore[arg-type]
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="needs ripgrep on PATH for the local test")
+async def test_mirror_glob_and_needle_that_looks_like_a_flag(tmp_path: Path) -> None:
+    hub = FakeHub()
+    hub.files = dict(NESTED) | {"bench/small/dash.txt": b"a\n--files here\n"}
+    method = MirrorMethod(hub, root=tmp_path, rg=Path(shutil.which("rg") or "rg"))  # type: ignore[arg-type]
+    assert await method.search("bench/small", "bench/small/*", NEEDLE) == EXPECTED
+    assert await method.search("bench/small", "bench/small/*", "--files") == [
+        ("bench/small/dash.txt", 2)
+    ]
+
+
+async def test_mirror_rg_failure_is_an_error(tmp_path: Path) -> None:
+    broken = tmp_path / "rg-broken"
+    broken.write_text("#!/bin/sh\necho 'rg: bad' >&2\nexit 2\n")
+    broken.chmod(0o755)
+    method = MirrorMethod(FakeHub(), root=tmp_path / "m", rg=broken)  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="rg exit"):
+        await method.search("bench/small", "bench/small/*", NEEDLE)
+
+
+async def test_mirror_read_fetches_only_that_file(tmp_path: Path) -> None:
+    hub = FakeHub()
+    method = MirrorMethod(hub, root=tmp_path, rg=Path("rg"))  # type: ignore[arg-type]
+    assert await method.read("bench/small/f00.txt") == 10_000
+    assert sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*") if p.is_file()) == [
+        "bench/small/f00.txt"
+    ]
+
+
+async def test_direct_scan_memory_is_bounded_on_a_huge_line() -> None:
+    hub = FakeHub()
+    hub.files = {"bench/small/long.txt": b"a" * 20_000_000 + NEEDLE.encode() + b"b" * 10 + b"\nx\n"}
+    method = DirectMethod(hub, max_carry_bytes=1_000_000)  # type: ignore[arg-type]
+    assert await method.search("bench/small", "bench/small/*", NEEDLE) == [
+        ("bench/small/long.txt", 1)
+    ]
+    assert method.peak_carry_bytes <= 1_000_000 + len(NEEDLE)

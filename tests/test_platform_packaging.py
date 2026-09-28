@@ -31,8 +31,7 @@ def test_component_zip_contains_entry_and_platform_code(name: str, tmp_path: Pat
     with zipfile.ZipFile(out) as archive:
         names = set(archive.namelist())
         assert (
-            archive.read("agentcore_platform_poc/BUILD_ID").decode()
-            == "20260927T000000Z-abc1234"
+            archive.read("agentcore_platform_poc/BUILD_ID").decode() == "20260927T000000Z-abc1234"
         )
     assert COMPONENTS[name].required_members <= names
     assert "fakedep/__init__.py" in names
@@ -41,9 +40,14 @@ def test_component_zip_contains_entry_and_platform_code(name: str, tmp_path: Pat
 
 def test_research_zip_excludes_bench_and_resource_hub(tmp_path: Path) -> None:
     out = build_component_zip(
-        "research", tmp_path / "r.zip", source_root=SRC,
-        index_url="https://pypi.example.test/simple", installer=_fake_installer,
-        workdir=tmp_path / "w", build_id="b", fetch=lambda url, sha: b"",
+        "research",
+        tmp_path / "r.zip",
+        source_root=SRC,
+        index_url="https://pypi.example.test/simple",
+        installer=_fake_installer,
+        workdir=tmp_path / "w",
+        build_id="b",
+        fetch=lambda url, sha: b"",
     )
     names = zipfile.ZipFile(out).namelist()
     assert not any(n.startswith("agentcore_platform_poc/bench_agent/") for n in names)
@@ -52,12 +56,35 @@ def test_research_zip_excludes_bench_and_resource_hub(tmp_path: Path) -> None:
 
 def test_bench_zip_carries_executable_ripgrep(tmp_path: Path) -> None:
     out = build_component_zip(
-        "bench", tmp_path / "b.zip", source_root=SRC,
-        index_url="https://pypi.example.test/simple", installer=_fake_installer,
-        workdir=tmp_path / "w", build_id="b", fetch=lambda url, sha: _tar_with_rg(),
+        "bench",
+        tmp_path / "b.zip",
+        source_root=SRC,
+        index_url="https://pypi.example.test/simple",
+        installer=_fake_installer,
+        workdir=tmp_path / "w",
+        build_id="b",
+        fetch=lambda url, sha: _tar_with_rg(),
     )
     info = zipfile.ZipFile(out).getinfo("bin/rg")
     assert (info.external_attr >> 16) & 0o111
+
+
+def test_bench_zip_carries_the_hub_glob_rules_only(tmp_path: Path) -> None:
+    out = build_component_zip(
+        "bench",
+        tmp_path / "b.zip",
+        source_root=SRC,
+        index_url="https://pypi.example.test/simple",
+        installer=_fake_installer,
+        workdir=tmp_path / "w",
+        build_id="b",
+        fetch=lambda url, sha: _tar_with_rg(),
+    )
+    hub = {n for n in zipfile.ZipFile(out).namelist() if "/resource_hub/" in n}
+    assert hub == {
+        "agentcore_platform_poc/resource_hub/__init__.py",
+        "agentcore_platform_poc/resource_hub/paths.py",
+    }
 
 
 def test_verify_rejects_zip_missing_component_entry(tmp_path: Path) -> None:

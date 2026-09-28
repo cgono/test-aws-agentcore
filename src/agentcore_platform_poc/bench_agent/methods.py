@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import fnmatch
 import hashlib
 import json
 import re
@@ -13,6 +12,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from agentcore_platform_poc.agent_platform.hub_client import ResourceHubClient
+from agentcore_platform_poc.resource_hub.paths import glob_matches
 
 METHODS = frozenset({"direct", "hub_search", "mirage_sdk", "mirage_fuse", "mirror"})
 OPS = frozenset({"list", "read", "write", "search"})
@@ -65,10 +65,18 @@ class Method(Protocol):
     def bytes(self) -> int: ...
 
 
+class SearchIncomplete(Exception):
+    """A search stopped at a limit; its matches must not be scored as a full result."""
+
+
 class DirectMethod:
-    def __init__(self, hub: ResourceHubClient, concurrency: int = 16) -> None:
+    def __init__(
+        self, hub: ResourceHubClient, concurrency: int = 16, max_carry_bytes: int = 1024 * 1024
+    ) -> None:
         self.hub = hub
         self._sem = asyncio.Semaphore(concurrency)
+        self._max_carry = max_carry_bytes
+        self.peak_carry_bytes = 0
 
     def requests(self) -> int:
         return self.hub.requests_made
@@ -88,20 +96,28 @@ class DirectMethod:
     async def _scan(self, path: str, needle: Data) -> Matches:
         async with self._sem:
             found: Matches = []
-            carry, line_no = b"", 0
+            carry, line_no, hit = b"", 0, False  # hit: needle seen in a cut part of this line
+            keep = max(len(needle) - 1, 0)
             async for part in self.hub.iter_chunks(path):
                 lines = (carry + part).split(b"\n")
                 carry = lines.pop()
-                for line in lines:
+                for index, line in enumerate(lines):
                     line_no += 1
-                    if needle in line:
+                    if (index == 0 and hit) or needle in line:
                         found.append((path, line_no))
-            if carry and needle in carry:
+                if lines:
+                    hit = False
+                if len(carry) > self._max_carry:
+                    # A very long line: remember a hit, keep only a tail that can finish a needle.
+                    hit = hit or needle in carry
+                    carry = carry[-keep:] if keep else b""
+                self.peak_carry_bytes = max(self.peak_carry_bytes, len(carry))
+            if hit or (carry and needle in carry):
                 found.append((path, line_no + 1))
             return found
 
     async def search(self, folder: str, glob: str, text: str) -> Matches:
-        paths = [p for p in await self.list(folder) if fnmatch.fnmatchcase(p, glob)]
+        paths = [p for p in await self.list(folder) if glob_matches(glob, p)]
         results = await asyncio.gather(*(self._scan(p, text.encode()) for p in paths))
         return sorted(m for r in results for m in r)
 
@@ -112,6 +128,8 @@ class DirectMethod:
 class HubSearchMethod(DirectMethod):
     async def search(self, folder: str, glob: str, text: str) -> Matches:
         result = await self.hub.search(text, glob)
+        if result.get("truncated"):
+            raise SearchIncomplete(f"truncated:{result['truncated']}")
         return sorted((m["path"], int(m["line_no"])) for m in result["matches"])
 
 
@@ -120,21 +138,24 @@ class MirrorMethod(DirectMethod):
         super().__init__(hub)
         self.root = root
         self.rg = rg
+        # A copy-in snapshot: files stay as first fetched until close() (fresh: true).
         self._synced: set[str] = set()
+        self._fetched: set[str] = set()
+
+    async def _fetch(self, path: str) -> None:
+        async with self._sem:
+            target = self.root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("wb") as handle:
+                async for part in self.hub.iter_chunks(path):
+                    handle.write(part)
+        self._fetched.add(path)
 
     async def _sync(self, folder: str) -> None:
         if folder in self._synced:
             return
-
-        async def fetch(path: str) -> None:
-            async with self._sem:
-                target = self.root / path
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with target.open("wb") as handle:
-                    async for part in self.hub.iter_chunks(path):
-                        handle.write(part)
-
-        await asyncio.gather(*(fetch(p) for p in await DirectMethod.list(self, folder)))
+        paths = await DirectMethod.list(self, folder)
+        await asyncio.gather(*(self._fetch(p) for p in paths if p not in self._fetched))
         self._synced.add(folder)
 
     async def list(self, folder: str) -> Paths:
@@ -144,38 +165,59 @@ class MirrorMethod(DirectMethod):
         )
 
     async def read(self, path: str) -> int:
-        await self._sync(str(Path(path).parent))
+        if path not in self._fetched:
+            await self._fetch(path)
         return (self.root / path).stat().st_size
 
     async def write(self, path: str, data: Data) -> None:
         target = self.root / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
+        self._fetched.add(path)
         await self.hub.write(path, data)  # write-back through the Hub
 
     async def search(self, folder: str, glob: str, text: str) -> Matches:
         await self._sync(folder)
-        process = await asyncio.create_subprocess_exec(
-            str(self.rg),
-            "-F",
-            "-n",
-            "--no-heading",
-            "--with-filename",
-            "-g",
-            glob.removeprefix(folder + "/"),
-            text,
-            folder,
-            cwd=self.root,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        out, _ = await process.communicate()
-        matches = []
-        for line in out.decode().splitlines():
-            path, number, _rest = line.split(":", 2)
-            matches.append((path, int(number)))
-        return sorted(matches)
+        return await rg_search(self.rg, self.root, folder, glob, text)
 
     async def close(self) -> None:
         shutil.rmtree(self.root, ignore_errors=True)
         self._synced.clear()
+        self._fetched.clear()
+
+
+async def rg_search(rg: Path, cwd: Path, folder: str, glob: str, text: str) -> Matches:
+    """Fixed-string search with ripgrep; the glob is applied with the Hub's segment rules."""
+    process = await asyncio.create_subprocess_exec(
+        str(rg),
+        "--fixed-strings",
+        "--line-number",
+        "--only-matching",  # print the needle, not the line: output stays small
+        "--null",  # path, NUL, then line:match — safe for any path
+        "--with-filename",
+        "--no-heading",
+        "--no-ignore",
+        "--hidden",
+        "--text",
+        "-e",
+        text,  # -e: a needle such as "--files" is never read as an option
+        "--",
+        folder,
+        cwd=cwd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    if process.stdout is None or process.stderr is None:  # PIPE always sets both
+        raise RuntimeError("rg pipes missing")
+    matches: set[tuple[str, int]] = set()
+    async for raw in process.stdout:
+        path, _, rest = raw.rstrip(b"\n").partition(b"\0")
+        number = rest.split(b":", 1)[0]
+        name = path.decode()
+        if number.isdigit() and glob_matches(glob, name):
+            matches.add((name, int(number)))
+    stderr = await process.stderr.read()
+    code = await process.wait()
+    if code not in (0, 1):  # 1 means no match
+        raise RuntimeError(f"rg exit {code}: {stderr[:200]!r}")
+    return sorted(matches)

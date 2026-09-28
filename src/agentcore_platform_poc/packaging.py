@@ -51,7 +51,7 @@ _COMMON = (
 
 
 def _entry(module: str) -> str:
-    return f"from {module} import main\n\nif __name__ == \"__main__\":\n    main()\n"
+    return f'from {module} import main\n\nif __name__ == "__main__":\n    main()\n'
 
 
 def _spec(name: str, package: str, extra_sources: tuple[str, ...] = ()) -> ZipSpec:
@@ -98,7 +98,15 @@ def _resource_hub_spec() -> ZipSpec:
 
 COMPONENTS: dict[str, ZipSpec] = {
     "research": _spec("research", "research_agent"),
-    "bench": _spec("bench", "bench_agent"),
+    # The bench methods filter with the Hub's own glob rules (paths.py has no Hub dependencies).
+    "bench": _spec(
+        "bench",
+        "bench_agent",
+        (
+            "agentcore_platform_poc/resource_hub/__init__.py",
+            "agentcore_platform_poc/resource_hub/paths.py",
+        ),
+    ),
     "probe": _spec("probe", "probe_agent"),
     "resource-hub": _resource_hub_spec(),
 }
