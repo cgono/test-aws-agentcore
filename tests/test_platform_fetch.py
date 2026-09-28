@@ -44,3 +44,16 @@ async def test_too_large() -> None:
             "https://api.worldbank.org/v2/x",
             http=_http(httpx.Response(200, content=b"x" * 2_000_001)),
         )
+
+
+async def test_asks_for_identity_encoding_and_rejects_compressed() -> None:
+    seen: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, content=b"\x1f\x8b", headers={"content-encoding": "gzip"})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    with pytest.raises(FetchRejected, match="encoded_response"):
+        await fetch_url("https://api.worldbank.org/v2/x", http=http)
+    assert seen[0].headers["accept-encoding"] == "identity"

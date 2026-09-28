@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
+import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -11,6 +13,8 @@ from typing import Any
 
 import jwt
 from bedrock_agentcore.runtime.context import BedrockAgentCoreContext
+
+logger = logging.getLogger(__name__)
 
 GATEWAY_TOKEN_FILE = Path("/tmp/poc3-gateway-token")  # noqa: S108 - Runtime microVM, per session
 
@@ -65,20 +69,23 @@ class IdentityTokenSource:
                     agent_identity_token=workload,
                     auth_flow="M2M",
                 )
-            except (
-                Exception
-            ) as error:  # SDK and botocore text can carry secrets; keep the type only
-                raise TokenUnavailable(type(error).__name__) from error
+            except Exception as error:  # SDK and botocore text can carry secrets
+                # Keep the type only, and drop the chain so tracebacks cannot log the text.
+                raise TokenUnavailable(type(error).__name__) from None
             self._token = str(token)
             return self._token
 
 
 def write_token_file(token: str, path: Path = GATEWAY_TOKEN_FILE) -> Path:
-    tmp = path.with_name(path.name + ".tmp")
-    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as handle:
-        handle.write(token)
-    os.replace(tmp, path)
+    # mkstemp creates a new file (O_EXCL, mode 0600), so a planted file or symlink is never used.
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(token)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
     return path
 
 
@@ -86,5 +93,9 @@ async def refresh_token_file(
     source: IdentityTokenSource, path: Path = GATEWAY_TOKEN_FILE, interval_s: float = 60
 ) -> None:
     while True:
-        write_token_file(await source.get(), path)
+        try:
+            write_token_file(await source.get(), path)
+        except (TokenUnavailable, OSError) as error:
+            # Keep trying: the helper refuses the file once its token expires.
+            logger.warning("gateway token refresh failed error=%s", type(error).__name__)
         await asyncio.sleep(interval_s)

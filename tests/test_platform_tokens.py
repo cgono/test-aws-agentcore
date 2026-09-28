@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import stat
 import time
 from pathlib import Path
@@ -11,6 +12,7 @@ import pytest
 from agentcore_platform_poc.agent_platform.tokens import (
     IdentityTokenSource,
     TokenUnavailable,
+    refresh_token_file,
     write_token_file,
 )
 from agentcore_platform_poc.research_agent import api_key_helper
@@ -92,3 +94,43 @@ def test_helper_refuses_expired_or_missing(
     monkeypatch.setattr(api_key_helper, "GATEWAY_TOKEN_FILE", tmp_path / "missing")
     assert api_key_helper.main() == 1
     assert capsys.readouterr().out == ""
+
+
+def test_token_file_ignores_planted_tmp_file(tmp_path: Path) -> None:
+    planted = tmp_path / "t.tmp"
+    planted.write_text("planted")
+    planted.chmod(0o644)
+    path = write_token_file("abc", tmp_path / "t")
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert planted.read_text() == "planted"
+
+
+async def test_identity_error_text_is_not_chained() -> None:
+    class Failing:
+        async def get_token(self, **kwargs: Any) -> str:
+            raise RuntimeError("secret-bearing SDK text")
+
+    source = IdentityTokenSource("p", "s", "r", client=Failing(), workload_token=lambda: "wat")
+    with pytest.raises(TokenUnavailable) as caught:
+        await source.get()
+    assert str(caught.value) == "RuntimeError"
+    assert caught.value.__cause__ is None and caught.value.__suppress_context__
+
+
+async def test_refresher_survives_a_failed_refresh(tmp_path: Path) -> None:
+    class Flaky:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def get(self) -> str:
+            self.calls += 1
+            if self.calls == 1:
+                raise TokenUnavailable("ClientError")
+            if self.calls == 3:
+                raise asyncio.CancelledError
+            return "fresh"
+
+    flaky = Flaky()
+    with pytest.raises(asyncio.CancelledError):
+        await refresh_token_file(flaky, tmp_path / "t", interval_s=0)  # type: ignore[arg-type]
+    assert (tmp_path / "t").read_text() == "fresh"

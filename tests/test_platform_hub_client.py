@@ -89,3 +89,36 @@ async def test_search_and_write() -> None:
     client = _client(httpx.MockTransport(handle), grant="G")
     await client.write("x", b"hi")
     assert (await client.search("N", "*.md", True))["matches"] == []
+
+
+@pytest.mark.parametrize("path", ["../../other", "a/../b", "./a", "a/."])
+async def test_dot_segments_never_leave_the_route(path: str) -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"request sent to {request.url.raw_path!r}")
+
+    with pytest.raises(HubError) as caught:
+        await _client(httpx.MockTransport(handle), grant="G").read(path, 0, 1)
+    assert (caught.value.status, caught.value.code) == (400, "invalid_path")
+
+
+async def test_whole_file_read_honours_offset() -> None:
+    ranges: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/v1/stat/"):
+            return httpx.Response(200, json={"path": "f", "size": 10})
+        ranges.append(request.headers["range"])
+        return httpx.Response(206, content=b"x" * 8)
+
+    assert await _client(httpx.MockTransport(handle), grant="G").read("f", offset=2) == b"x" * 8
+    assert ranges == ["bytes=2-9"]
+
+
+@pytest.mark.parametrize("body", [[], "oops", {"error": None}])
+async def test_non_object_error_body_is_hub_error(body: object) -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json=body)
+
+    with pytest.raises(HubError) as caught:
+        await _client(httpx.MockTransport(handle), grant="G").list()
+    assert caught.value.status == 401 and caught.value.code in {"unknown", "None"}

@@ -60,14 +60,18 @@ class ResourceHubClient:
         self.bytes_received += len(response.content)
         if response.status_code >= 400:
             try:
-                code = str(response.json().get("error", "unknown"))
+                data = response.json()
             except ValueError:
-                code = "unknown"
+                data = None
+            code = str(data.get("error", "unknown")) if isinstance(data, dict) else "unknown"
             raise HubError(response.status_code, code)
         return response
 
     @staticmethod
     def _path(path: str) -> str:
+        # httpx removes literal dot segments, which would move the request to another route.
+        if any(part in {".", ".."} for part in path.split("/")):
+            raise HubError(400, "invalid_path")
         return quote(path, safe="/")
 
     async def list(self, path: str = "") -> list[dict[str, Any]]:
@@ -93,7 +97,9 @@ class ResourceHubClient:
 
     async def read(self, path: str, offset: int = 0, length: int | None = None) -> bytes:
         if length is None:
-            return b"".join([part async for part in self.iter_chunks(path)])
+            if offset == 0:
+                return b"".join([part async for part in self.iter_chunks(path)])
+            length = max(await self.stat(path) - offset, 0)
         parts = []
         for start in range(offset, offset + length, MAX_CHUNK):
             parts.append(
