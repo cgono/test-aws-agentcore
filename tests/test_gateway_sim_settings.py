@@ -42,7 +42,16 @@ def test_every_setting_is_required(missing: str) -> None:
         GatewaySettings.from_env(env)
 
 
-@pytest.mark.parametrize("value", ["0", "5000", "many"])
+@pytest.mark.parametrize("value", ["0", "9000", "many"])
 def test_max_output_tokens_is_bounded(value: str) -> None:
     with pytest.raises(GatewaySettingsError, match="GATEWAY_MAX_OUTPUT_TOKENS"):
         GatewaySettings.from_env({**ENV, "GATEWAY_MAX_OUTPUT_TOKENS": value})
+
+
+def test_body_limit_setting() -> None:
+    settings = GatewaySettings.from_env(
+        {**ENV, "GATEWAY_MAX_BODY_BYTES": "2000000", "GATEWAY_MAX_OUTPUT_TOKENS": "8192"}
+    )
+    assert settings.max_body_bytes == 2_000_000 and settings.max_output_tokens == 8192
+    with pytest.raises(GatewaySettingsError, match="GATEWAY_MAX_BODY_BYTES"):
+        GatewaySettings.from_env({**ENV, "GATEWAY_MAX_BODY_BYTES": str(5 * 1024 * 1024)})

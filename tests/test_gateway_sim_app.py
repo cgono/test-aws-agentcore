@@ -258,3 +258,107 @@ def test_oversized_body_without_content_length_is_rejected_while_streaming() -> 
 
     assert response.status_code == 413
     assert seen == []
+
+
+def test_anthropic_custom_tools_and_clamped_max_tokens() -> None:
+    client, seen = _client(_ok)
+    tool = {
+        "name": "mcp__platform__ws_read",
+        "description": "d",
+        "input_schema": {"type": "object"},
+    }
+    response = client.post(
+        "/anthropic/v1/messages",
+        json={
+            "model": "model-a",
+            "max_tokens": 32000,
+            "messages": [],
+            "tools": [tool],
+            "tool_choice": {"type": "auto"},
+            "metadata": {"user_id": "u"},
+        },
+        headers={
+            **GOOD,
+            "anthropic-beta": "claude-code-20250219,fine-grained-tool-streaming-2025-05-14",
+        },
+    )
+    assert response.status_code == 200
+    sent = json.loads(seen[0].content)
+    assert sent["max_tokens"] == 64 and sent["tools"] == [tool]
+    assert (
+        seen[0].headers["anthropic-beta"]
+        == "claude-code-20250219,fine-grained-tool-streaming-2025-05-14"
+    )
+
+
+def test_bad_beta_header_is_dropped() -> None:
+    client, seen = _client(_ok)
+    client.post(
+        "/anthropic/v1/messages",
+        json={"model": "model-a", "messages": []},
+        headers={**GOOD, "anthropic-beta": "x\r\ninjected: 1"},
+    )
+    assert "anthropic-beta" not in seen[0].headers
+
+
+def test_anthropic_stream_passes_sse_through() -> None:
+    sse = b"event: message_start\ndata: {}\n\nevent: message_stop\ndata: {}\n\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=sse, headers={"content-type": "text/event-stream"})
+
+    client, seen = _client(handler)
+    response = client.post(
+        "/anthropic/v1/messages",
+        json={"model": "model-a", "stream": True, "messages": []},
+        headers=GOOD,
+    )
+    assert response.status_code == 200 and response.content == sse
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert json.loads(seen[0].content)["stream"] is True
+
+
+def test_anthropic_stream_upstream_error_is_json() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, json={"error": {"type": "rate_limit_error"}})
+
+    client, _ = _client(handler)
+    response = client.post(
+        "/anthropic/v1/messages",
+        json={"model": "model-a", "stream": True, "messages": []},
+        headers=GOOD,
+    )
+    assert response.status_code == 429 and response.json() == {
+        "error": {"upstream_status": 429, "type": "rate_limit_error"}
+    }
+
+
+def test_stream_model_allow_list_still_enforced() -> None:
+    client, seen = _client(_ok)
+    response = client.post(
+        "/anthropic/v1/messages",
+        json={"model": "model-x", "stream": True, "messages": []},
+        headers=GOOD,
+    )
+    assert response.status_code == 400 and not seen
+
+
+def test_count_tokens_route() -> None:
+    client, seen = _client(_ok)
+    response = client.post(
+        "/anthropic/v1/messages/count_tokens",
+        json={"model": "model-a", "messages": []},
+        headers=GOOD,
+    )
+    assert response.status_code == 200 and str(seen[0].url).endswith("/v1/messages/count_tokens")
+
+
+def test_field_names_are_logged_without_values(caplog: pytest.LogCaptureFixture) -> None:
+    client, _ = _client(_ok)
+    with caplog.at_level("INFO"):
+        client.post(
+            "/anthropic/v1/messages",
+            json={"model": "model-a", "messages": [{"role": "user", "content": "SECRET PROMPT"}]},
+            headers=GOOD,
+        )
+    assert "fields=messages,model" in caplog.text and "SECRET PROMPT" not in caplog.text

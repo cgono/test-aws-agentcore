@@ -30,8 +30,19 @@ def _max_output_tokens(env: Mapping[str, str]) -> int:
         value = int(raw)
     except ValueError as error:
         raise GatewaySettingsError("GATEWAY_MAX_OUTPUT_TOKENS must be an integer") from error
-    if not 1 <= value <= 1024:
-        raise GatewaySettingsError("GATEWAY_MAX_OUTPUT_TOKENS must be between 1 and 1024")
+    if not 1 <= value <= 8192:
+        raise GatewaySettingsError("GATEWAY_MAX_OUTPUT_TOKENS must be between 1 and 8192")
+    return value
+
+
+def _max_body_bytes(env: Mapping[str, str]) -> int:
+    raw = env.get("GATEWAY_MAX_BODY_BYTES", "32768")
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise GatewaySettingsError("GATEWAY_MAX_BODY_BYTES must be an integer") from error
+    if not 1024 <= value <= 4 * 1024 * 1024:
+        raise GatewaySettingsError("GATEWAY_MAX_BODY_BYTES must be between 1024 and 4194304")
     return value
 
 
@@ -61,6 +72,7 @@ class GatewaySettings:
             openai_api_key=_required(env, "OPENAI_API_KEY"),
             anthropic_api_key=_required(env, "ANTHROPIC_API_KEY"),
             max_output_tokens=_max_output_tokens(env),
+            max_body_bytes=_max_body_bytes(env),
         )
 
     @property
