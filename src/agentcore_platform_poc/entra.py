@@ -3,8 +3,7 @@
 
 from __future__ import annotations
 
-import time
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from typing import Any
 
 import jwt
@@ -27,27 +26,20 @@ class AuthError(Exception):
 
 
 class EntraVerifier:
-    def __init__(self, policy: JwtPolicy, clock: Callable[[], float] = time.time) -> None:
+    def __init__(self, policy: JwtPolicy) -> None:
         self.policy = policy
-        self.clock = clock
 
     def claims(self, token: str) -> dict[str, Any]:
         try:
             claims = self.policy.validate(token)
         except TokenRejected as error:
-            raise AuthError(401, self._why(token)) from error
+            # PyJWT checks exp only after the signature passed, so a forged token is never
+            # labelled expired.
+            expired = isinstance(error.__cause__, jwt.ExpiredSignatureError)
+            raise AuthError(401, "token_expired" if expired else "token_invalid") from error
         if claims.get("ver") != "2.0" or not isinstance(claims.get("aud"), str):
             raise AuthError(401, "token_invalid")
         return claims
-
-    def _why(self, token: str) -> str:
-        try:
-            exp = jwt.decode(token, options={"verify_signature": False}).get("exp")
-        except jwt.PyJWTError:
-            return "token_invalid"
-        if isinstance(exp, int) and not isinstance(exp, bool) and exp <= self.clock():
-            return "token_expired"
-        return "token_invalid"
 
 
 def build_verifier(tenant_id: str, audience: str) -> EntraVerifier:
@@ -81,7 +73,7 @@ def require_user(
 
 
 def require_app(claims: Mapping[str, Any], *, role: str, allowed_azp: frozenset[str]) -> str:
-    if "scp" in claims or claims.get("idtyp", "app") != "app":
+    if "scp" in claims or claims.get("idtyp") != "app":
         raise AuthError(403, "not_app_token")
     roles = claims.get("roles")
     if not isinstance(roles, list) or role not in roles:

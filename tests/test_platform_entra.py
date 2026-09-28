@@ -1,9 +1,9 @@
 # tests/test_platform_entra.py
 from __future__ import annotations
 
-import time
 from typing import Any
 
+import jwt
 import pytest
 
 from agentcore_identity_poc.jwt_validation import TokenRejected
@@ -28,36 +28,44 @@ APP = {
 
 
 class FakePolicy:
-    def __init__(self, claims: dict[str, Any] | None) -> None:
+    def __init__(self, claims: dict[str, Any] | None, cause: Exception | None = None) -> None:
         self._claims = claims
+        self._cause = cause
         self.audience = "hub"
 
     def validate(self, token: str) -> dict[str, Any]:
         if self._claims is None:
-            raise TokenRejected("Token rejected")
+            raise TokenRejected("Token rejected") from self._cause
         return dict(self._claims)
 
 
 def _unsigned(exp: int) -> str:
-    import jwt
-
     return jwt.encode({"exp": exp}, "k" * 32, algorithm="HS256")
 
 
 def test_valid_claims_pass_through() -> None:
-    verifier = EntraVerifier(FakePolicy(USER), clock=lambda: 1000.0)  # type: ignore[arg-type]
+    verifier = EntraVerifier(FakePolicy(USER))  # type: ignore[arg-type]
     assert verifier.claims("t")["oid"] == USER["oid"]
 
 
 def test_expired_token_is_token_expired() -> None:
-    verifier = EntraVerifier(FakePolicy(None), clock=lambda: 5000.0)  # type: ignore[arg-type]
+    # PyJWT raises ExpiredSignatureError only after the signature check passed.
+    policy = FakePolicy(None, cause=jwt.ExpiredSignatureError("Signature has expired"))
+    verifier = EntraVerifier(policy)  # type: ignore[arg-type]
     with pytest.raises(AuthError) as caught:
-        verifier.claims(_unsigned(exp=4000))
+        verifier.claims("t")
     assert (caught.value.status, caught.value.code) == (401, "token_expired")
 
 
+def test_forged_token_with_past_exp_is_token_invalid() -> None:
+    verifier = EntraVerifier(FakePolicy(None))  # type: ignore[arg-type]
+    with pytest.raises(AuthError) as caught:
+        verifier.claims(_unsigned(exp=1))
+    assert caught.value.code == "token_invalid"
+
+
 def test_bad_token_is_token_invalid() -> None:
-    verifier = EntraVerifier(FakePolicy(None), clock=lambda: 1000.0)  # type: ignore[arg-type]
+    verifier = EntraVerifier(FakePolicy(None))  # type: ignore[arg-type]
     for token in (_unsigned(exp=4000), "garbage"):
         with pytest.raises(AuthError) as caught:
             verifier.claims(token)
@@ -66,7 +74,7 @@ def test_bad_token_is_token_invalid() -> None:
 
 @pytest.mark.parametrize("change", [{"ver": "1.0"}, {"aud": ["hub", "x"]}])
 def test_v1_or_list_aud_rejected(change: dict[str, Any]) -> None:
-    verifier = EntraVerifier(FakePolicy({**USER, **change}), clock=lambda: 1000.0)  # type: ignore[arg-type]
+    verifier = EntraVerifier(FakePolicy({**USER, **change}))  # type: ignore[arg-type]
     with pytest.raises(AuthError, match="token_invalid"):
         verifier.claims("t")
 
@@ -104,17 +112,14 @@ def test_require_app() -> None:
     assert (
         require_app(APP, role="Workspace.Agent", allowed_azp=frozenset({"research"})) == "research"
     )
-    no_idtyp = {k: v for k, v in APP.items() if k != "idtyp"}
-    assert (
-        require_app(no_idtyp, role="Workspace.Agent", allowed_azp=frozenset({"research"}))
-        == "research"
-    )
 
 
 @pytest.mark.parametrize(
     ("claims", "code"),
     [
         (USER, "not_app_token"),
+        # Task 0 adds the optional idtyp claim; a roles-only token without it is not trusted.
+        ({k: v for k, v in APP.items() if k != "idtyp"}, "not_app_token"),
         ({**APP, "idtyp": "user"}, "not_app_token"),
         ({**APP, "roles": ["Other"]}, "missing_role"),
         ({**APP, "roles": "Workspace.Agent"}, "missing_role"),
@@ -125,8 +130,3 @@ def test_require_app_rejections(claims: dict[str, Any], code: str) -> None:
     with pytest.raises(AuthError) as caught:
         require_app(claims, role="Workspace.Agent", allowed_azp=frozenset({"research"}))
     assert caught.value.code == code
-
-
-def test_clock_default_is_wall_time() -> None:
-    verifier = EntraVerifier(FakePolicy(USER))  # type: ignore[arg-type]
-    assert abs(verifier.clock() - time.time()) < 5
