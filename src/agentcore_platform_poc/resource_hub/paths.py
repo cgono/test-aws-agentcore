@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import fnmatch
+import functools
 import re
 from urllib.parse import unquote
 
@@ -22,6 +24,13 @@ def user_prefix(oid: str) -> str:
     if not _OID.fullmatch(oid):
         raise PathRejected("bad user id")
     return f"users/{oid}/"
+
+
+def _utf8_length(text: str) -> int:
+    try:
+        return len(text.encode("utf-8"))
+    except UnicodeEncodeError:  # a lone surrogate, e.g. from a JSON "\ud800" escape
+        raise PathRejected("not valid Unicode") from None
 
 
 def _check_segments(path: str) -> None:
@@ -47,7 +56,7 @@ def canonical_path(raw: str, *, decode: bool, allow_empty: bool = False) -> str:
         path = raw
     if path == "" and allow_empty:
         return ""
-    if path == "" or len(path.encode("utf-8")) > MAX_PATH_BYTES:
+    if path == "" or _utf8_length(path) > MAX_PATH_BYTES:
         raise PathRejected("empty or too long")
     if _ENCODED_LEFT.search(path):
         raise PathRejected("encoded separator or dot after decoding")
@@ -60,14 +69,31 @@ def object_key(oid: str, path: str) -> str:
     key = prefix + path
     if not key.startswith(prefix):
         raise PathRejected("outside prefix")
+    if _utf8_length(key) > MAX_PATH_BYTES:  # the S3 key limit includes the user prefix
+        raise PathRejected("key too long")
     return key
 
 
 def check_glob(glob: str) -> str:
-    if not glob or not _GLOB_CHARS.fullmatch(glob):
+    if not glob or len(glob) > MAX_PATH_BYTES or not _GLOB_CHARS.fullmatch(glob):
         raise PathRejected("glob may use letters, digits, . _ - * ? / and spaces only")
     _check_segments(glob)
     return glob
+
+
+def glob_matches(glob: str, path: str) -> bool:
+    """Match segment by segment: `*` and `?` never cross `/`; a `**` segment spans 0+ segments."""
+    pattern, parts = glob.split("/"), path.split("/")
+
+    @functools.cache
+    def match(g: int, p: int) -> bool:
+        if g == len(pattern):
+            return p == len(parts)
+        if pattern[g] == "**":
+            return match(g + 1, p) or (p < len(parts) and match(g, p + 1))
+        return p < len(parts) and fnmatch.fnmatchcase(parts[p], pattern[g]) and match(g + 1, p + 1)
+
+    return match(0, 0)
 
 
 def relative(oid: str, key: str) -> str:

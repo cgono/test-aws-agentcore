@@ -29,6 +29,7 @@ class FakeS3:
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
         self.get_calls = 0
+        self.pages = 0
 
         class _Exceptions:
             pass
@@ -64,6 +65,7 @@ class FakeS3:
             def paginate(self, *, Bucket: str, Prefix: str) -> Any:  # noqa: N803
                 keys = sorted(k for k in store.objects if k.startswith(Prefix))
                 for i in range(0, max(len(keys), 1), 2):
+                    store.pages += 1
                     yield {
                         "Contents": [
                             {

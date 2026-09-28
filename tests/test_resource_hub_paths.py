@@ -4,9 +4,11 @@ from __future__ import annotations
 import pytest
 
 from agentcore_platform_poc.resource_hub.paths import (
+    MAX_PATH_BYTES,
     PathRejected,
     canonical_path,
     check_glob,
+    glob_matches,
     object_key,
     relative,
     user_prefix,
@@ -97,3 +99,45 @@ def test_encoded_separator_in_raw_input_is_rejected(raw: str) -> None:
 def test_invalid_utf8_escape_is_path_rejected() -> None:
     with pytest.raises(PathRejected):
         canonical_path("a%ffb", decode=True)
+
+
+def test_joined_key_over_the_s3_limit_is_rejected() -> None:
+    path = "x" * (MAX_PATH_BYTES - len(user_prefix(A)) + 1)
+    assert canonical_path(path, decode=False) == path  # the path alone is short enough
+    with pytest.raises(PathRejected):
+        object_key(A, path)
+
+
+@pytest.mark.parametrize("decode", [True, False])
+def test_lone_surrogate_is_path_rejected(decode: bool) -> None:
+    with pytest.raises(PathRejected):
+        canonical_path("a\ud800b", decode=decode)
+
+
+def test_long_glob_is_rejected() -> None:
+    with pytest.raises(PathRejected):
+        check_glob("a" * (MAX_PATH_BYTES + 1))
+
+
+@pytest.mark.parametrize(
+    ("glob", "path", "expected"),
+    [
+        ("*.md", "brief.md", True),
+        ("*.md", "docs/brief.md", False),
+        ("docs/*", "docs/a.md", True),
+        ("docs/*", "docs/private/secret.md", False),
+        ("a?b", "a/b", False),
+        ("docs/**/x?.txt", "docs/x1.txt", True),
+        ("docs/**/x?.txt", "docs/a/b/x1.txt", True),
+        ("**", "a/b/c", True),
+        ("**/*.md", "a/b.md", True),
+        ("**/*.md", "a/b.txt", False),
+    ],
+)
+def test_glob_wildcards_stay_inside_one_segment(glob: str, path: str, expected: bool) -> None:
+    assert glob_matches(glob, path) is expected
+
+
+def test_many_double_stars_match_quickly() -> None:
+    glob = "/".join(["**"] * 300 + ["nomatch"])
+    assert glob_matches(check_glob(glob), "/".join("d" * 60)) is False
