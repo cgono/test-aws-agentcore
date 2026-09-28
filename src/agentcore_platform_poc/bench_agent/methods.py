@@ -167,7 +167,8 @@ class MirrorMethod(DirectMethod):
     async def read(self, path: str) -> int:
         if path not in self._fetched:
             await self._fetch(path)
-        return (self.root / path).stat().st_size
+        # Read the whole local copy: the benchmark times a read, not a stat.
+        return await asyncio.to_thread(_read_file, self.root / path)
 
     async def write(self, path: str, data: Data) -> None:
         target = self.root / path
@@ -184,6 +185,14 @@ class MirrorMethod(DirectMethod):
         shutil.rmtree(self.root, ignore_errors=True)
         self._synced.clear()
         self._fetched.clear()
+
+
+def _read_file(path: Path, chunk: int = 4 * 1024 * 1024) -> int:
+    total = 0
+    with path.open("rb") as handle:
+        while part := handle.read(chunk):
+            total += len(part)
+    return total
 
 
 async def rg_search(rg: Path, cwd: Path, folder: str, glob: str, text: str) -> Matches:

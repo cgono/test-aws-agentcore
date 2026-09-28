@@ -794,14 +794,14 @@ and add `POC3_USER_A_OID` / `POC3_USER_B_OID` to `.env`.
 
 ```bash
 mkdir -p .poc3-expiry && chmod 700 .poc3-expiry
-python3 -c "import json;print(json.load(open('.poc3-tokens.json'))['a']['hub'])" > .poc3-expiry/hub-token && chmod 600 .poc3-expiry/hub-token
+.venv/bin/python -c "import json;print(json.load(open('.poc3-tokens.json'))['a']['hub'])" > .poc3-expiry/hub-token && chmod 600 .poc3-expiry/hub-token
 ```
 
 Restart the unified API with `POC3_EXPIRY_TEST_MODE=true POC3_MAX_GRANT_TTL_S=7200`, then:
 
 ```bash
 .venv/bin/python -m scripts.platform_cli grant --user a --ttl 7200 --out .poc3-expiry/grant
-python3 -c "import jwt;print('user token exp', jwt.decode(open('.poc3-expiry/hub-token').read(),options={'verify_signature':False})['exp'])"
+.venv/bin/python -c "import jwt;print('user token exp', jwt.decode(open('.poc3-expiry/hub-token').read(),options={'verify_signature':False})['exp'])"
 ```
 
 Record the token `exp` (Unix time). Restart the unified API without expiry mode for Steps 6–7.
@@ -829,7 +829,7 @@ POC3_LIVE=1 .venv/bin/python -m pytest tests/integration/test_platform_live.py -
    left, enable raw mode, and run the pair:
 
 ```bash
-python3 -c "import jwt,time;left=jwt.decode(open('.poc3-expiry/grant').read(),options={'verify_signature':False})['exp']-time.time();print('grant seconds left',int(left));assert left>600, 'control grant too close to expiry: redo Step 5'"
+.venv/bin/python -c "import jwt,time;left=jwt.decode(open('.poc3-expiry/grant').read(),options={'verify_signature':False})['exp']-time.time();print('grant seconds left',int(left));assert left>600, 'control grant too close to expiry: redo Step 5'"
 (cd infra/terraform/platform && terraform apply -var allow_raw_user_token=true)
 # restart the unified API with POC3_EXPIRY_TEST_MODE=true POC3_MAX_GRANT_TTL_S=7200
 .venv/bin/python -m scripts.platform_cli login --user a    # fresh api token (the old one expired too)

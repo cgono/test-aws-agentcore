@@ -93,9 +93,11 @@ def _verdict(op: str, target: str, s: dict[str, Any]) -> str:
     limits = THRESHOLDS.get((op, _workload(op, target) or ""))
     if limits is None:
         return "recorded"
-    p50_ok = s["p50"] <= limits[0]
-    p95_ok = s["p95"] is None or s["p95"] <= limits[1]
-    return "pass" if p50_ok and p95_ok else "fail"
+    if s["p50"] > limits[0]:
+        return "fail"
+    if s["p95"] is None:
+        return "recorded"  # under MIN_P95_SAMPLES warm rows: the p95 half cannot be judged
+    return "pass" if s["p95"] <= limits[1] else "fail"
 
 
 def _cell(value: Any) -> str:

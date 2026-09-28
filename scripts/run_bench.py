@@ -16,6 +16,7 @@ from agentcore_platform_poc.bench_agent.methods import digest
 from agentcore_platform_poc.bench_fixtures import NEEDLE
 from agentcore_platform_poc.bench_report import render_markdown, summarize
 from agentcore_platform_poc.caller import TokenStore
+from agentcore_platform_poc.resource_hub.paths import glob_matches
 
 BENCH_DIR = Path("evidence/bench")
 METHODS = ["direct", "hub_search", "mirage_sdk", "mirage_fuse", "mirror"]
@@ -31,13 +32,10 @@ LARGE_OPS = [
     ("read", "bench/large/huge/h050_0.txt", None),
     ("read", "bench/large/huge/h1g_0.txt", None),
     ("read", "bench/large/huge/h5g_0.txt", None),
-    ("search", "bench/large/huge|bench/large/huge/*", NEEDLE),
+    # The 5 GB file, not the whole huge folder: that folder is 6.55 GB, above the Hub's 6 GiB
+    # search cap, so hub_search could only report truncation.
+    ("search", "bench/large/huge|bench/large/huge/h5g_0.txt", NEEDLE),
 ]
-SEARCH_FOLDERS = (
-    ("small", "bench/small"),
-    ("large", "bench/large/small"),
-    ("large", "bench/large/huge"),
-)
 CASE_FIELDS = ("method", "op", "target", "text", "fresh")
 
 
@@ -73,12 +71,14 @@ def expected_results(bench_dir: Path) -> dict[str, str]:
     manifests = {
         w: json.loads((bench_dir / f"manifest-{w}.json").read_text()) for w in ("small", "large")
     }
+    found = [tuple(m) for manifest in manifests.values() for m in manifest["matches"]]
     expected: dict[str, str] = {}
-    for workspace, prefix in SEARCH_FOLDERS:
-        matches = [
-            tuple(m) for m in manifests[workspace]["matches"] if m[0].startswith(prefix + "/")
-        ]
-        expected[f"{prefix}|{prefix}/*"] = digest(matches)
+    for op, target, _text in SMALL_OPS + LARGE_OPS:
+        if op == "search":
+            folder, glob = target.split("|", 1)
+            expected[target] = digest(
+                [m for m in found if m[0].startswith(folder + "/") and glob_matches(glob, m[0])]
+            )
     expected["bench/large"] = digest([f["path"] for f in manifests["large"]["files"]])
     for manifest in manifests.values():
         for spec in manifest["files"]:
@@ -101,14 +101,29 @@ def _row(case: dict[str, object], response: httpx.Response) -> dict[str, Any]:
     return result | {"ok": result.get("ok") is True}
 
 
-def _latest(rows_file: Path) -> dict[str, dict[str, Any]]:
+def _latest(rows_file: Path, user: str) -> dict[str, dict[str, Any]]:
+    """This user's rows, the last one per key (a retried case replaces its earlier failure)."""
     latest: dict[str, dict[str, Any]] = {}
     if rows_file.exists():
         for line in rows_file.read_text().splitlines():
-            if line.strip():
+            try:
                 row = json.loads(line)
-                latest[str(row["key"])] = row  # a retried case replaces its earlier failure
+            except ValueError:
+                continue  # a line cut off by a crash mid-append; that case runs again
+            if isinstance(row, dict) and row.get("user") == user:
+                latest[str(row["key"])] = row
     return latest
+
+
+def _append(rows_file: Path, row: dict[str, Any]) -> None:
+    rows_file.parent.mkdir(parents=True, exist_ok=True)
+    with rows_file.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell():
+            handle.seek(-1, os.SEEK_END)
+            if handle.read(1) != b"\n":
+                handle.write(b"\n")  # end a cut-off line, so this row stays parseable
+        handle.write(json.dumps(row).encode() + b"\n")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -123,7 +138,7 @@ def main(argv: list[str] | None = None) -> int:
     except FileNotFoundError:
         print(f"no fixture manifests in {BENCH_DIR}: run -m scripts.seed_bench_fixtures first")
         return 2
-    done = {key for key, row in _latest(rows_file).items() if row.get("ok")}
+    done = {key for key, row in _latest(rows_file, args.user).items() if row.get("ok")}
     # One Runtime session per (method, op, target) in this run: rep 0 is the cold case in a new
     # session, and warm reps reuse it (same microVM and method instance). A session from an
     # earlier run is gone, so a resumed group starts a new session (the agent reports it cold).
@@ -164,14 +179,13 @@ def main(argv: list[str] | None = None) -> int:
             "key": key,
             "rep": case["rep"],
             "session_id": sessions[group],
+            "user": args.user,
         }
-        rows_file.parent.mkdir(parents=True, exist_ok=True)
-        with rows_file.open("a") as handle:
-            handle.write(json.dumps(row) + "\n")
+        _append(rows_file, row)
         warm_ran_cold = row["ok"] and row["cold"] and not case["fresh"]
         note = " (warm rep ran cold: the session ended)" if warm_ran_cold else ""
         print(key, row["ok"], row.get("ms"), row.get("error") or "", note)
-    summary = summarize(list(_latest(rows_file).values()), expected)
+    summary = summarize(list(_latest(rows_file, args.user).values()), expected)
     (BENCH_DIR / "summary.md").write_text(render_markdown(summary))
     print(f"wrote {BENCH_DIR / 'summary.md'}")
     return 0

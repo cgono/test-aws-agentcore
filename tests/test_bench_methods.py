@@ -184,6 +184,19 @@ async def test_mirror_read_fetches_only_that_file(tmp_path: Path) -> None:
     ]
 
 
+async def test_mirror_warm_read_reads_the_local_copy(tmp_path: Path) -> None:
+    # A warm read must read the bytes, not only stat the copy (the benchmark times it).
+    method = MirrorMethod(FakeHub(), root=tmp_path, rg=Path("rg"))  # type: ignore[arg-type]
+    await method.read("bench/small/f00.txt")
+    copy = tmp_path / "bench/small/f00.txt"
+    copy.chmod(0)
+    try:
+        with pytest.raises(PermissionError):
+            await method.read("bench/small/f00.txt")
+    finally:
+        copy.chmod(0o600)
+
+
 async def test_direct_scan_memory_is_bounded_on_a_huge_line() -> None:
     hub = FakeHub()
     hub.files = {"bench/small/long.txt": b"a" * 20_000_000 + NEEDLE.encode() + b"b" * 10 + b"\nx\n"}

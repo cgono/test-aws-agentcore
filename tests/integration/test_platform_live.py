@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import csv
 import io
 import json
@@ -87,13 +88,17 @@ def _hub_get(out: dict[str, str], user: str, path: str) -> httpx.Response:
     )
 
 
-def _keys(out: dict[str, str], prefix: str) -> dict[str, str]:
-    """Key → ETag under a prefix: a rewrite of an existing object changes its ETag."""
+def _keys(out: dict[str, str], prefix: str) -> dict[str, tuple[str, str]]:
+    """Key → (ETag, LastModified): any rewrite, even of the same bytes, changes LastModified."""
     s3 = boto3.client("s3", region_name=out["aws_region"])
     pages = s3.get_paginator("list_objects_v2").paginate(
         Bucket=out["workspace_bucket"], Prefix=prefix
     )
-    return {item["Key"]: item["ETag"] for page in pages for item in page.get("Contents", [])}
+    return {
+        item["Key"]: (item["ETag"], item["LastModified"].isoformat())
+        for page in pages
+        for item in page.get("Contents", [])
+    }
 
 
 def _png_chunks(data: bytes, kind: bytes) -> list[bytes]:
@@ -283,9 +288,17 @@ def test_q6_sandbox_has_no_s3(out: dict[str, str]) -> None:
         result = parse_tool_result(client.execute_code(code))
     finally:
         client.stop()
-    denied = "allowed" not in result.output and bool(result.output.strip())
+    # The code must run, and both S3 calls must end in an exception (not some other failure).
+    lines = result.stdout.strip().splitlines()
+    outcomes = ast.literal_eval(lines[-1]) if lines else None
+    denied = (
+        not result.failed
+        and isinstance(outcomes, list)
+        and len(outcomes) == 2
+        and all(isinstance(o, str) and o != "allowed" for o in outcomes)
+    )
     _note("Q6.sandbox_no_s3", denied, output=result.output[:200])
-    assert denied
+    assert denied, result.output[:500]
 
 
 def test_q2_runtime_rejects_wrong_audience(out: dict[str, str]) -> None:

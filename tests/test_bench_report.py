@@ -122,3 +122,10 @@ def test_markdown_escapes_pipes_and_newlines() -> None:
     header, _, line = text.splitlines()
     assert "bench/large/small\\|bench/large/small/*" in line and "boom \\| x y" in line
     assert line.count("|") - line.count("\\|") == header.count("|")  # same number of cells
+
+
+def test_too_few_warm_samples_are_recorded_not_passed() -> None:
+    # The latency thresholds are p50 AND p95: without 20 warm samples there is no p95 to judge.
+    rows = [_row(100, cold=True)] + [_row(100)] * 19
+    [summary] = summarize(rows, {SEARCH: "d"})
+    assert summary["p95"] is None and summary["verdict"] == "recorded"

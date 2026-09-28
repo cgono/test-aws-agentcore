@@ -76,9 +76,7 @@ def test_expected_results_from_the_manifests(tmp_path: Path) -> None:
     assert expected["bench/large/small|bench/large/small/*"] == digest(
         [("bench/large/small/f001.txt", 5)]
     )
-    assert expected["bench/large/huge|bench/large/huge/*"] == digest(
-        [("bench/large/huge/h1g_0.txt", 10)]
-    )
+    assert expected["bench/large/huge|bench/large/huge/h5g_0.txt"] == digest([])  # h1g excluded
     assert expected["bench/large"] == digest(
         ["bench/large/huge/h1g_0.txt", "bench/large/small/f001.txt"]
     )
@@ -137,7 +135,7 @@ def test_runs_every_case_with_one_session_per_group(
     assert [c["case"]["fresh"] for c in calls] == [True, False, False, True]
     assert set(calls[0]["case"]) == {"method", "op", "target", "text", "fresh"}
     summary = (workdir / "evidence/bench/summary.md").read_text()
-    assert "| direct | read |" in summary and "| pass |" in summary
+    assert "| direct | read |" in summary and "| recorded |" in summary  # 2 warm rows < 20
 
 
 def test_rerun_skips_successful_rows_and_retries_failures_in_a_new_session(
@@ -241,3 +239,46 @@ def test_missing_manifest_stops_before_any_call(
     monkeypatch.setattr(run_bench.httpx, "post", _agent(calls))
     assert run_bench.main([]) == 2 and calls == []
     assert "seed_bench_fixtures" in capsys.readouterr().out
+
+
+def test_a_partial_last_line_does_not_block_resume(
+    workdir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(run_bench.httpx, "post", _agent(calls))
+    monkeypatch.setattr(run_bench, "plan", lambda seed: CASES[:2])
+    assert run_bench.main([]) == 0
+    rows_file = workdir / "evidence/bench/rows.jsonl"
+    rows_file.write_text(rows_file.read_text() + '{"key": "cut-off')  # a crash mid-append
+    calls.clear()
+    monkeypatch.setattr(run_bench, "plan", lambda seed: CASES[:3])
+    assert run_bench.main([]) == 0
+    assert len(calls) == 1  # the cut-off line is skipped, the two good rows still count
+    lines = rows_file.read_text().splitlines()
+    assert lines[2] == '{"key": "cut-off' and json.loads(lines[3])["rep"] == 2
+
+
+def test_rows_belong_to_one_user(workdir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    TokenStore().save("b", "api", "tok-b")
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(run_bench.httpx, "post", _agent(calls))
+    assert run_bench.main(["--user", "a"]) == 0
+    calls.clear()
+    assert run_bench.main(["--user", "b"]) == 0
+    assert len(calls) == len(CASES)  # A's rows are not B's results
+    assert {r["user"] for r in _rows(workdir)} == {"a", "b"}
+
+
+def test_large_search_targets_the_5_gb_file(tmp_path: Path) -> None:
+    # The whole huge folder is 6.55 GB, above the Hub's 6 GiB search cap.
+    targets = {str(c["target"]) for c in run_bench.plan(7) if c["op"] == "search"}
+    assert "bench/large/huge|bench/large/huge/h5g_0.txt" in targets
+    assert "bench/large/huge|bench/large/huge/*" not in targets
+    _manifests(tmp_path)
+    manifest = tmp_path / "evidence/bench/manifest-large.json"
+    data = json.loads(manifest.read_text())
+    data["matches"].append(["bench/large/huge/h5g_0.txt", 10])
+    manifest.write_text(json.dumps(data))
+    expected = run_bench.expected_results(tmp_path / "evidence/bench")
+    key = "bench/large/huge|bench/large/huge/h5g_0.txt"
+    assert expected[key] == digest([("bench/large/huge/h5g_0.txt", 10)])
