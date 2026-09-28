@@ -25,7 +25,7 @@ async def invoke(payload: dict[str, Any], context: RequestContext) -> dict[str, 
                 [os.environ["HUB_SCOPE"], os.environ["GATEWAY_SCOPE"]]
             )
         elif name == "claude_cli":
-            from agentcore_platform_poc.agent_platform.tokens import (  # type: ignore[import-untyped]
+            from agentcore_platform_poc.agent_platform.tokens import (
                 IdentityTokenSource,
                 write_token_file,
             )

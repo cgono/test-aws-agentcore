@@ -35,7 +35,7 @@ def safe_claims(token: str) -> dict[str, Any]:
 
 async def identity_probe(scopes: list[str]) -> dict[str, Any]:
     # Task 13 supplies the token source; Task 7 is the first live invocation.
-    from agentcore_platform_poc.agent_platform.tokens import (  # type: ignore[import-untyped]
+    from agentcore_platform_poc.agent_platform.tokens import (
         IdentityTokenSource,
     )
 

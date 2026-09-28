@@ -42,6 +42,7 @@ agentcore_identity_poc = ["static/*.html"]
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-markers"
+asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = ["integration: requires live cloud/provider credentials"]
 
