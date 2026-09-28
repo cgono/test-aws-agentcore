@@ -39,12 +39,9 @@ def _build(name: str, hub: ResourceHubClient) -> Method:
         return HubSearchMethod(hub)
     if name == "mirror":
         return MirrorMethod(hub)
-    # Task 21 adds mirage_resource; drop this ignore then.
-    from agentcore_platform_poc.bench_agent.mirage_resource import (  # type: ignore[import-untyped]
-        MirageMethod,
-    )
+    from agentcore_platform_poc.bench_agent.mirage_resource import MirageMethod
 
-    return MirageMethod(hub, fuse=(name == "mirage_fuse"))  # type: ignore[no-any-return]
+    return MirageMethod(hub, fuse=(name == "mirage_fuse"))
 
 
 async def invoke(payload: dict[str, Any], context: RequestContext) -> dict[str, Any]:

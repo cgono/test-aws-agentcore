@@ -37,7 +37,16 @@ class FakeHub:
         ]
 
     async def stat(self, path: str) -> int:
+        from agentcore_platform_poc.agent_platform.hub_client import HubError
+
+        if path not in self.files:
+            raise HubError(404, "not_found")
         return len(self.files[path])
+
+    async def read(self, path: str, offset: int = 0, length: int | None = None) -> bytes:
+        self.requests_made += 1
+        data = self.files[path][offset:]
+        return data if length is None else data[:length]
 
     async def iter_chunks(self, path: str, chunk: int = 4 * 1024 * 1024) -> Any:
         data = self.files[path]
