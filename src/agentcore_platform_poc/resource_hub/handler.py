@@ -117,7 +117,12 @@ def _route(
             data, total = store.read_range(key, 0, None)
             return "read", path, _bytes(200, data, {"x-total-size": str(total)})
         start, end = int(match.group(1)), int(match.group(2)) if match.group(2) else None
-        data, total = store.read_range(key, start, end)
+        try:
+            data, total = store.read_range(key, start, end)
+        except ValueError:
+            return "read", path, _json(416, {"error": "bad_range"})
+        if not data:  # only an empty file gets here; no byte range can be satisfied
+            return "read", path, _json(416, {"error": "bad_range"})
         last = start + len(data) - 1
         return (
             "read",
@@ -147,9 +152,12 @@ def _route(
             or (glob is not None and not isinstance(glob, str))
         ):
             return "search", "", _json(400, {"error": "bad_search_request"})
-        result = store.search(
-            caller.oid, text, glob=check_glob(glob) if glob else None, ignore_case=ignore
-        )
+        try:
+            text.encode("utf-8")
+        except UnicodeEncodeError:  # a lone surrogate from a JSON "\ud800" escape
+            return "search", "", _json(400, {"error": "bad_search_request"})
+        checked_glob = check_glob(glob) if glob is not None else None
+        result = store.search(caller.oid, text, glob=checked_glob, ignore_case=ignore)
         return (
             "search",
             glob or "",
@@ -183,7 +191,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         response = _json(404, {"error": "not_found"})
     except TooLarge:
         response = _json(413, {"error": "too_large"})
-    except ValueError:
-        response = _json(416, {"error": "bad_range"})
+    except Exception:  # never return exception text to the caller
+        response = _json(500, {"error": "internal"})
     _log(caller, op, path, response["statusCode"], started)
     return response

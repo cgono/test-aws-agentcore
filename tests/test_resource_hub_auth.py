@@ -138,3 +138,12 @@ def test_settings_from_env() -> None:
     )
     with pytest.raises(ValueError):
         HubSettings.from_env({})
+
+
+def test_grant_mode_logs_the_signed_sid_not_the_header() -> None:
+    headers = {
+        "authorization": "Bearer research",
+        "x-resource-grant": _grant(),
+        "x-session-id": "x",
+    }
+    assert _auth(headers).sid == "s1"

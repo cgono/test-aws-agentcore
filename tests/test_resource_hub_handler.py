@@ -123,7 +123,15 @@ def test_search(s3: FakeS3) -> None:
 
 @pytest.mark.parametrize(
     "payload",
-    [b"not json", b"[1]", b'{"text": ""}', b'{"text": "x", "glob": "../*"}', b'{"text": 5}'],
+    [
+        b"not json",
+        b"[1]",
+        b'{"text": ""}',
+        b'{"text": "x", "glob": "../*"}',
+        b'{"text": 5}',
+        b'{"text": "x", "glob": ""}',
+        b'{"text": "\\ud800"}',
+    ],
 )
 def test_bad_search_body(s3: FakeS3, payload: bytes) -> None:
     assert hub.handler(_event("POST", "/v1/search", body=payload), None)["statusCode"] == 400
@@ -144,3 +152,24 @@ def test_log_line_has_no_token(s3: FakeS3, capsys: pytest.CaptureFixture[str]) -
     hub.handler(_event("GET", "/v1/list/"), None)
     out = capsys.readouterr().out
     assert "Bearer" not in out and '"oid": "' + A + '"' in out
+
+
+def test_range_on_an_empty_file_is_416(s3: FakeS3) -> None:
+    s3.objects[f"users/{A}/empty.txt"] = b""
+    event = _event("GET", "/v1/files/empty.txt", headers={"range": "bytes=0-"})
+    assert hub.handler(event, None)["statusCode"] == 416
+
+
+def test_whole_read_of_an_empty_file_is_200(s3: FakeS3) -> None:
+    s3.objects[f"users/{A}/empty.txt"] = b""
+    response = hub.handler(_event("GET", "/v1/files/empty.txt"), None)
+    assert response["statusCode"] == 200 and base64.b64decode(response["body"]) == b""
+
+
+def test_unexpected_error_is_a_plain_500(s3: FakeS3, monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*_: Any, **__: Any) -> Any:
+        raise ValueError("internal detail")
+
+    monkeypatch.setattr(WorkspaceStore, "list", boom)
+    response = hub.handler(_event("GET", "/v1/list/"), None)
+    assert response["statusCode"] == 500 and _json(response) == {"error": "internal"}

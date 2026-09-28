@@ -51,7 +51,7 @@ def authenticate(
             raise AuthError(401, error.code) from error
         if checked.agent != azp:
             raise AuthError(403, "agent_mismatch")
-        return Caller("agent_grant", checked.sub, azp, sid)
+        return Caller("agent_grant", checked.sub, azp, checked.sid)  # signed, not the header
     if not settings.allow_raw_user_token:
         raise AuthError(403, "raw_mode_disabled")
     oid = require_user(verifier.claims(user_token or ""), scope=USER_SCOPE)
