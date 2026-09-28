@@ -1,6 +1,8 @@
 # tests/test_platform_sandbox.py
 from __future__ import annotations
 
+import threading
+import time
 from typing import Any
 
 import pytest
@@ -71,3 +73,26 @@ def test_bad_sandbox_paths(bad: str) -> None:
 
 def test_stop_before_start_is_noop() -> None:
     Sandbox("r", "ci", client_factory=FakeCI).stop()
+
+
+class SlowStartCI(FakeCI):
+    def start(self, identifier: str) -> None:
+        time.sleep(0.1)
+        super().start(identifier)
+
+
+def test_concurrent_first_runs_start_one_session() -> None:
+    made: list[FakeCI] = []
+
+    def factory(region: str) -> FakeCI:
+        made.append(SlowStartCI(region))
+        return made[-1]
+
+    sandbox = Sandbox("r", "ci", client_factory=factory)
+    threads = [threading.Thread(target=sandbox.run, args=("x", {}, [])) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    sandbox.stop()
+    assert len(made) == 1 and made[0].stopped == 1

@@ -9,7 +9,13 @@ import pytest
 
 from agentcore_platform_poc.agent_platform.hub_client import HubError
 from agentcore_platform_poc.agent_platform.sandbox import RunResult
-from agentcore_platform_poc.agent_platform.tools import ToolContext, build_tools
+from agentcore_platform_poc.agent_platform.tools import (
+    MAX_LIST_ENTRIES,
+    MAX_RUN_INPUT_BYTES,
+    MAX_UPLOAD_BYTES,
+    ToolContext,
+    build_tools,
+)
 
 
 class FakeHub:
@@ -107,3 +113,89 @@ async def test_fetch_rejection_is_tool_error(tools: tuple[dict[str, Any], ToolCo
     specs, _ = tools
     result = await specs["fetch_url"].handler({"url": "https://evil.example.test/"})
     assert result.is_error and json.loads(result.text)["error"] == "host_not_allowed"
+
+
+class HugeInputHub(FakeHub):
+    async def stat(self, path: str) -> int:
+        return MAX_RUN_INPUT_BYTES + 1 if path == "huge.bin" else await super().stat(path)
+
+    async def read(self, path: str, offset: int = 0, length: int | None = None) -> bytes:
+        assert path != "huge.bin", "an oversized input must not be read"
+        return await super().read(path, offset, length)
+
+
+async def test_run_code_refuses_oversized_inputs_before_reading() -> None:
+    ctx = ToolContext(hub=HugeInputHub(), sandbox=FakeSandbox(), http=httpx.AsyncClient())  # type: ignore[arg-type]
+    run_code = {t.name: t for t in build_tools(ctx)}["run_code"]
+    result = await run_code.handler({"code": "x", "inputs": ["brief.md", "huge.bin"]})
+    assert result.is_error and json.loads(result.text)["error"] == "inputs_too_large"
+    assert ctx.sandbox.calls == []  # type: ignore[attr-defined]
+
+
+class FailingSandbox(FakeSandbox):
+    def run(self, code: str, inputs: dict[str, bytes], outputs: list[str]) -> RunResult:
+        raise RuntimeError("secret upstream detail")
+
+
+async def test_unexpected_sandbox_error_is_a_safe_tool_error() -> None:
+    ctx = ToolContext(hub=FakeHub(), sandbox=FailingSandbox(), http=httpx.AsyncClient())  # type: ignore[arg-type]
+    result = await {t.name: t for t in build_tools(ctx)}["run_code"].handler({"code": "x"})
+    assert result.is_error and json.loads(result.text) == {"error": "tool_failed"}
+
+
+async def test_network_error_is_a_safe_tool_error() -> None:
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("secret detail", request=request)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(refuse))
+    ctx = ToolContext(hub=FakeHub(), sandbox=FakeSandbox(), http=http)  # type: ignore[arg-type]
+    fetch = {t.name: t for t in build_tools(ctx)}["fetch_url"]
+    result = await fetch.handler({"url": "https://api.worldbank.org/v2/country"})
+    assert result.is_error and json.loads(result.text) == {"error": "network_error"}
+
+
+class BigOutputSandbox(FakeSandbox):
+    def run(self, code: str, inputs: dict[str, bytes], outputs: list[str]) -> RunResult:
+        files = {"a.png": b"a", "big.bin": b"x" * (MAX_UPLOAD_BYTES + 1), "forbidden/x": b"f"}
+        return RunResult("", "", 0, False, files, [])
+
+
+async def test_outputs_over_the_upload_limit_and_failed_writes_are_reported() -> None:
+    ctx = ToolContext(hub=FakeHub(), sandbox=BigOutputSandbox(), http=httpx.AsyncClient())  # type: ignore[arg-type]
+    run_code = {t.name: t for t in build_tools(ctx)}["run_code"]
+    result = await run_code.handler({"code": "x", "outputs": ["a.png", "big.bin", "forbidden/x"]})
+    body = json.loads(result.text)
+    assert result.is_error and body["saved"] == ["a.png"] and ctx.files_written == ["a.png"]
+    assert body["too_large"] == ["big.bin"] and body["not_saved"] == {
+        "forbidden/x": "agent_mismatch"
+    }
+    assert "big.bin" not in ctx.hub.files  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    ("name", "args"),
+    [
+        ("run_code", {"code": "x", "inputs": "abc"}),
+        ("run_code", {"code": "x", "outputs": [1]}),
+        ("ws_read", {"path": "brief.md", "offset": 2.9}),
+        ("ws_read", {"path": "brief.md", "offset": -1}),
+        ("ws_read", {"path": "brief.md", "offset": True}),
+        ("ws_search", {"text": "a", "ignore_case": "false"}),
+        ("ws_list", {"path": ["a"]}),
+        ("ws_write", {"path": "a", "content": "b", "extra": 1}),
+    ],
+)
+async def test_wrong_argument_types_are_rejected(
+    tools: tuple[dict[str, Any], ToolContext], name: str, args: dict[str, Any]
+) -> None:
+    specs, ctx = tools
+    result = await specs[name].handler(args)
+    assert result.is_error and json.loads(result.text)["error"] == "bad_arguments"
+    assert ctx.sandbox.calls == []  # type: ignore[attr-defined]
+
+
+async def test_ws_list_is_bounded(tools: tuple[dict[str, Any], ToolContext]) -> None:
+    specs, ctx = tools
+    ctx.hub.files.update({f"f{i:04d}.txt": b"x" for i in range(MAX_LIST_ENTRIES + 10)})  # type: ignore[attr-defined]
+    body = json.loads((await specs["ws_list"].handler({})).text)
+    assert len(body["entries"]) == MAX_LIST_ENTRIES and body["more"] == 12

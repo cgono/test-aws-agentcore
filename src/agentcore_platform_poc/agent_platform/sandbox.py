@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -51,6 +52,8 @@ class Sandbox:
         self._identifier = identifier
         self._factory = client_factory
         self._client: Any = None
+        # run() is called from worker threads; one session, one call at a time.
+        self._lock = threading.Lock()
 
     def _started(self) -> Any:
         if self._client is None:
@@ -62,6 +65,10 @@ class Sandbox:
     def run(self, code: str, inputs: dict[str, bytes], outputs: list[str]) -> RunResult:
         for path in [*inputs, *outputs]:
             _check(path)
+        with self._lock:
+            return self._run(code, inputs, outputs)
+
+    def _run(self, code: str, inputs: dict[str, bytes], outputs: list[str]) -> RunResult:
         client = self._started()
         for path, data in inputs.items():
             client.upload_file(path, data)
@@ -80,6 +87,7 @@ class Sandbox:
         )
 
     def stop(self) -> None:
-        if self._client is not None:
-            client, self._client = self._client, None
-            client.stop()
+        with self._lock:
+            if self._client is not None:
+                client, self._client = self._client, None
+                client.stop()
