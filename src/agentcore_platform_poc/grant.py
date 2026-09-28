@@ -17,6 +17,9 @@ from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 GRANT_ISSUER = "poc3-unified-api"
 GRANT_AUDIENCE = "poc3-resource-hub"
 DEFAULT_TTL_SECONDS = 3600
+# The largest AgentCore Runtime max_lifetime. The unified API applies the per-runtime value.
+MAX_TTL_SECONDS = 8 * 3600
+_CLOCK_SKEW_SECONDS = 60  # the unified API (laptop) and the Lambda clocks may differ a little
 _REQUIRED = ("iss", "aud", "sub", "agent", "sid", "jti", "iat", "exp")
 
 
@@ -80,8 +83,8 @@ def issue_grant(
     now: int,
     jti: str | None = None,
 ) -> str:
-    if ttl_seconds <= 0:
-        raise ValueError("ttl_seconds must be positive")
+    if not 0 < ttl_seconds <= MAX_TTL_SECONDS:
+        raise ValueError(f"ttl_seconds must be between 1 and {MAX_TTL_SECONDS}")
     header = _b64(json.dumps({"alg": "ES256", "typ": "JWT"}, separators=(",", ":")).encode())
     claims = {
         "iss": GRANT_ISSUER,
@@ -114,6 +117,10 @@ def verify_grant(token: str, public_key_pem: bytes, *, now: int) -> Grant:
     if not all(isinstance(v, int) and not isinstance(v, bool) for v in (exp, iat)):
         raise GrantRejected("grant_invalid")
     if not all(isinstance(claims[k], str) and claims[k] for k in ("sub", "agent", "sid", "jti")):
+        raise GrantRejected("grant_invalid")
+    if claims["aud"] != GRANT_AUDIENCE or iat > now + _CLOCK_SKEW_SECONDS:
+        raise GrantRejected("grant_invalid")
+    if not 0 < exp - iat <= MAX_TTL_SECONDS:
         raise GrantRejected("grant_invalid")
     if now >= exp:
         raise GrantRejected("grant_expired")

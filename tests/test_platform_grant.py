@@ -12,6 +12,7 @@ from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 from agentcore_platform_poc.grant import (
     GRANT_AUDIENCE,
     GRANT_ISSUER,
+    MAX_TTL_SECONDS,
     GrantRejected,
     KmsSigner,
     LocalSigner,
@@ -120,3 +121,52 @@ def test_kms_signer_output_verifies() -> None:
     assert (
         kms.calls[0]["SigningAlgorithm"] == "ECDSA_SHA_256" and kms.calls[0]["MessageType"] == "RAW"
     )
+
+
+def _signed(claims: dict[str, object]) -> str:
+    def b64(data: bytes) -> str:
+        return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+    header = b64(json.dumps({"alg": "ES256", "typ": "JWT"}).encode())
+    payload = b64(json.dumps(claims).encode())
+    signature = LocalSigner(KEY).sign(f"{header}.{payload}".encode())
+    return f"{header}.{payload}.{b64(signature)}"
+
+
+def _claims(**overrides: object) -> dict[str, object]:
+    claims: dict[str, object] = {
+        "iss": GRANT_ISSUER,
+        "aud": GRANT_AUDIENCE,
+        "sub": A,
+        "agent": "a",
+        "sid": "s",
+        "jti": "j",
+        "iat": 1000,
+        "exp": 4600,
+    }
+    claims.update(overrides)
+    return claims
+
+
+def test_signed_helper_round_trips() -> None:
+    assert verify_grant(_signed(_claims()), PEM, now=1001).exp == 4600
+
+
+def test_ttl_above_hard_cap_rejected() -> None:
+    with pytest.raises(ValueError):
+        _grant(ttl_seconds=MAX_TTL_SECONDS + 1)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"iat": 2000},  # issued in the future (beyond the 60 s skew)
+        {"iat": 4700},  # iat after exp
+        {"exp": 1000 + MAX_TTL_SECONDS + 1},  # lifetime above the hard cap
+        {"aud": [GRANT_AUDIENCE, "other"]},  # the audience is one string
+    ],
+)
+def test_bad_time_or_audience_claims_are_invalid(overrides: dict[str, object]) -> None:
+    with pytest.raises(GrantRejected) as caught:
+        verify_grant(_signed(_claims(**overrides)), PEM, now=1001)
+    assert caught.value.code == "grant_invalid"
