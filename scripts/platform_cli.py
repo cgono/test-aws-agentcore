@@ -7,6 +7,7 @@ import json
 import os
 import uuid
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 
 import httpx
@@ -32,6 +33,7 @@ def login(user: str) -> None:
         env["POC3_CLI_CLIENT_ID"],
         authority=f"https://login.microsoftonline.com/{env['POC3_TENANT_ID']}",
     )
+    tokens: dict[str, str] = {}
     for kind, scope in (
         ("api", f"api://{env['POC3_UNIFIED_API_CLIENT_ID']}/Research.Run"),
         ("hub", f"api://{env['POC3_HUB_APP_ID']}/Workspace.ReadWrite"),
@@ -44,8 +46,22 @@ def login(user: str) -> None:
             result = app.acquire_token_by_device_flow(flow)
         if "access_token" not in result:
             raise SystemExit(f"login failed: {result.get('error')}")
-        STORE.save(user, kind, result["access_token"])
-    print(f"signed in as user {user}")
+        tokens[kind] = result["access_token"]
+    try:
+        oid = STORE.bind_identity(user, tokens["api"], tokens["hub"])
+    except ValueError as error:
+        raise SystemExit(f"login refused: {error}") from None
+    for kind, token in tokens.items():
+        STORE.save(user, kind, token)
+    print(f"signed in as user {user} (oid {oid})")
+
+
+def _json_or_error(response: httpx.Response) -> dict[str, Any]:
+    try:
+        body = response.json()
+    except ValueError:
+        return {"http_status": response.status_code, "error": "non_json_body"}
+    return body if isinstance(body, dict) else {"http_status": response.status_code, "value": body}
 
 
 def _hub(user: str, method: str, route: str, **kwargs: object) -> httpx.Response:
@@ -111,7 +127,17 @@ def main(argv: list[str] | None = None) -> int:
             headers={"authorization": f"Bearer {STORE.load(args.user, 'api')}"},
             timeout=960,
         )
-        print(json.dumps(response.json(), indent=2))
+        body_out = _json_or_error(response)
+        print(json.dumps(body_out, indent=2))
+        result = body_out.get("result")
+        failed = (
+            response.status_code >= 400
+            or not isinstance(body_out.get("status"), int)
+            or body_out["status"] >= 400
+            or not isinstance(result, dict)
+            or result.get("error") is not None
+        )
+        return 1 if failed else 0
     elif args.command == "grant":
         response = httpx.post(
             f"{_api_url()}/grants",
@@ -119,9 +145,15 @@ def main(argv: list[str] | None = None) -> int:
             headers={"authorization": f"Bearer {STORE.load(args.user, 'api')}"},
             timeout=30,
         )
-        args.out.write_text(response.json()["grant"])
+        issued = _json_or_error(response)
+        if response.status_code >= 400 or not isinstance(issued.get("grant"), str):
+            print(json.dumps(issued))
+            return 1
+        fd = os.open(args.out, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(issued["grant"])
         os.chmod(args.out, 0o600)
-        print(json.dumps({"saved": str(args.out), "exp": response.json()["exp"]}))
+        print(json.dumps({"saved": str(args.out), "exp": issued.get("exp")}))
     elif args.command == "ls":
         print(
             json.dumps(
