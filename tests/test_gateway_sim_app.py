@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable, Iterator
+from typing import Any
 
 import httpx
 import pytest
@@ -362,3 +364,119 @@ def test_field_names_are_logged_without_values(caplog: pytest.LogCaptureFixture)
             headers=GOOD,
         )
     assert "fields=messages,model" in caplog.text and "SECRET PROMPT" not in caplog.text
+
+
+def test_stream_on_count_tokens_is_rejected() -> None:
+    client, seen = _client(_ok)
+    response = client.post(
+        "/anthropic/v1/messages/count_tokens",
+        json={"model": "model-a", "stream": True, "max_tokens": 32768, "messages": []},
+        headers=GOOD,
+    )
+    assert response.status_code == 400 and response.json() == {"error": "streaming_not_supported"}
+    assert seen == []
+
+
+def _sse(request: httpx.Request) -> httpx.Response:
+    if not json.loads(request.content).get("stream"):
+        return _ok(request)
+    return httpx.Response(
+        200, content=b"event: ping\ndata: {}\n\n", headers={"content-type": "text/event-stream"}
+    )
+
+
+async def _asgi_post(app: Any, path: str, body: dict[str, Any], *, disconnect: bool) -> int:
+    raw = json.dumps(body).encode()
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"authorization", b"Bearer good"), (b"content-type", b"application/json")],
+        "client": ("127.0.0.1", 1),
+        "server": ("testserver", 80),
+    }
+    messages = [{"type": "http.request", "body": raw, "more_body": False}]
+    statuses: list[int] = []
+
+    async def receive() -> dict[str, Any]:
+        if messages:
+            return messages.pop(0)
+        if not disconnect:
+            await asyncio.sleep(3600)
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, Any]) -> None:
+        if message["type"] == "http.response.start":
+            statuses.append(message["status"])
+            if disconnect:
+                raise OSError("client went away")
+
+    try:
+        await app(scope, receive, send)
+    except OSError:
+        pass
+    return statuses[0] if statuses else 0
+
+
+async def test_stream_permit_is_released_when_the_client_disconnects() -> None:
+    upstream = httpx.AsyncClient(transport=httpx.MockTransport(_sse))
+    app = create_app(_settings(max_concurrency=1), authorizer=FakeAuthorizer(), upstream=upstream)
+    body = {"model": "model-a", "stream": True, "messages": []}
+    await _asgi_post(app, "/anthropic/v1/messages", body, disconnect=True)
+    status = await _asgi_post(
+        app, "/anthropic/v1/messages", {**body, "stream": False}, disconnect=False
+    )
+    assert status == 200
+
+
+def test_stream_permit_is_released_on_unexpected_upstream_error() -> None:
+    def boom(request: httpx.Request) -> httpx.Response:
+        if json.loads(request.content).get("stream"):
+            raise RuntimeError("unexpected")
+        return _ok(request)
+
+    client, _ = _client(boom, max_concurrency=1)
+    with pytest.raises(RuntimeError):
+        client.post(
+            "/anthropic/v1/messages",
+            json={"model": "model-a", "stream": True, "messages": []},
+            headers=GOOD,
+        )
+    response = client.post(
+        "/anthropic/v1/messages", json={"model": "model-a", "messages": []}, headers=GOOD
+    )
+    assert response.status_code == 200
+
+
+def test_unknown_field_names_are_not_logged(caplog: pytest.LogCaptureFixture) -> None:
+    client, _ = _client(_ok)
+    with caplog.at_level("INFO"):
+        response = client.post(
+            "/anthropic/v1/messages",
+            json={"model": "model-a", "messages": [], "SECRET_TOKEN=abc\nFAKE LINE": 1},
+            headers=GOOD,
+        )
+    assert response.status_code == 400
+    assert "SECRET_TOKEN" not in caplog.text and "unknown=1" in caplog.text
+
+
+def test_thinking_budget_follows_clamped_max_tokens() -> None:
+    client, seen = _client(_ok)
+    client.post(
+        "/anthropic/v1/messages",
+        json={
+            "model": "model-a",
+            "max_tokens": 32000,
+            "thinking": {"type": "enabled", "budget_tokens": 10000},
+            "messages": [],
+        },
+        headers=GOOD,
+    )
+    sent = json.loads(seen[0].content)
+    assert sent["max_tokens"] == 64 and sent["thinking"] == {"type": "enabled", "budget_tokens": 63}

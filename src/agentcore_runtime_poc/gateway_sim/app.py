@@ -85,7 +85,7 @@ def _custom_tools_only(body: dict[str, Any]) -> bool:
 def _normalize_body(
     provider: Provider, body: dict[str, Any], settings: GatewaySettings, *, count_only: bool = False
 ) -> str | None:
-    if body.get("stream") and provider == "openai":
+    if body.get("stream") and (provider == "openai" or count_only):
         return "streaming_not_supported"
     allowed = settings.openai_models if provider == "openai" else settings.anthropic_models
     model = body.get("model")
@@ -105,16 +105,24 @@ def _normalize_body(
     value = body.get(field)
     if value is None:
         body[field] = settings.max_output_tokens
-        return None
-    if isinstance(value, bool) or not isinstance(value, int):
+    elif isinstance(value, bool) or not isinstance(value, int) or value < 1:
         return "max_tokens_out_of_range"
-    if value < 1:
-        return "max_tokens_out_of_range"
-    if value > settings.max_output_tokens:
+    elif value > settings.max_output_tokens:
         if provider == "openai":
             return "max_tokens_out_of_range"
         body[field] = settings.max_output_tokens
+    if provider == "anthropic":
+        _fit_thinking_budget(body)
     return None
+
+
+def _fit_thinking_budget(body: dict[str, Any]) -> None:
+    # Anthropic requires budget_tokens < max_tokens; keep it valid after the clamp.
+    thinking = body.get("thinking")
+    budget = thinking.get("budget_tokens") if isinstance(thinking, dict) else None
+    if isinstance(thinking, dict) and isinstance(budget, int) and not isinstance(budget, bool):
+        if budget >= body["max_tokens"]:
+            body["thinking"] = {**thinking, "budget_tokens": body["max_tokens"] - 1}
 
 
 def _upstream_request(provider: Provider, settings: GatewaySettings) -> tuple[str, dict[str, str]]:
@@ -183,13 +191,37 @@ async def _forward(
     return 200, data
 
 
+class _Relay(StreamingResponse):
+    """SSE relay that owns the upstream response and the concurrency permit.
+
+    Cleanup is in __call__, not in the body generator: a client that disconnects before the
+    first chunk never starts the generator, so its finally would never run.
+    """
+
+    def __init__(self, upstream: httpx.Response, release: Callable[[], None]) -> None:
+        self._upstream = upstream
+        self._release = release
+        # Decoded bytes: content-encoding is not relayed.
+        super().__init__(upstream.aiter_bytes(), media_type="text/event-stream")
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            try:
+                await self._upstream.aclose()
+            finally:
+                self._release()
+
+
 async def _stream(
     client: httpx.AsyncClient,
     body: dict[str, Any],
     settings: GatewaySettings,
     beta: str | None,
     release: Callable[[], None],
-) -> StreamingResponse | JSONResponse:
+) -> Response:
+    """Return a _Relay that owns the permit, or an error response (the caller releases)."""
     url, headers = _upstream_request("anthropic", settings)
     if beta:
         headers["anthropic-beta"] = beta
@@ -199,31 +231,21 @@ async def _stream(
     try:
         response = await client.send(request, stream=True, follow_redirects=False)
     except httpx.TimeoutException:
-        release()
         return _error(504, "upstream_timeout")
     except httpx.HTTPError:
-        release()
         return _error(502, "upstream_unreachable")
-    if response.status_code != 200:
+    if response.status_code == 200:
+        return _Relay(response, release)
+    try:
         raw = await response.aread()
+    finally:
         await response.aclose()
-        release()
-        try:
-            data: Any = json.loads(raw)
-        except ValueError:
-            data = None
-        status, payload = _upstream_error(response.status_code, data)
-        return JSONResponse(payload, status_code=status)
-
-    async def relay() -> AsyncIterator[bytes]:
-        try:
-            async for chunk in response.aiter_bytes():  # decoded: content-encoding is not relayed
-                yield chunk
-        finally:
-            await response.aclose()
-            release()
-
-    return StreamingResponse(relay(), media_type="text/event-stream")
+    try:
+        data: Any = json.loads(raw)
+    except ValueError:
+        data = None
+    status, payload = _upstream_error(response.status_code, data)
+    return JSONResponse(payload, status_code=status)
 
 
 async def _read_limited(request: Request, limit: int) -> bytes | None:
@@ -267,6 +289,14 @@ def create_app(
         if semaphore.locked():
             return _error(429, "too_many_requests")
         await semaphore.acquire()
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                semaphore.release()
+
         handed_off = False
         try:
             raw = await _read_limited(request, settings.max_body_bytes)
@@ -279,7 +309,13 @@ def create_app(
             if not isinstance(body, dict):
                 return _error(400, "invalid_json")
             if provider == "anthropic":
-                logger.info("gateway fields provider=anthropic fields=%s", ",".join(sorted(body)))
+                # Keys are caller-chosen: log only known names, and count the rest.
+                known = sorted(key for key in body if key in _ALLOWED_FIELDS["anthropic"])
+                logger.info(
+                    "gateway fields provider=anthropic fields=%s unknown=%d",
+                    ",".join(known),
+                    len(body) - len(known),
+                )
             problem = _normalize_body(
                 provider, body, settings, count_only=url == ANTHROPIC_COUNT_URL
             )
@@ -288,14 +324,15 @@ def create_app(
             beta = request.headers.get("anthropic-beta")
             beta = beta if provider == "anthropic" and beta and _BETA.fullmatch(beta) else None
             started = time.perf_counter()
-            if provider == "anthropic" and body.get("stream"):
-                handed_off = True
+            if provider == "anthropic" and url is None and body.get("stream"):
                 logger.info("gateway stream provider=anthropic caller=%s", caller)
-                return await _stream(client, body, settings, beta, semaphore.release)
+                result = await _stream(client, body, settings, beta, release)
+                handed_off = isinstance(result, _Relay)
+                return result
             status, payload = await _forward(client, provider, body, settings, url=url, beta=beta)
         finally:
             if not handed_off:
-                semaphore.release()
+                release()
         logger.info(
             "gateway forward provider=%s caller=%s status=%s ms=%.0f",
             provider,
