@@ -282,3 +282,63 @@ def test_large_search_targets_the_5_gb_file(tmp_path: Path) -> None:
     expected = run_bench.expected_results(tmp_path / "evidence/bench")
     key = "bench/large/huge|bench/large/huge/h5g_0.txt"
     assert expected[key] == digest([("bench/large/huge/h5g_0.txt", 10)])
+
+
+def _failing_direct(error: str) -> Any:
+    def answer(body: dict[str, Any]) -> httpx.Response:
+        if body["case"]["method"] != "direct":
+            return _agent([])(url="", json=body, headers={}, timeout=0)
+        case = body["case"]
+        result = {
+            "method": case["method"], "op": case["op"], "target": case["target"],
+            "cold": case["fresh"], "ok": False, "ms": 5.0, "error": error,
+        }  # fmt: skip
+        return httpx.Response(200, json={"status": 200, "session_id": "x", "result": result})
+
+    return answer
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "OSError: [Errno 28] No space left on device",
+        "ResourceTooLarge: bench/large/huge/h5g_0.txt: mirage cat buffers 5000000000 bytes",
+        "PermissionError: [Errno 13] Permission denied: '/mnt/ws'",
+    ],
+)
+def test_an_infeasible_error_ends_its_group_and_stays_final_on_resume(
+    workdir: Path, monkeypatch: pytest.MonkeyPatch, error: str
+) -> None:
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(run_bench.httpx, "post", _agent(calls, _failing_direct(error)))
+    assert run_bench.main([]) == 0
+    # Rep 0 of direct fails for good: reps 1-2 are skipped, the mirror group still runs.
+    assert [(c["case"]["method"], c["case"]["fresh"]) for c in calls] == [
+        ("direct", True),
+        ("mirror", True),
+    ]
+    calls.clear()
+    assert run_bench.main([]) == 0
+    assert calls == []
+    summary = (workdir / "evidence/bench/summary.md").read_text()
+    assert "| fail |" in summary
+
+
+def test_other_failed_rows_do_not_end_their_group(
+    workdir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(run_bench.httpx, "post", _agent(calls, _failing_direct("hub:429:unknown")))
+    assert run_bench.main([]) == 0
+    assert len(calls) == 4
+
+
+def test_unified_api_500_stops_the_run(
+    workdir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: list[dict[str, Any]] = []
+    answer = lambda body: httpx.Response(500, text="Internal Server Error")  # noqa: E731
+    monkeypatch.setattr(run_bench.httpx, "post", _agent(calls, answer))
+    assert run_bench.main([]) == 2
+    assert len(calls) == 1 and not (workdir / "evidence/bench/rows.jsonl").exists()
+    assert "aws sso login" in capsys.readouterr().out

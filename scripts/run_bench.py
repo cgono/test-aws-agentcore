@@ -37,6 +37,17 @@ LARGE_OPS = [
     ("search", "bench/large/huge|bench/large/huge/h5g_0.txt", NEEDLE),
 ]
 CASE_FIELDS = ("method", "op", "target", "text", "fresh")
+# Errors that the method cannot get past for this target (a finding, not a flaky run): the
+# first one ends its group, and a resumed run does not repeat it.
+INFEASIBLE = (
+    "OSError: [Errno 28] No space left on device",  # mirror: workspace larger than /tmp
+    "ResourceTooLarge:",  # Mirage buffers a whole file
+    "PermissionError: [Errno 13] Permission denied: '/mnt/ws'",  # no FUSE in the Runtime
+)
+
+
+def _infeasible(row: dict[str, Any]) -> bool:
+    return not row.get("ok") and str(row.get("error") or "").startswith(INFEASIBLE)
 
 
 def plan(seed: int) -> list[dict[str, object]]:
@@ -138,7 +149,9 @@ def main(argv: list[str] | None = None) -> int:
     except FileNotFoundError:
         print(f"no fixture manifests in {BENCH_DIR}: run -m scripts.seed_bench_fixtures first")
         return 2
-    done = {key for key, row in _latest(rows_file, args.user).items() if row.get("ok")}
+    latest = _latest(rows_file, args.user)
+    done = {key for key, row in latest.items() if row.get("ok")}
+    final = {key.rsplit("|", 1)[0] for key, row in latest.items() if _infeasible(row)}
     # One Runtime session per (method, op, target) in this run: rep 0 is the cold case in a new
     # session, and warm reps reuse it (same microVM and method instance). A session from an
     # earlier run is gone, so a resumed group starts a new session (the agent reports it cold).
@@ -146,7 +159,7 @@ def main(argv: list[str] | None = None) -> int:
     for case in plan(args.seed):
         group = f"{case['method']}|{case['op']}|{case['target']}"
         key = f"{group}|{case['rep']}"
-        if key in done:
+        if key in done or group in final:
             continue
         if case["fresh"] or group not in sessions:
             sessions[group] = f"poc3-{uuid.uuid4().hex}"
@@ -170,6 +183,13 @@ def main(argv: list[str] | None = None) -> int:
                     "then rerun this command"
                 )
                 return 2
+            if response.status_code == 500:
+                print(
+                    "unified API error (500): check its log. An AWS SSO expiry "
+                    "(TokenRetrievalError) needs `aws sso login` and a unified API restart; "
+                    "then rerun this command"
+                )
+                return 2
             outcome = _row(case, response)
         row = outcome | {
             "method": case["method"],
@@ -184,6 +204,9 @@ def main(argv: list[str] | None = None) -> int:
         _append(rows_file, row)
         warm_ran_cold = row["ok"] and row["cold"] and not case["fresh"]
         note = " (warm rep ran cold: the session ended)" if warm_ran_cold else ""
+        if _infeasible(row):
+            final.add(group)
+            note = " (infeasible: skipping the rest of this group)"
         print(key, row["ok"], row.get("ms"), row.get("error") or "", note)
     summary = summarize(list(_latest(rows_file, args.user).values()), expected)
     (BENCH_DIR / "summary.md").write_text(render_markdown(summary))
