@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import random
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 from urllib.parse import quote
@@ -9,6 +11,9 @@ from urllib.parse import quote
 import httpx
 
 MAX_CHUNK = 4 * 1024 * 1024
+# Lambda answers 429 when the account or function concurrency is full; retry with backoff.
+THROTTLE_ATTEMPTS = 6
+THROTTLE_BASE_S = 0.5
 
 
 class HubError(Exception):
@@ -28,6 +33,7 @@ class ResourceHubClient:
         user_token: str | None = None,
         session_id: str | None = None,
         http: httpx.AsyncClient,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         if (grant is None) == (user_token is None):
             raise ValueError("pass exactly one of grant or user_token")
@@ -37,7 +43,9 @@ class ResourceHubClient:
         self._user_token = user_token
         self._sid = session_id
         self._http = http
+        self._sleep = sleep
         self.requests_made = 0
+        self.throttled = 0
         self.bytes_received = 0
 
     async def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -53,11 +61,18 @@ class ResourceHubClient:
     async def _call(
         self, method: str, route: str, *, extra: dict[str, str] | None = None, **kwargs: Any
     ) -> httpx.Response:
-        response = await self._http.request(
-            method, f"{self._base}{route}", headers=await self._headers(extra), **kwargs
-        )
-        self.requests_made += 1
-        self.bytes_received += len(response.content)
+        for attempt in range(THROTTLE_ATTEMPTS):
+            response = await self._http.request(
+                method, f"{self._base}{route}", headers=await self._headers(extra), **kwargs
+            )
+            self.requests_made += 1
+            self.bytes_received += len(response.content)
+            if response.status_code != 429:
+                break
+            self.throttled += 1
+            if attempt + 1 < THROTTLE_ATTEMPTS:
+                delay = THROTTLE_BASE_S * 2**attempt
+                await self._sleep(delay * (1 + random.random()))  # noqa: S311
         if response.status_code >= 400:
             try:
                 data = response.json()

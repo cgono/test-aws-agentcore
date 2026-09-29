@@ -65,13 +65,21 @@ class Method(Protocol):
     def bytes(self) -> int: ...
 
 
+# Parallel Hub reads per search or sync. The POC account allows 10 concurrent Lambda
+# executions, so 16 was throttled (429); 4 leaves room for a long hub_search in flight.
+HUB_CONCURRENCY = 4
+
+
 class SearchIncomplete(Exception):
     """A search stopped at a limit; its matches must not be scored as a full result."""
 
 
 class DirectMethod:
     def __init__(
-        self, hub: ResourceHubClient, concurrency: int = 16, max_carry_bytes: int = 1024 * 1024
+        self,
+        hub: ResourceHubClient,
+        concurrency: int = HUB_CONCURRENCY,
+        max_carry_bytes: int = 1024 * 1024,
     ) -> None:
         self.hub = hub
         self._sem = asyncio.Semaphore(concurrency)

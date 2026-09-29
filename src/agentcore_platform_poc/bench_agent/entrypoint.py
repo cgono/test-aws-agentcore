@@ -98,6 +98,7 @@ async def invoke(payload: dict[str, Any], context: RequestContext) -> dict[str, 
     method = _methods[case.method]
     method.hub._grant = grant  # type: ignore[attr-defined]  # the same session may carry a newer grant
     before_req, before_bytes = method.requests(), method.bytes()
+    before_throttled = method.hub.throttled  # type: ignore[attr-defined]
     failure: str | None = None
     result: Any = None
     try:
@@ -127,6 +128,7 @@ async def invoke(payload: dict[str, Any], context: RequestContext) -> dict[str, 
         "ms": ms,
         "bytes": method.bytes() - before_bytes,
         "requests": method.requests() - before_req,
+        "throttled": method.hub.throttled - before_throttled,  # type: ignore[attr-defined]
         "result_count": count,
         "result_digest": digest(result) if isinstance(result, list) else str(result),
         "error": failure,

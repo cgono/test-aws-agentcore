@@ -122,3 +122,48 @@ async def test_non_object_error_body_is_hub_error(body: object) -> None:
     with pytest.raises(HubError) as caught:
         await _client(httpx.MockTransport(handle), grant="G").list()
     assert caught.value.status == 401 and caught.value.code in {"unknown", "None"}
+
+
+def _throttled_then(ok_after: int, sleeps: list[float]) -> ResourceHubClient:
+    calls = {"n": 0}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] <= ok_after:
+            return httpx.Response(429, text="Rate Exceeded.")
+        return httpx.Response(200, json={"entries": []})
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    return _client(httpx.MockTransport(handle), grant="G", sleep=sleep)
+
+
+async def test_throttled_request_is_retried_with_backoff() -> None:
+    sleeps: list[float] = []
+    client = _throttled_then(2, sleeps)
+    assert await client.list() == []
+    assert len(sleeps) == 2 and 0 < sleeps[0] <= sleeps[1]
+    assert client.requests_made == 3 and client.throttled == 2
+
+
+async def test_throttling_gives_up_after_the_retry_limit() -> None:
+    sleeps: list[float] = []
+    client = _throttled_then(100, sleeps)
+    with pytest.raises(HubError) as caught:
+        await client.list()
+    assert caught.value.status == 429 and len(sleeps) == client.throttled - 1
+
+
+async def test_other_errors_are_not_retried() -> None:
+    sleeps: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "busy"})
+
+    with pytest.raises(HubError):
+        await _client(httpx.MockTransport(handle), grant="G", sleep=sleep).list()
+    assert sleeps == []

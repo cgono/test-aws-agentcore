@@ -23,7 +23,7 @@ def _grant(sub: str) -> str:
 class FakeMethod:
     def __init__(self, owner: str, log: list[str]) -> None:
         self.owner, self.log = owner, log
-        self.hub = type("H", (), {"_grant": None})()
+        self.hub = type("H", (), {"_grant": None, "throttled": 0})()
 
     def requests(self) -> int:
         return 0
