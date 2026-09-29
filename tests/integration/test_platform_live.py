@@ -223,7 +223,7 @@ def test_q6_hub_isolation_direct(out: dict[str, str]) -> None:
 
     b = env["POC3_USER_B_OID"]
     checks = {
-        "ok": get("brief.md", research, x_resource_grant=grant_a) == 200,
+        "own_file": get("brief.md", research, x_resource_grant=grant_a) == 200,
         "escape": get(f"..%2F{b}/brief.md", research, x_resource_grant=grant_a) == 400,
         "encoded_dots": get(f"%2e%2e/%2e%2e/users/{b}/brief.md", research, x_resource_grant=grant_a)
         == 400,
